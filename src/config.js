@@ -10,11 +10,16 @@
  *            validation, so the entry point can guarantee the process never
  *            hangs forever.
  *
+ * Phase 1.3: added `scroll.totalTimeoutMs` (per-pagination budget, default 60s)
+ *            and `scroll.stallThreshold` (consecutive no-progress scrolls
+ *            before stopping, default 3) with validation.
+ *
  * Precedence (highest → lowest):
  *   1. CLI flags:    --query --location --max-results --output-file
  *   2. Environment:  DEFAULT_QUERY / DEFAULT_LOCATION / DEFAULT_MAX_RESULTS /
  *                    OUTPUT_FILE / HEADLESS / SLOW_MO / VIEWPORT_* / OUTPUT_DIR /
- *                    RUN_TIMEOUT_MS / LOG_LEVEL
+ *                    RUN_TIMEOUT_MS / SCROLL_TIMEOUT_MS / SCROLL_STALL_THRESHOLD /
+ *                    LOG_LEVEL
  *   3. Built-in defaults (only for non-required fields)
  *
  * Required fields (query, location) have NO built-in default — the operator
@@ -115,6 +120,14 @@ function resolveConfig(argv = process.argv) {
       // force-closed and the process exits with code 3. Default: 5 minutes.
       timeoutMs: parseInt(process.env.RUN_TIMEOUT_MS || '300000', 10),
     },
+    scroll: {
+      // Per-pagination budget in ms. The scroll loop gives up after this even
+      // if results haven't been exhausted. Default: 60 seconds.
+      totalTimeoutMs: parseInt(process.env.SCROLL_TIMEOUT_MS || '60000', 10),
+      // Consecutive no-progress scrolls before the loop declares results
+      // exhausted and stops. Default: 3.
+      stallThreshold: parseInt(process.env.SCROLL_STALL_THRESHOLD || '3', 10),
+    },
     log: {
       level: process.env.LOG_LEVEL || 'info',
     },
@@ -146,6 +159,14 @@ function resolveConfig(argv = process.argv) {
   const { timeoutMs } = config.run;
   if (!Number.isInteger(timeoutMs) || Number.isNaN(timeoutMs) || timeoutMs < 5000) {
     errors.push(`RUN_TIMEOUT_MS must be a positive integer >= 5000 ms (got: ${JSON.stringify(process.env.RUN_TIMEOUT_MS)}).`);
+  }
+  // Validate scroll timeout (must be a positive integer >= 5000 ms).
+  const { totalTimeoutMs: scrollTimeout, stallThreshold } = config.scroll;
+  if (!Number.isInteger(scrollTimeout) || Number.isNaN(scrollTimeout) || scrollTimeout < 5000) {
+    errors.push(`SCROLL_TIMEOUT_MS must be a positive integer >= 5000 ms (got: ${JSON.stringify(process.env.SCROLL_TIMEOUT_MS)}).`);
+  }
+  if (!Number.isInteger(stallThreshold) || Number.isNaN(stallThreshold) || stallThreshold < 1) {
+    errors.push(`SCROLL_STALL_THRESHOLD must be a positive integer >= 1 (got: ${JSON.stringify(process.env.SCROLL_STALL_THRESHOLD)}).`);
   }
 
   if (errors.length > 0) {

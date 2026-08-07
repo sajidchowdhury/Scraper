@@ -2,13 +2,12 @@
 
 A Node.js scraper that extracts business data from Google Maps and exports it to CSV.
 
-## Current status: Phase 1.2 — Robust Browser Automation Core
+## Current status: Phase 1.3 — Pagination / Infinite-Scroll Handling
 
 The project is structured into clean modules, the search target is fully
-configurable via CLI flags or environment variables, and the browser
-lifecycle is bulletproof: a global run timeout prevents hangs, Ctrl-C shuts
-down gracefully, and the browser is always torn down via `try/finally`.
-Pagination, field extraction, and CSV export land in subsequent phases.
+configurable, the browser lifecycle is bulletproof, and the scraper now
+**paginates through all results** in the feed (not just the first ~20).
+Field extraction and CSV export land in subsequent phases.
 
 - Full roadmap (Phases 1–5): see [`SCRAPER_FEATURES.md`](./SCRAPER_FEATURES.md)
 - Phase 1 step-by-step plan: see [`PHASE1_EXECUTION_PLAN.md`](./PHASE1_EXECUTION_PLAN.md)
@@ -84,6 +83,8 @@ that CLI flags override.
 | `OUTPUT_DIR`            | `./data`     | Directory where CSV/JSON outputs are written             |
 | `OUTPUT_FILE`           | *(empty)*    | Output CSV path; empty = auto-generated (overridden by `--output-file`) |
 | `RUN_TIMEOUT_MS`        | `300000`     | Global run timeout in ms (min `5000`); prevents hangs → exit `3` |
+| `SCROLL_TIMEOUT_MS`     | `60000`      | Per-pagination budget in ms (min `5000`); scroll gives up after this |
+| `SCROLL_STALL_THRESHOLD`| `3`          | Consecutive no-progress scrolls before declaring results exhausted (min `1`) |
 | `LOG_LEVEL`             | `info`       | `debug` \| `info` \| `warn` \| `error`                    |
 
 ## Lifecycle & exit codes
@@ -107,6 +108,23 @@ The scraper is built to **never hang** and **never leak browser processes**.
 | `3`       | Runtime error (browser crash, network failure, timeout)       |
 | `130`     | Interrupted by user (Ctrl-C, graceful shutdown)               |
 | `137`     | Interrupted by user (second Ctrl-C, forced shutdown)          |
+
+## Pagination
+
+Google Maps only loads ~20 results initially and lazy-loads more as you
+scroll the results feed. The scraper handles this automatically — after the
+feed appears, `scrollFeedToBottom()` scrolls until one of these stop
+conditions is met:
+
+| Stop reason   | Trigger                                                            |
+|---------------|--------------------------------------------------------------------|
+| `maxResults`  | `--max-results` / `DEFAULT_MAX_RESULTS` count reached               |
+| `exhausted`   | `SCROLL_STALL_THRESHOLD` consecutive scrolls with no new results    |
+| `timeout`     | `SCROLL_TIMEOUT_MS` budget exceeded                                |
+| `noResults`   | Feed contained zero business cards (e.g., bad query)               |
+
+Scroll progress is logged in real time, e.g. `Scroll progress {scroll: 3,
+loaded: 60, delta: "+20", stall: 0}`.
 
 ## Project structure
 
@@ -134,8 +152,8 @@ scraper/
 ## Roadmap
 
 Phase 1 is broken into 12 sub-phases (1.0 through 1.11). The current
-milestone, **1.2**, makes the browser lifecycle bulletproof (global timeout,
-graceful SIGINT, idempotent teardown, fallback selectors). See
+milestone, **1.3**, makes the scraper paginate through all results in the
+feed (stall detection + maxResults + scroll-timeout). See
 [`PHASE1_EXECUTION_PLAN.md`](./PHASE1_EXECUTION_PLAN.md) for the full breakdown.
 
 ## License

@@ -11,6 +11,10 @@
  *            - Removed the Phase 1.0/1.1 demo pause — the lifecycle is now
  *              real: launch → navigate → search → confirm feed → close.
  *
+ * Phase 1.3: pagination / infinite-scroll handling. After the feed is found,
+ *            scrollFeedToBottom() scrolls through all results (or until
+ *            maxResults / exhaustion / scroll-timeout), logging progress.
+ *
  * Exit codes:
  *   0    success
  *   1    partial success (some businesses failed — used once extraction exists)
@@ -19,12 +23,14 @@
  *   130  interrupted by user (SIGINT, graceful shutdown)
  *   137  interrupted by user (second SIGINT, forced shutdown)
  *
- * Phase 1.3 (TODO): add scroll -> extract -> export to the work pipeline.
+ * Phase 1.4 (TODO): extract structured business data from the loaded feed.
+ * Phase 1.6 (TODO): export the extracted data to CSV.
  */
 const { resolveConfig, ConfigError } = require('./config');
 const logger = require('./logger');
 const { launchBrowser, closeBrowser } = require('./browser');
 const { navigateToMaps, performSearch } = require('./search');
+const { scrollFeedToBottom } = require('./scroll');
 
 /**
  * Thrown when the global run timeout fires. Caught by the main try/catch to
@@ -104,19 +110,28 @@ async function main() {
       closeBrowser(browser).catch(() => {});
     }, config.run.timeoutMs);
 
-    // ----- The actual work (Phase 1.3 will extend this) -----
+    // ----- The actual work -----
     const { browser: b, page } = await launchBrowser(config);
     browser = b;
 
     await navigateToMaps(page);
     await performSearch(page, config.search.query, config.search.location);
 
-    // Phase 1.2 scaffold: search confirmed, feed visible. The full pipeline
-    // (scroll -> extract -> export) lands in Phases 1.3-1.6.
-    logger.info('Phase 1.2 scaffold reached — search confirmed, closing cleanly.', {
+    // Phase 1.3: paginate through all results (or until maxResults / exhaustion / timeout).
+    const scrollResult = await scrollFeedToBottom(page, {
+      maxResults: config.search.maxResults,
+      totalTimeoutMs: config.scroll.totalTimeoutMs,
+      stallThreshold: config.scroll.stallThreshold,
+    });
+    logger.info('Pagination result', scrollResult);
+
+    // Phase 1.3 scaffold: all available results are now loaded in the feed.
+    // Extraction (Phase 1.4) and CSV export (Phase 1.6) land next.
+    logger.info('Phase 1.3 scaffold reached — pagination complete, closing cleanly.', {
       query: config.search.query,
       location: config.search.location,
-      maxResults: config.search.maxResults == null ? 'all (enforced in Phase 1.3)' : config.search.maxResults,
+      totalLoaded: scrollResult.totalLoaded,
+      stopReason: scrollResult.stopReason,
     });
   } catch (err) {
     if (interrupted) {
@@ -161,7 +176,9 @@ function logResolvedConfig(config) {
     headless: config.browser.headless,
     slowMo: config.browser.slowMo,
     viewport: `${config.browser.viewport.width}x${config.browser.viewport.height}`,
-    timeoutMs: config.run.timeoutMs,
+    runTimeoutMs: config.run.timeoutMs,
+    scrollTimeoutMs: config.scroll.totalTimeoutMs,
+    scrollStallThreshold: config.scroll.stallThreshold,
     logLevel: config.log.level,
   };
   logger.info('Scraper starting');
