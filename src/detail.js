@@ -658,56 +658,156 @@ function sleep(ms) {
 /**
  * Open the detail panel for a business by clicking its place link in the
  * results list. The place link is identified by href matching the business's
- * maps_url (or the first place anchor if no match).
+ * place_id (most stable), then maps_url, then any place anchor as fallback.
+ *
+ * Phase 1.5→1.11 hardening:
+ *   - Match anchor by place_id first (stable, short, no CSS-special chars),
+ *     then by maps_url substring, then any /maps/place/ anchor.
+ *   - scrollIntoViewIfNeeded before click (after scroll-to-load, target card
+ *     may be off-screen and Playwright's auto-scroll can miss on virtualized
+ *     feeds).
+ *   - Primary "panel opened" signal = URL changed to /maps/place/ (pushState
+ *     navigation — most robust against Google DOM rewrites). Secondary signal
+ *     = a detail-panel DOM element appears (updated selectors, dropped the
+ *     stale h1[data-attrid="title"] primary).
+ *   - warn-level diagnostics on every failure path so info-level runs surface
+ *     the exact reason (no anchor / click threw / wait timed out + whether the
+ *     URL changed at all).
  *
  * @returns {Promise<boolean>} true if a panel-open signal was detected
  */
 async function openDetailPanelOnPage(page, business, { logger }) {
   const log = logger && logger.phase ? logger.phase('detail') : logger;
   const targetHref = business && business.maps_url ? business.maps_url : null;
+  const targetPlaceId = business && business.place_id ? business.place_id : null;
+  const targetName = business && business.name ? business.name : null;
+  const beforeUrl = safePageUrl(page);
 
-  // Find the matching place anchor in the current results list
-  const anchorSelector = targetHref
-    ? `a[href*="${cssEscapeHref(targetHref)}"]`
-    : 'a[href*="/maps/place/"]';
+  // --- 1. Find the place anchor for THIS business -------------------------
+  // place_id is the most stable substring to match (short base64-ish string,
+  // no CSS-special chars). maps_url works too but contains ( ) ! : @ , which
+  // can occasionally confuse attribute selectors. Final fallback: any place
+  // anchor (may open the wrong business, but at least we can observe whether
+  // the panel-open signal fires — useful for diagnosis).
+  const anchorSelectors = [];
+  if (targetPlaceId) anchorSelectors.push(`a[href*="${cssEscapeHref(targetPlaceId)}"]`);
+  if (targetHref) anchorSelectors.push(`a[href*="${cssEscapeHref(targetHref)}"]`);
+  anchorSelectors.push('a[href*="/maps/place/"]');
 
-  let anchor;
-  try {
-    anchor = await page.$(anchorSelector).catch(() => null);
-  } catch {
-    anchor = null;
+  let anchor = null;
+  let matchedBy = null;
+  for (const sel of anchorSelectors) {
+    try {
+      anchor = await page.$(sel).catch(() => null);
+      if (anchor) { matchedBy = sel; break; }
+    } catch {
+      /* invalid selector for this scope — try next */
+    }
   }
-  if (!anchor) {
-    // Fallback: any place anchor
-    anchor = await page.$('a[href*="/maps/place/"]').catch(() => null);
+
+  // Last resort: click the card container whose aria-label matches the
+  // business name. Modern Google Maps cards are clickable divs, not just
+  // anchors.
+  if (!anchor && targetName) {
+    const cardSelectors = [
+      `div[role="article"][aria-label*="${cssEscapeHref(targetName)}"]`,
+      `div[role="feed"] > div[aria-label*="${cssEscapeHref(targetName)}"]`,
+    ];
+    for (const sel of cardSelectors) {
+      try {
+        anchor = await page.$(sel).catch(() => null);
+        if (anchor) { matchedBy = sel; break; }
+      } catch {
+        /* try next */
+      }
+    }
   }
+
   if (!anchor) {
+    log.warn('detail panel open failed: no anchor/card found in DOM', {
+      business: targetName,
+      place_id: targetPlaceId,
+      triedSelectors: anchorSelectors,
+      beforeUrl,
+    });
     return false;
   }
 
+  // --- 2. Click (scroll into view first) ----------------------------------
   try {
+    if (typeof anchor.scrollIntoViewIfNeeded === 'function') {
+      await anchor.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+    }
     await anchor.click({ timeout: 8000 });
   } catch (err) {
-    log.debug('click on place anchor failed', { error: err.message });
+    log.warn('detail panel open failed: click threw', {
+      business: targetName,
+      matchedBy,
+      error: err.message,
+      beforeUrl,
+    });
     return false;
   }
 
-  // Wait for the detail panel to appear. The panel region replaces or
-  // supplements the list. We look for either the region element or a
-  // secondary place-title heading.
+  // --- 3. Wait for the detail panel to appear -----------------------------
+  // Primary: URL changes to /maps/place/ (pushState — most robust). The
+  // waitForFunction polls ~every animation frame so it catches the change
+  // within ~100ms. Secondary: a detail-panel DOM element appears.
+  const urlWait = (typeof page.waitForFunction === 'function')
+    ? page.waitForFunction(
+        () => window.location.pathname.includes('/maps/place/'),
+        { timeout: 12000 },
+      ).then(() => 'url').catch(() => null)
+    : Promise.resolve(null);
+
+  const domWait = page.waitForSelector(
+    [
+      'button[aria-label*="Back"]',
+      'div[role="region"]',
+      'h1',
+      'div[aria-label*="Place"]',
+      'h1[data-attrid="title"]',
+    ].join(', '),
+    { timeout: 12000 },
+  ).then(() => 'dom').catch(() => null);
+
+  let signal;
   try {
-    await page.waitForSelector(
-      [
-        'div[role="region"][aria-label*="info"]',
-        'div[aria-label*="Place"]',
-        'h1[data-attrid="title"]',
-        'button[aria-label*="Back"]',
-      ].join(', '),
-      { timeout: 12000 },
-    );
-    return true;
+    signal = await Promise.race([urlWait, domWait]);
   } catch {
+    signal = null;
+  }
+
+  if (!signal) {
+    const afterUrl = safePageUrl(page);
+    log.warn('detail panel open failed: wait timed out', {
+      business: targetName,
+      matchedBy,
+      beforeUrl,
+      afterUrl,
+      urlChanged: afterUrl !== beforeUrl,
+    });
     return false;
+  }
+
+  log.debug('detail panel opened', {
+    business: targetName,
+    signal,
+    matchedBy,
+    afterUrl: safePageUrl(page),
+  });
+  return true;
+}
+
+/**
+ * Safely read page.url() — returns null if the page stub doesn't expose it
+ * (unit tests with synthetic pages) or if the call throws.
+ */
+function safePageUrl(page) {
+  try {
+    return typeof page.url === 'function' ? page.url() : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1021,5 +1121,6 @@ module.exports = {
   deepScrapeAll,
   openDetailPanelOnPage,
   backToListOnPage,
+  safePageUrl,
   sleep,
 };

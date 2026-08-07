@@ -192,6 +192,54 @@ to the `markers` array.
 without detecting them (i.e. it hangs instead of pausing), add the new
 interstitial text here. Multi-locale: include CJK variants.
 
+### Detail-panel open strategy (`src/detail.js` — `openDetailPanelOnPage`)
+
+Unlike list-view extraction (which reads the DOM in one `page.evaluate`),
+opening a detail panel is an **interaction**: find the link, click it, wait
+for the panel. This is where most deep-scrape breakages happen. The strategy
+has three stages, each with diagnostic logging at `warn` level so failures
+are visible at the default `info` log level:
+
+**Stage 1 — Find the anchor** (tried in order, first match wins):
+
+| # | Selector | Why |
+|---|---|---|
+| 1 | `a[href*="<place_id>"]` | Most stable — `place_id` is a short base64-ish string (`ChIJ...`) with no CSS-special characters. Always present in the href. |
+| 2 | `a[href*="<maps_url>"]` | Canonical URL substring. Works but the URL contains `( ) ! : @ ,` which can occasionally confuse attribute matching. |
+| 3 | `a[href*="/maps/place/"]` | Generic fallback — matches any place link. May open the wrong business if the first two fail, but at least the panel opens. |
+| 4 | `div[role="article"][aria-label*="<name>"]` | Card-container fallback for layouts where the card itself is the clickable element (not a nested `<a>`). |
+
+If all four fail → `warn: no anchor/card found in DOM` with the business name,
+place_id, and the full list of tried selectors.
+
+**Stage 2 — Click** (with `scrollIntoViewIfNeeded` first):
+
+After scroll-to-load, the target card may be off-screen (Google Maps
+virtualizes the feed). Playwright's auto-scroll can miss on virtualized lists,
+so we explicitly scroll the anchor into view, then click. If the click throws
+(element detached, overlay intercepting) → `warn: click threw` with the error
+message and which selector matched.
+
+**Stage 3 — Wait for the panel** (two signals race, first wins):
+
+| Signal | Method | Why |
+|---|---|---|
+| URL change | `page.waitForFunction(() => location.pathname.includes('/maps/place/'))` | **Most robust.** Google Maps uses pushState navigation — the URL changes from `/search/...` to `/place/...` the instant the panel opens. Immune to DOM rewrites. |
+| DOM element | `page.waitForSelector('button[aria-label*="Back"], div[role="region"], h1, ...')` | Secondary. Catches cases where the URL didn't change (rare). |
+
+If neither fires within 12s → `warn: wait timed out` with `beforeUrl`,
+`afterUrl`, and `urlChanged` (boolean). **This is the key diagnostic**: if
+`urlChanged: true` but the wait still timed out, the click worked but landed
+somewhere unexpected. If `urlChanged: false`, the click was a no-op (element
+was the wrong target, or Google swallowed the click).
+
+> **Historical note:** the old code waited only for DOM selectors including
+> `h1[data-attrid="title"]`, which was a 2020-era Google Maps selector that no
+> longer exists. Every detail open timed out (0% success rate) with no
+> diagnostic output because failures only logged at `debug` level. The Phase
+> 1.11 hardening added the URL-change signal and promoted diagnostics to
+> `warn`.
+
 ## Why not Playwright's locator API?
 
 Playwright's `page.locator('text=Website')` is ergonomic but:
@@ -211,7 +259,8 @@ extraction-rate reporting trivial.
 ## Test coverage
 
 Every field parser has unit tests in `tests/extract.test.js` (67 tests) and
-`tests/detail.test.js` (55 tests), including end-to-end extraction against
+`tests/detail.test.js` (66 tests, including 11 for the Phase 1.11
+`openDetailPanelOnPage` hardening), including end-to-end extraction against
 HTML fixture cards that match the live Maps DOM. When you add a new
 selector, add a fixture card that exercises it — this catches regressions
 when Google changes the DOM again.

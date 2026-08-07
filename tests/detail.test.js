@@ -39,6 +39,8 @@ const {
   deepScrapeDetails,
   deepScrapeAll,
   extractDetailFromPage,
+  openDetailPanelOnPage,
+  safePageUrl,
   sleep,
 } = require('../src/detail');
 
@@ -558,6 +560,228 @@ describe('deepScrapeAll (batch)', () => {
     // 0% success → should trigger WARN
     const warn = logs.find(([level, m]) => level === 'warn' && m.includes('below 80%'));
     expect(warn).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5b. openDetailPanelOnPage — Phase 1.11 hardening
+//     Verifies: place_id-first anchor matching, URL-change wait signal,
+//     warn-level diagnostics on every failure path, safePageUrl robustness.
+// ---------------------------------------------------------------------------
+
+describe('openDetailPanelOnPage (Phase 1.11 hardening)', () => {
+  /**
+   * Build a configurable stub page. opts:
+   *   - anchorFor: function(sel) => elementHandle | null  (controls page.$)
+   *   - url: string (current page URL — controls safePageUrl + waitForFunction)
+   *   - urlAfterClick: string (URL to report after click — simulates pushState)
+   *   - waitForSelectorThrows: bool (if true, waitForSelector rejects)
+   *   - clickThrows: bool (if true, anchor.click rejects)
+   */
+  function makeDetailStubPage(opts = {}) {
+    let clicked = false;
+    const url = opts.url || 'https://www.google.com/maps/search/cafe+in+berlin';
+    const urlAfterClick = opts.urlAfterClick || url;
+    // Every "found" anchor gets this handle. anchorFor() just decides whether
+    // a given selector matches (returns truthy) or not (returns falsy).
+    const anchorHandle = {
+      click: async () => {
+        clicked = true;
+        if (opts.clickThrows) throw new Error('click intercepted');
+      },
+      scrollIntoViewIfNeeded: async () => {},
+    };
+    return {
+      _clicked: () => clicked,
+      url: () => (clicked ? urlAfterClick : url),
+      $: async (sel) => {
+        if (typeof opts.anchorFor === 'function') {
+          return opts.anchorFor(sel) ? anchorHandle : null;
+        }
+        return null;
+      },
+      $$: async () => [],
+      waitForFunction: async (fn, { timeout } = {}) => {
+        // If urlAfterClick contains /maps/place/, resolve; else reject.
+        if (urlAfterClick.includes('/maps/place/')) return true;
+        throw new Error(`waitForFunction timeout (${timeout}ms)`);
+      },
+      waitForSelector: async () => {
+        if (opts.waitForSelectorThrows !== false) {
+          throw new Error('waitForSelector timeout');
+        }
+        return {};
+      },
+      evaluate: async () => ({}),
+      goBack: async () => {},
+    };
+  }
+
+  function makeCaptureLogger() {
+    const warns = [];
+    const debugs = [];
+    return {
+      warns,
+      debugs,
+      phase: () => ({
+        warn: (msg, ctx) => warns.push({ msg, ctx }),
+        debug: (msg, ctx) => debugs.push({ msg, ctx }),
+        info: () => {},
+        error: () => {},
+      }),
+      warn: (msg, ctx) => warns.push({ msg, ctx }),
+      debug: (msg, ctx) => debugs.push({ msg, ctx }),
+      info: () => {},
+      error: () => {},
+    };
+  }
+
+  test('returns false + logs warn when no anchor found in DOM', async () => {
+    const page = makeDetailStubPage({ anchorFor: () => null });
+    const logger = makeCaptureLogger();
+    const business = { name: 'Cafe X', maps_url: 'https://www.google.com/maps/place/X', place_id: 'ChIJabc' };
+
+    const result = await openDetailPanelOnPage(page, business, { logger });
+
+    expect(result).toBe(false);
+    expect(logger.warns.length).toBeGreaterThanOrEqual(1);
+    const noAnchorWarn = logger.warns.find((w) => w.msg.includes('no anchor/card found'));
+    expect(noAnchorWarn).toBeDefined();
+    expect(noAnchorWarn.ctx.business).toBe('Cafe X');
+    expect(noAnchorWarn.ctx.place_id).toBe('ChIJabc');
+    // Should have tried the place_id selector first
+    expect(noAnchorWarn.ctx.triedSelectors[0]).toContain('ChIJabc');
+  });
+
+  test('tries place_id selector before maps_url selector', async () => {
+    let seenSelectors = [];
+    const page = makeDetailStubPage({
+      anchorFor: (sel) => { seenSelectors.push(sel); return null; },
+    });
+    const logger = makeCaptureLogger();
+    const business = {
+      name: 'Cafe Y',
+      maps_url: 'https://www.google.com/maps/place/Y/@52.5',
+      place_id: 'ChIJxyz',
+    };
+
+    await openDetailPanelOnPage(page, business, { logger });
+
+    // First selector tried must be the place_id one (most stable)
+    expect(seenSelectors[0]).toBe('a[href*="ChIJxyz"]');
+    // maps_url selector tried second
+    expect(seenSelectors[1]).toContain('maps/place');
+    // generic fallback tried last
+    expect(seenSelectors[2]).toBe('a[href*="/maps/place/"]');
+  });
+
+  test('returns true when URL changes to /maps/place/ after click', async () => {
+    const page = makeDetailStubPage({
+      anchorFor: (sel) => (sel.includes('ChIJ') ? {} : null),
+      url: 'https://www.google.com/maps/search/cafe+in+berlin',
+      urlAfterClick: 'https://www.google.com/maps/place/Cafe+Z/@52.5,13.4,15z',
+      waitForSelectorThrows: true, // DOM wait fails — URL wait must save us
+    });
+    const logger = makeCaptureLogger();
+    const business = { name: 'Cafe Z', place_id: 'ChIJzzz', maps_url: 'https://www.google.com/maps/place/Z' };
+
+    const result = await openDetailPanelOnPage(page, business, { logger });
+
+    expect(result).toBe(true);
+    expect(page._clicked()).toBe(true);
+  });
+
+  test('logs warn with urlChanged:true when click navigated but wait still timed out', async () => {
+    // Click happens, URL changes to a NON-/maps/place/ URL (e.g. some other
+    // Google surface), so both urlWait and domWait reject → timeout. The
+    // diagnostic must report urlChanged:true so the operator knows the click
+    // worked but the destination was unexpected.
+    const page = makeDetailStubPage({
+      anchorFor: (sel) => (sel.includes('ChIJ') ? {} : null),
+      url: 'https://www.google.com/maps/search/cafe',
+      urlAfterClick: 'https://www.google.com/maps/search/something+else',
+      waitForSelectorThrows: true,
+    });
+    const logger = makeCaptureLogger();
+    const business = { name: 'Cafe W', place_id: 'ChIJwww', maps_url: 'https://www.google.com/maps/place/W' };
+
+    const result = await openDetailPanelOnPage(page, business, { logger });
+
+    expect(result).toBe(false);
+    const timeoutWarn = logger.warns.find((w) => w.msg.includes('wait timed out'));
+    expect(timeoutWarn).toBeDefined();
+    expect(timeoutWarn.ctx.urlChanged).toBe(true);
+    expect(timeoutWarn.ctx.beforeUrl).toContain('/search/cafe');
+    expect(timeoutWarn.ctx.afterUrl).toContain('/search/something');
+  });
+
+  test('logs warn when click throws (element detached / intercepted)', async () => {
+    const page = makeDetailStubPage({
+      anchorFor: () => ({}),
+      clickThrows: true,
+    });
+    const logger = makeCaptureLogger();
+    const business = { name: 'Cafe V', place_id: 'ChIJvvv', maps_url: 'https://www.google.com/maps/place/V' };
+
+    const result = await openDetailPanelOnPage(page, business, { logger });
+
+    expect(result).toBe(false);
+    const clickWarn = logger.warns.find((w) => w.msg.includes('click threw'));
+    expect(clickWarn).toBeDefined();
+    expect(clickWarn.ctx.error).toBe('click intercepted');
+  });
+
+  test('falls back to card-by-aria-label when no anchor matches', async () => {
+    // Simulate: no a[href] matches, but a div[role=article][aria-label] does.
+    const page = makeDetailStubPage({
+      anchorFor: (sel) => {
+        if (sel.includes('role="article"') && sel.includes('Cafe U')) return { click: async () => {} };
+        return null;
+      },
+      urlAfterClick: 'https://www.google.com/maps/place/Cafe+U/@52.5',
+      waitForSelectorThrows: true,
+    });
+    const logger = makeCaptureLogger();
+    const business = { name: 'Cafe U', place_id: 'ChIJu u', maps_url: 'https://www.google.com/maps/place/U' };
+
+    const result = await openDetailPanelOnPage(page, business, { logger });
+
+    expect(result).toBe(true);
+  });
+
+  test('does not throw when business has no place_id or maps_url', async () => {
+    const page = makeDetailStubPage({ anchorFor: () => null });
+    const logger = makeCaptureLogger();
+    const business = { name: 'Mystery Cafe' };
+
+    const result = await openDetailPanelOnPage(page, business, { logger });
+
+    expect(result).toBe(false);
+    // Should still have tried the generic fallback selector
+    const noAnchorWarn = logger.warns.find((w) => w.msg.includes('no anchor/card found'));
+    expect(noAnchorWarn.ctx.triedSelectors).toContain('a[href*="/maps/place/"]');
+  });
+});
+
+describe('safePageUrl', () => {
+  test('returns page.url() when it is a function', () => {
+    const page = { url: () => 'https://example.com/maps' };
+    expect(safePageUrl(page)).toBe('https://example.com/maps');
+  });
+
+  test('returns null when page has no url method (synthetic stub)', () => {
+    const page = { $: async () => null };
+    expect(safePageUrl(page)).toBeNull();
+  });
+
+  test('returns null when page.url() throws', () => {
+    const page = { url: () => { throw new Error('page closed'); } };
+    expect(safePageUrl(page)).toBeNull();
+  });
+
+  test('returns null for null/undefined page', () => {
+    expect(safePageUrl(null)).toBeNull();
+    expect(safePageUrl(undefined)).toBeNull();
   });
 });
 

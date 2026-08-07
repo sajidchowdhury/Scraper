@@ -9,6 +9,51 @@ Phase 1 is tagged `v1.0.0-phase1` — the `-phase1` suffix marks the milestone
 
 ---
 
+## [Unreleased] — post-v1.0.0-phase1 hotfixes
+
+### Fixed
+- **`playwright` missing from `package.json` dependencies** (`04acb38`):
+  fresh-clone installs produced `Cannot find module 'playwright'` because the
+  package was only available globally in the dev sandbox. Now declared as a
+  runtime dependency.
+- **`--dryRun` example was ambiguous and led to "no CSV" confusion**
+  (`d85ef34`): the help text's last (most-memorable) example used `--dryRun`
+  with only a `# no delay, scripted` comment, never warning that no files are
+  written. Reordered the examples (real runs first, smoke-test last) and
+  rewrote the flag description to `"Smoke test: run pipeline but write NO
+  output files"`. Added a Troubleshooting entry with the exact log
+  signatures.
+- **Detail-panel deep scrape opened 0% of panels** (this release):
+  `openDetailPanelOnPage` waited only for DOM selectors including the stale
+  `h1[data-attrid="title"]` (a 2020-era Google Maps selector), and logged
+  every failure at `debug` level (suppressed at default `info`). Every
+  detail open timed out after 3 retries × 12s = ~40s of silent failure per
+  business. Rewrote the function with three hardening stages:
+  1. **Anchor finding**: match by `place_id` first (stable, no CSS-special
+     chars), then `maps_url`, then generic `/maps/place/`, then card-by-
+     `aria-label` fallback.
+  2. **Click**: `scrollIntoViewIfNeeded` before click (target card may be
+     off-screen after scroll-to-load on Google's virtualized feed).
+  3. **Wait**: primary signal is URL change to `/maps/place/` via
+     `page.waitForFunction` (pushState navigation — most robust). Secondary
+     signal is updated DOM selectors (dropped `data-attrid`, added plain
+     `h1`, `div[role="region"]`).
+  Every failure path now logs at `warn` level with `beforeUrl`, `afterUrl`,
+  `urlChanged`, `matchedBy`, and `triedSelectors` so the operator can see
+  exactly which stage failed. Added `safePageUrl` helper (exported) for
+  robust `page.url()` reads on synthetic test pages.
+
+### Added
+- `tests/detail.test.js`: 11 new tests for the hardened `openDetailPanelOnPage`
+  (7 tests: no-anchor, selector ordering, URL-change success, timeout-with-
+  urlChanged, click-threw, card-by-aria-label fallback, no-place_id grace) and
+  `safePageUrl` (4 tests). Total suite: **410 tests / 1028 assertions**.
+- `SELECTORS.md`: new "Detail-panel open strategy" section documenting the
+  three-stage approach with selector tables and the historical note on why
+  `data-attrid` was dropped.
+
+---
+
 ## [v1.0.0-phase1] — 2026-08-07
 
 The Phase 1 milestone: a single-query, single-machine Google Maps business
