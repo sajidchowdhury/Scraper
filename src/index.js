@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * src/index.js — CLI entry point (Phases 1.0 → 1.7)
+ * src/index.js — CLI entry point (Phases 1.0 → 1.8)
  *
  * Pipeline:
  *   loadConfig → [shouldResume] → launchBrowser → performSearch
@@ -23,11 +23,24 @@
  *   - Per-business error isolation: a failed extraction or detail-scrape is
  *     logged + counted, never crashes the run.
  *
+ * Phase 1.8 — Minimal anti-block behavior:
+ *   - RateLimiter (default 30 req/min) gates every Google-bound HTTP request
+ *     (page.goto in search + each detail-panel open in deep-scrape).
+ *   - Human typing in the search box (char-by-char, 50-150ms jitter) unless
+ *     --noHumanTyping.
+ *   - Randomized delays between scroll actions (800-2000ms), before Enter
+ *     (500-1500ms), and between detail visits (1500-3500ms).
+ *   - User-agent randomized per run from a list of 8 recent real Chrome UAs.
+ *   - 429/503 response watcher attached to the page (logs + alerts).
+ *   - CAPTCHA detection after search and after each detail scrape; on detect,
+ *     pauses (default 5min) + prints a clear alert, then aborts with the
+ *     checkpoint preserved for --resume. Auto-solve is Phase 2.
+ *
  * Exit codes (Phase 1.10 prep):
  *   0 = success (all businesses extracted/scraped cleanly)
  *   1 = partial success (run completed but some businesses failed)
  *   2 = config error
- *   3 = runtime error (crash)
+ *   3 = runtime error (crash / CAPTCHA abort)
  */
 
 const path = require('path');
@@ -47,6 +60,7 @@ const {
   buildDedupSet,
   dedupKey,
 } = require('./checkpoint');
+const { RateLimiter, detectCaptcha } = require('./antiblock');
 
 async function main() {
   const cfg = loadConfig(process.argv.slice(2));
@@ -85,7 +99,18 @@ async function main() {
     fresh: cfg.fresh,
     checkpointInterval: cfg.checkpointInterval,
     retry: cfg.retry,
+    antiblock: {
+      maxRPM: cfg.antiblock.maxRequestsPerMin,
+      humanTyping: cfg.antiblock.humanTyping,
+      captchaPause: cfg.antiblock.captchaPause,
+      scrollDelay: [cfg.antiblock.scrollDelayMinMs, cfg.antiblock.scrollDelayMaxMs],
+      detailDelay: [cfg.antiblock.detailDelayMinMs, cfg.antiblock.detailDelayMaxMs],
+    },
   });
+
+  // Phase 1.8 — construct the rate limiter once and attach to cfg so every
+  // module that makes Google-bound requests (search, detail) can acquire.
+  cfg.rateLimiter = new RateLimiter(cfg.antiblock.maxRequestsPerMin, { logger });
 
   // Phase 1.7 — checkpoint resume decision (before launching the browser,
   // so we know whether to seed the businesses array).
@@ -117,17 +142,19 @@ async function main() {
   let result;
 
   try {
-    result = await withBrowser(cfg, async ({ page }) => {
-      // We always re-search + re-scroll on resume — a live browser session
-      // can't be restored, only the extracted data can.
-      await performSearch(page, cfg, logger, cfg.retry);
+    result = await withBrowser(
+      cfg,
+      async ({ page }) => {
+        // We always re-search + re-scroll on resume — a live browser session
+        // can't be restored, only the extracted data can.
+        await performSearch(page, cfg, logger, cfg.retry, cfg.rateLimiter);
 
-      const scrollResult = await scrollFeedToBottomOnPage(page, cfg, logger);
-      logger.info('Scroll complete', {
-        finalCount: scrollResult.finalCount,
-        reason: scrollResult.reason,
-        elapsedMs: scrollResult.elapsedMs,
-      });
+        const scrollResult = await scrollFeedToBottomOnPage(page, cfg, logger);
+        logger.info('Scroll complete', {
+          finalCount: scrollResult.finalCount,
+          reason: scrollResult.reason,
+          elapsedMs: scrollResult.elapsedMs,
+        });
 
       const { businesses: freshBusinesses, extractionRates, stats: extractStats } =
         await extractBusinesses(page, {
@@ -217,7 +244,13 @@ async function main() {
           }
         };
 
-        detailStats = await deepScrapeAll(page, allBusinesses, cfg, logger, { onProgress });
+        detailStats = await deepScrapeAll(page, allBusinesses, cfg, logger, {
+          onProgress,
+          // Phase 1.8 — CAPTCHA hook: check after each business. If detected,
+          // deepScrapeAll pauses + aborts with err.code === 'CAPTCHA_DETECTED'.
+          captchaCheck: cfg.antiblock.captchaPause ? () => detectCaptcha(page) : null,
+          captchaWaitMs: cfg.antiblock.captchaWaitMs,
+        });
         const detailDuration = Date.now() - detailStart;
         logger.info('Deep-scrape phase complete', {
           attempted: detailStats.attempted,
@@ -253,10 +286,31 @@ async function main() {
           newCount,
           skipped: skipCount,
         },
+        antiblock: {
+          maxRPM: cfg.antiblock.maxRequestsPerMin,
+          rateLimitWaits: cfg.rateLimiter ? cfg.rateLimiter.totalWaits : 0,
+          humanTyping: cfg.antiblock.humanTyping,
+        },
       };
-    });
+    },
+    {
+      // Phase 1.8 — wire the 429/503 watcher. On a blocked response we just
+      // log (the rate limiter + CAPTCHA check handle the actual backoff).
+      logger,
+      onBlocked: ({ status, url, count }) => {
+        logger.warn('Google returned a block-status response', { status, url, count });
+      },
+    },
+  );
   } catch (err) {
-    logger.error('Runtime error during pipeline', { message: err.message, stack: err.stack });
+    if (err && err.code === 'CAPTCHA_DETECTED') {
+      logger.error('Run aborted — CAPTCHA detected', {
+        indicator: err.captchaIndicator,
+        hint: 'Wait for the block to clear, then rerun with --resume',
+      });
+    } else {
+      logger.error('Runtime error during pipeline', { message: err.message, stack: err.stack });
+    }
     logger.warn('Checkpoint preserved on disk — rerun with --resume to continue');
     clearTimeout(globalTimer);
     process.removeListener('SIGINT', onSigInt);

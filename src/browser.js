@@ -1,35 +1,38 @@
 'use strict';
 
 /**
- * src/browser.js — Phase 1.2
+ * src/browser.js — Phase 1.2 (Phase 1.8: anti-block integration)
  *
- * Launches Playwright Chromium with config-driven options (headless, slowMo,
- * viewport). Returns { browser, page }. Caller is responsible for closing
- * in a try/finally — see withBrowser() helper below.
+ * Launches Playwright Chromium with config-driven options (headless, viewport,
+ * randomized user-agent). Returns { browser, context, page }. Caller is
+ * responsible for closing in a try/finally — see withBrowser() helper below.
+ *
+ * Phase 1.8 changes:
+ *   - User-agent list + pickUserAgent() moved to src/antiblock.js (expanded to
+ *     8 recent real Chrome UAs across Windows / macOS / Linux).
+ *   - slowMo no longer has a default — randomized delays are applied at each
+ *     action site (scroll / type / detail) instead of a global metronome. The
+ *     SLOW_MO env var still works for debugging but defaults to 0.
+ *   - Optional attachBlockWatcher hook: callers can pass an onBlocked callback
+ *     to be notified of Google 429 / 503 responses (handled in index.js).
  */
 
 const { chromium } = require('playwright');
+const { pickUserAgent, attachBlockWatcher } = require('./antiblock');
 
-const USER_AGENTS = [
-  // Real recent desktop Chrome UAs — picked at random per launch (Phase 1.8 prep)
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-];
-
-function pickUserAgent() {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
-
-async function launchBrowser(cfg) {
+async function launchBrowser(cfg, opts = {}) {
   const browser = await chromium.launch({
     headless: cfg.headless,
+    // slowMo default 0 — Phase 1.8 relies on explicit randomized delays at
+    // each action site instead of a global slowMo (which is metronomic and
+    // thus fingerprintable). SLOW_MO env still honored for debugging.
     slowMo: cfg.slowMo || undefined,
   });
 
+  const ua = pickUserAgent();
   const context = await browser.newContext({
     viewport: { width: cfg.viewportWidth, height: cfg.viewportHeight },
-    userAgent: pickUserAgent(),
+    userAgent: ua,
     locale: 'en-US',
     timezoneId: 'America/Toronto',
   });
@@ -37,6 +40,22 @@ async function launchBrowser(cfg) {
   context.setDefaultTimeout(cfg.navTimeoutMs || 60000);
 
   const page = await context.newPage();
+
+  // Phase 1.8 — attach the HTTP 429/503 watcher if a callback was provided.
+  // The callback decides what to do (pause + alert, or exit). The watcher
+  // itself just detects and forwards.
+  let detachWatcher = null;
+  if (typeof opts.onBlocked === 'function' || opts.logger) {
+    detachWatcher = attachBlockWatcher(page, {
+      logger: opts.logger || null,
+      onBlocked: opts.onBlocked || null,
+      hostFilter: 'google.com',
+    });
+  }
+
+  // Expose detach so the caller can read blockedCount at teardown if wanted.
+  page._antiblockDetach = detachWatcher;
+
   return { browser, context, page };
 }
 
@@ -52,14 +71,24 @@ async function closeBrowser(browser) {
 /**
  * Convenience wrapper: ensures browser closes even on error.
  * Usage: await withBrowser(cfg, async ({ page }) => { ... })
+ *
+ * Phase 1.8: pass { logger, onBlocked } in the third arg to wire the
+ * 429/503 watcher into the page.
  */
-async function withBrowser(cfg, fn) {
-  const { browser, page } = await launchBrowser(cfg);
+async function withBrowser(cfg, fn, opts = {}) {
+  const { browser, page } = await launchBrowser(cfg, opts);
   try {
     return await fn({ browser, page });
   } finally {
+    if (typeof page._antiblockDetach === 'function') {
+      try {
+        page._antiblockDetach();
+      } catch {
+        /* best-effort */
+      }
+    }
     await closeBrowser(browser);
   }
 }
 
-module.exports = { launchBrowser, closeBrowser, withBrowser, pickUserAgent };
+module.exports = { launchBrowser, closeBrowser, withBrowser };

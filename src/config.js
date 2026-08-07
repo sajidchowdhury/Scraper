@@ -75,6 +75,11 @@ function parseArgs(argv) {
     else if (a === '--checkpointInterval') out.checkpointInterval = argv[++i];
     else if (a === '--maxRetries') out.maxRetries = argv[++i];
     else if (a === '--retryBaseMs') out.retryBaseMs = argv[++i];
+    // Phase 1.8 — minimal anti-block behavior
+    else if (a === '--maxRPM') out.maxRPM = argv[++i];
+    else if (a === '--noHumanTyping') out.humanTyping = false;
+    else if (a === '--noCaptchaPause') out.captchaPause = false;
+    else if (a === '--captchaWaitMs') out.captchaWaitMs = argv[++i];
   }
   return out;
 }
@@ -115,6 +120,17 @@ function validate(cfg) {
   }
   if (cfg.resume && cfg.fresh) {
     errors.push('--resume and --fresh are mutually exclusive');
+  }
+  // Phase 1.8 — antiblock validation
+  if (cfg.antiblock.maxRequestsPerMin < 1 || cfg.antiblock.maxRequestsPerMin > 600) {
+    errors.push(
+      `maxRPM must be between 1 and 600 (got ${cfg.antiblock.maxRequestsPerMin})`,
+    );
+  }
+  if (cfg.antiblock.captchaWaitMs < 0 || cfg.antiblock.captchaWaitMs > 3_600_000) {
+    errors.push(
+      `captchaWaitMs must be between 0 and 3600000 (got ${cfg.antiblock.captchaWaitMs})`,
+    );
   }
   return errors;
 }
@@ -195,6 +211,29 @@ function loadConfig(argv = process.argv.slice(2)) {
       baseMs: toIntOrNull(cli.retryBaseMs ?? process.env.RETRY_BASE_MS) ?? 1000,
     },
 
+    // Phase 1.8 — Minimal anti-block behavior
+    antiblock: {
+      maxRequestsPerMin:
+        toIntOrNull(cli.maxRPM ?? process.env.MAX_REQUESTS_PER_MIN) ?? 30,
+      humanTyping: cli.humanTyping !== undefined ? cli.humanTyping : process.env.HUMAN_TYPING !== 'false',
+      captchaPause:
+        cli.captchaPause !== undefined ? cli.captchaPause : process.env.CAPTCHA_PAUSE !== 'false',
+      captchaWaitMs: toIntOrNull(cli.captchaWaitMs ?? process.env.CAPTCHA_WAIT_MS) ?? 5 * 60 * 1000,
+      // Delay ranges (ms). Spec defaults:
+      //   scroll: 800-2000, extraction inter-batch: 200-600,
+      //   detail visit: 1500-3500, pre-Enter: 500-1500, typing key: 50-150
+      scrollDelayMinMs: toIntOrNull(process.env.SCROLL_DELAY_MIN_MS) ?? 800,
+      scrollDelayMaxMs: toIntOrNull(process.env.SCROLL_DELAY_MAX_MS) ?? 2000,
+      extractDelayMinMs: toIntOrNull(process.env.EXTRACT_DELAY_MIN_MS) ?? 200,
+      extractDelayMaxMs: toIntOrNull(process.env.EXTRACT_DELAY_MAX_MS) ?? 600,
+      detailDelayMinMs: toIntOrNull(process.env.DETAIL_DELAY_MIN_MS) ?? 1500,
+      detailDelayMaxMs: toIntOrNull(process.env.DETAIL_DELAY_MAX_MS) ?? 3500,
+      preEnterDelayMinMs: toIntOrNull(process.env.PRE_ENTER_DELAY_MIN_MS) ?? 500,
+      preEnterDelayMaxMs: toIntOrNull(process.env.PRE_ENTER_DELAY_MAX_MS) ?? 1500,
+      typeKeyMinMs: toIntOrNull(process.env.TYPE_KEY_MIN_MS) ?? 50,
+      typeKeyMaxMs: toIntOrNull(process.env.TYPE_KEY_MAX_MS) ?? 150,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -237,6 +276,11 @@ Optional:
   --checkpointInterval <n>   Write checkpoint every N new records (default: 10)
   --maxRetries <n>           Retry attempts for transient ops (default: 3)
   --retryBaseMs <ms>         Base backoff for retries, doubles each time (default: 1000)
+
+  --maxRPM <n>               Phase 1.8 — max Google requests per minute (default: 30)
+  --noHumanTyping            Phase 1.8 — disable char-by-char search typing
+  --noCaptchaPause           Phase 1.8 — don't pause on CAPTCHA (just exit)
+  --captchaWaitMs <ms>       Phase 1.8 — how long to pause on CAPTCHA (default: 300000)
 
   --version                  Print version and exit
   --help, -h                 Show this help

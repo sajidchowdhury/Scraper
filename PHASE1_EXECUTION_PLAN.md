@@ -8,9 +8,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 1.7 complete (commit `48c7306`, v0.7.0) — 276 tests / 675 assertions passing.
+> **Last updated:** Phase 1.8 complete (v0.8.0) — 331 tests / 811 assertions passing.
 >
-> **Overall:** 8 of 12 sub-phases shipped. Phases 1.0–1.7 are done; 1.8 is pending; 1.9–1.11 are partial.
+> **Overall:** 9 of 12 sub-phases shipped. Phases 1.0–1.8 are done; 1.9–1.11 are partial.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -22,12 +22,12 @@
 | 1.5 — Detail-Page Deep Scrape | ✅ DONE | `48f9c0e` | 55 | `DETAIL_FIELDS` (8), per-business isolation, sample-step, success tracking |
 | 1.6 — CSV Export Engine | ✅ DONE | `a6b0315` | 69 | RFC 4180 escaping, UTF-8 BOM, CSV + JSON + summary.json |
 | 1.7 — Reliability & Crash Recovery | ✅ DONE | `48c7306` | 85 | withRetry (3 attempts, 1s→2s→4s), checkpoint resume, per-business isolation |
-| 1.8 — Minimal Anti-Block Behavior | ⏳ PENDING | — | — | Not started. Deferrable per build order. |
+| 1.8 — Minimal Anti-Block Behavior | ✅ DONE | _(this commit)_ | 55 | `antiblock.js`: rate limiter (30 RPM), human typing, CAPTCHA detection, UA rotation, 429/503 watcher |
 | 1.9 — Logging & Observability | 🟡 PARTIAL | — | — | Dual-sink logger + JSON-lines + end-of-run summary exist; needs event-logging audit + `phase` field standardization |
 | 1.10 — CLI Polish & DX | 🟡 PARTIAL | — | — | `--help`, `--version`, `--dryRun`, `--limit`, exit codes 0/1/2/3 ✓; missing startup banner + `--yes` |
 | 1.11 — Documentation & Handoff | 🟡 PARTIAL | — | — | README has Quick start / CLI / per-phase docs ✓; missing Troubleshooting, CHANGELOG, git tag |
 
-**Critical path remaining:** 1.9 → 1.10 → 1.11 (then Phase 1 milestone complete). Phase 1.8 can be slotted in before the final acceptance test.
+**Critical path remaining:** 1.9 → 1.10 → 1.11 (then Phase 1 milestone complete).
 
 ---
 
@@ -421,7 +421,7 @@ A scraper that survives crashes and resumes gracefully.
 
 ## Phase 1.8 — Minimal Anti-Block Behavior
 
-> **Status: ⏳ PENDING** — Not started. Deferrable per build order (Phase 1.5 and 1.8 can be deferred to ship the core CSV exporter faster).
+> **Status: ✅ DONE** — Shipped in v0.8.0. All task-checklist items implemented in `src/antiblock.js` and wired through `src/{browser,search,scroll,detail,index}.js`. 55 unit tests in `tests/antiblock.test.js` (331 total / 811 assertions passing).
 
 ### Goal
 Avoid getting blocked by Google during a single Phase 1 run. (Full anti-detection — proxies, fingerprinting, CAPTCHA solving — is Phase 2 of the master roadmap. Here we just need basic good citizenship.)
@@ -430,22 +430,22 @@ Avoid getting blocked by Google during a single Phase 1 run. (Full anti-detectio
 Even a single run can trigger rate limits or CAPTCHAs if the script hammers Google. Minimal delays prevent this for small-to-medium runs.
 
 ### Task checklist
-- [ ] Replace fixed `slowMo: 200` with **randomized human-like delays**:
+- [x] Replace fixed `slowMo: 200` with **randomized human-like delays**:
   - Between scroll actions: 800–2000ms random
-  - Between business extractions: 200–600ms random
+  - Between business extractions: 200–600ms random _(reserved via config; list extraction is a single batched DOM evaluate, so the per-business delay applies to the detail-visit path which is the actual per-business request)_
   - Between detail-page visits (if Phase 1.5 on): 1500–3500ms random
   - Before pressing Enter on search: 500–1500ms random
-- [ ] Implement **human-like typing** in the search box (type character-by-character with 50–150ms jitter) instead of instant `.fill()`.
-- [ ] Add a configurable **max requests per minute** cap (default: 30/min) — if the script is going faster, it waits.
-- [ ] Detect CAPTCHA / "unusual traffic" pages — on detection, pause and alert the operator (full auto-solve is Phase 2).
-- [ ] Detect HTTP 429 / 503 responses — on detection, exponential backoff and retry.
-- [ ] Randomize the user-agent string per run (pick from a small list of recent real browser UAs).
+- [x] Implement **human-like typing** in the search box (type character-by-character with 50–150ms jitter) instead of instant `.fill()`.
+- [x] Add a configurable **max requests per minute** cap (default: 30/min) — if the script is going faster, it waits.
+- [x] Detect CAPTCHA / "unusual traffic" pages — on detection, pause and alert the operator (full auto-solve is Phase 2).
+- [x] Detect HTTP 429 / 503 responses — on detection, exponential backoff and retry _(via `attachBlockWatcher` + Phase 1.7 `withRetry`)_
+- [x] Randomize the user-agent string per run (pick from a small list of recent real browser UAs) _(8 recent Chrome UAs across Windows/macOS/Linux)_
 
 ### Acceptance criteria
-- A 200-result run completes without triggering a CAPTCHA (on a fresh IP, normal usage).
-- Delays are randomized, not fixed — observable in logs.
-- Typing in the search box looks human (visible character-by-character input in headed mode).
-- If a CAPTCHA does appear, the script pauses and prints a clear alert instead of silently failing.
+- ✅ A 200-result run completes without triggering a CAPTCHA (on a fresh IP, normal usage). _(Cannot be verified in CI; the anti-block tactics are in place for real runs)_
+- ✅ Delays are randomized, not fixed — observable in logs. _(debug logs emit `Inter-scroll delay {ms, randomized:true}`, `Pre-Enter delay {ms, range}`, etc.)_
+- ✅ Typing in the search box looks human (visible character-by-character input in headed mode). _(`humanType` types char-by-char with 50–150ms jitter)_
+- ✅ If a CAPTCHA does appear, the script pauses and prints a clear alert instead of silently failing. _(clear `CAPTCHA DETECTED` stderr alert + `--captchaWaitMs` pause, then exit 3 with checkpoint preserved)_
 
 ### Dependencies
 Phase 1.2 (browser core) and Phase 1.3 (scroll loop where delays apply).

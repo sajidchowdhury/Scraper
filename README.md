@@ -47,6 +47,14 @@ Optional:
                              hours, popular times, reviews, photos, links
   --deepScrapeSampleStep <n> Scrape every Nth business (1 = all, 5 = QA mode)
   --noDeepScrape             Force --deepScrape false (overrides .env)
+  --resume / --fresh         Phase 1.7 — resume from / ignore .checkpoint.json
+  --checkpointInterval <n>   Phase 1.7 — write checkpoint every N records (10)
+  --maxRetries <n>           Phase 1.7 — retry attempts for transient ops (3)
+  --retryBaseMs <ms>         Phase 1.7 — base backoff, doubles each retry (1000)
+  --maxRPM <n>               Phase 1.8 — max Google requests per minute (30)
+  --noHumanTyping            Phase 1.8 — disable char-by-char search typing
+  --noCaptchaPause           Phase 1.8 — don't pause on CAPTCHA (just exit)
+  --captchaWaitMs <ms>       Phase 1.8 — CAPTCHA pause duration (300000)
   --version                  Print version and exit
   --help, -h                 Show this help
 ```
@@ -65,6 +73,7 @@ scraper/
 │   ├── export.js    (Phase 1.6 — CSV + JSON + summary export, RFC 4180 + BOM)
 │   ├── retry.js     (Phase 1.7 — withRetry: exponential backoff for transient ops)
 │   ├── checkpoint.js (Phase 1.7 — crash-recovery checkpoint: read/write/clear/resume)
+│   ├── antiblock.js  (Phase 1.8 — rate limiter, human typing, CAPTCHA detection, UA rotation)
 │   ├── config.js    (env + CLI config loader, validation)
 │   └── logger.js    (dual-sink logger: console + JSON-lines file)
 ├── tests/
@@ -73,7 +82,8 @@ scraper/
 │   ├── export.test.js     (Phase 1.6 unit tests — RFC 4180, BOM, multi-value, e2e)
 │   ├── retry.test.js      (Phase 1.7 unit tests — backoff, retryIf, edge cases)
 │   ├── checkpoint.test.js (Phase 1.7 unit tests — dedup, resume, corrupt handling)
-│   └── config.test.js     (Phase 1.7 config tests — new flags + validation)
+│   ├── config.test.js     (Phase 1.7 config tests — new flags + validation)
+│   └── antiblock.test.js  (Phase 1.8 unit tests — rate limiter, human typing, CAPTCHA)
 ├── data/            (output CSV/JSON + .checkpoint.json, gitignored)
 ├── logs/            (run logs, gitignored)
 ├── .env.example
@@ -288,3 +298,72 @@ the run. The run summary tracks:
 
 The exit code reflects the outcome: `0` = all clean, `1` = partial success
 (some failures but run completed), `3` = systemic crash.
+
+## Phase 1.8 — Minimal Anti-Block Behavior
+
+The scraper behaves politely enough to survive normal-size runs without
+triggering CAPTCHAs or rate limits. Full anti-detection (proxies,
+fingerprinting, CAPTCHA solving) is Phase 2 — here we just practice basic good
+citizenship. All tactics live in `src/antiblock.js`.
+
+### 1. Randomized human-like delays
+
+Fixed/metronomic delays are replaced with randomized ranges (visible in debug
+logs as `Inter-scroll delay`, `Pre-Enter delay`, etc.):
+
+| Action                     | Range (ms)   | Config env vars                  |
+|----------------------------|--------------|----------------------------------|
+| Between scroll actions     | 800–2000    | `SCROLL_DELAY_MIN/MAX_MS`        |
+| Before pressing Enter      | 500–1500    | `PRE_ENTER_DELAY_MIN/MAX_MS`     |
+| Between detail-page visits | 1500–3500   | `DETAIL_DELAY_MIN/MAX_MS`        |
+| Per keypress (typing)      | 50–150      | `TYPE_KEY_MIN/MAX_MS`            |
+
+### 2. Human-like typing
+
+The search query is typed character-by-character with 50–150ms jitter per key
+instead of Playwright's instant `.fill()`. Visible in `--headed` mode as real
+typing. Disable with `--noHumanTyping`.
+
+### 3. Max requests per minute cap
+
+A sliding-window `RateLimiter` (default **30 req/min**) gates every
+Google-bound HTTP request (`page.goto` in search + each detail-panel open in
+deep-scrape). If the script is going faster than the cap, it waits. Override
+with `--maxRPM <n>`.
+
+### 4. CAPTCHA / "unusual traffic" detection
+
+After the search feed appears and after every detail scrape, the page body is
+scanned for known block indicators (`unusual traffic`, `captcha`, `recaptcha`,
+`not a robot`, etc.). On detection the script:
+
+1. Prints a clear `CAPTCHA DETECTED` alert to stderr
+2. Pauses for `--captchaWaitMs` (default 5 min) so the operator can solve it
+   in `--headed` mode
+3. Aborts with exit code 3 — the checkpoint is preserved for `--resume`
+
+Disable the pause with `--noCaptchaPause` (still exits 3). Auto-solve is
+Phase 2.
+
+### 5. HTTP 429 / 503 detection
+
+A `page.on('response')` watcher fires on Google 429 / 503 responses, logging
+a warning with the status + URL. These combine with the rate limiter and
+Phase 1.7 retry/backoff to handle transient throttling.
+
+### 6. User-agent rotation
+
+A user-agent is picked at random per run from a list of 8 recent real desktop
+Chrome UAs (Windows / macOS / Linux) so each run looks like a different
+machine.
+
+```bash
+# Polite default run (30 RPM, human typing, CAPTCHA pause on):
+npm start -- --query "Cafe" --location "Berlin" --maxResults 200
+
+# Aggressive QA mode (faster, still anti-block basics):
+npm start -- --query "Cafe" --location "Berlin" --maxRPM 60 --noHumanTyping
+
+# Headed run so you can solve a CAPTCHA manually if one appears:
+npm start -- --query "Cafe" --location "Berlin" --headed --captchaWaitMs 600000
+```

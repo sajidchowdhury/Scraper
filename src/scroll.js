@@ -16,6 +16,7 @@
  */
 
 const { withRetry } = require('./retry');
+const { randomInt } = require('./antiblock');
 
 /**
  * Count current result cards on the page.
@@ -94,6 +95,18 @@ function sleep(ms) {
 }
 
 /**
+ * Phase 1.8 — pick a randomized inter-scroll delay in [min, max]. If only
+ * batchDelayMs is provided (older callers / tests), returns it unchanged so
+ * deterministic scroll tests stay deterministic.
+ */
+function pickBatchDelay({ batchDelayMs, batchDelayMinMs, batchDelayMaxMs }) {
+  if (batchDelayMinMs != null && batchDelayMaxMs != null) {
+    return randomInt(batchDelayMinMs, batchDelayMaxMs);
+  }
+  return batchDelayMs;
+}
+
+/**
  * Main scroll loop. Accepts dependency-injected functions for testability.
  *
  * @param {object} opts
@@ -103,7 +116,9 @@ function sleep(ms) {
  * @param {number} opts.maxResults                    - stop early if reached (null = unlimited)
  * @param {number} opts.totalTimeoutMs                - hard cap
  * @param {number} opts.stallThreshold                - consecutive no-growth scrolls to stop
- * @param {number} opts.batchDelayMs                  - delay between scroll attempts
+ * @param {number} opts.batchDelayMs                  - delay between scroll attempts (fixed; legacy)
+ * @param {number} [opts.batchDelayMinMs]              - Phase 1.8: min randomized scroll delay
+ * @param {number} [opts.batchDelayMaxMs]              - Phase 1.8: max randomized scroll delay
  * @param {object} opts.logger
  */
 async function scrollFeedToBottom({
@@ -114,6 +129,8 @@ async function scrollFeedToBottom({
   totalTimeoutMs = 90000,
   stallThreshold = 3,
   batchDelayMs = 800,
+  batchDelayMinMs = null,
+  batchDelayMaxMs = null,
   pollIntervalMs = 500,
   logger = { info() {}, debug() {}, warn() {} },
 }) {
@@ -149,7 +166,12 @@ async function scrollFeedToBottom({
     }
 
     await scrollFn();
-    await sleep(batchDelayMs);
+    // Phase 1.8 — randomized inter-scroll delay (800-2000ms by default).
+    // When batchDelayMinMs/MaxMs are unset, falls back to fixed batchDelayMs
+    // (preserves deterministic behavior for legacy callers / unit tests).
+    const delay = pickBatchDelay({ batchDelayMs, batchDelayMinMs, batchDelayMaxMs });
+    logger.debug('Inter-scroll delay', { ms: delay, randomized: batchDelayMinMs != null });
+    await sleep(delay);
 
     // Wait for count to settle after this scroll
     const { count: newCount } = await waitForCountStable(countFn, {
@@ -204,7 +226,12 @@ async function scrollFeedToBottomOnPage(page, cfg, logger) {
     maxResults: cfg.maxResults,
     totalTimeoutMs: cfg.scroll.totalTimeoutMs,
     stallThreshold: cfg.scroll.stallThreshold,
+    // Phase 1.8 — randomized scroll delay from cfg.antiblock (800-2000ms by
+    // default). Falls back to cfg.scroll.batchDelayMs only if antiblock
+    // ranges are missing (shouldn't happen with current config defaults).
     batchDelayMs: cfg.scroll.batchDelayMs,
+    batchDelayMinMs: cfg.antiblock ? cfg.antiblock.scrollDelayMinMs : null,
+    batchDelayMaxMs: cfg.antiblock ? cfg.antiblock.scrollDelayMaxMs : null,
     pollIntervalMs: cfg.scroll.pollIntervalMs,
     logger,
   });
@@ -217,5 +244,6 @@ module.exports = {
   waitForCountStable,
   scrollFeedToBottom,
   scrollFeedToBottomOnPage,
+  pickBatchDelay,
   sleep,
 };

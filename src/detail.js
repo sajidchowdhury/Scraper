@@ -18,17 +18,26 @@
  *
  * Design rules (per Phase 1.5 spec):
  *   - Toggleable: --deepScrape true|false, default false (keep runs fast)
- *   - Per-detail randomized delay (1-3s default) to avoid hammering Google
+ *   - Per-detail randomized delay (1.5-3.5s default, Phase 1.8) to avoid
+ *     hammering Google
  *   - Per-business failure isolation: a failed detail load logs + continues;
  *     that business keeps its list-view fields with null detail fields
  *   - Detail-scrape success rate tracked + logged
  *   - Adds ~2-4s per business (measurable in logs)
+ *
+ * Phase 1.8 additions:
+ *   - Rate limiter: acquire a slot before each detail-panel open (the only
+ *     new HTTP request per business). Pass cfg.rateLimiter from index.js.
+ *   - CAPTCHA detection: deepScrapeAll accepts a captchaCheck hook; after each
+ *     business, if the hook reports a CAPTCHA, the run pauses + alerts the
+ *     operator, then aborts (auto-solve is Phase 2).
  *
  * Functions accept injectable openFn/extractFn/backFn for unit testing
  * without a real browser (DI pattern, matching src/scroll.js).
  */
 
 const { withRetry } = require('./retry');
+const { randomInt } = require('./antiblock');
 
 // ---------------------------------------------------------------------------
 // Detail field schema (exported for CSV column order in Phase 1.6)
@@ -582,8 +591,9 @@ async function deepScrapeDetails({
       };
     }
 
-    // Randomized inter-detail delay — avoids a metronomic request pattern
-    const delay = delayMinMs + Math.floor(Math.random() * Math.max(0, delayMaxMs - delayMinMs));
+    // Randomized inter-detail delay — avoids a metronomic request pattern.
+    // Phase 1.8: delay range now 1500-3500ms (was 1000-3000) per spec.
+    const delay = randomInt(delayMinMs, delayMaxMs);
     await sleep(delay);
 
     if (timedOut) throw new Error(`detail-scrape timeout (${timeoutMs}ms) during delay`);
@@ -738,10 +748,18 @@ async function backToListOnPage(page, { logger }) {
  */
 async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
   const detailCfg = (cfg && cfg.detail) || {};
+  const ab = (cfg && cfg.antiblock) || {};
   const hasRetry = !!(cfg && cfg.retry);
   const retryOpts = hasRetry
     ? { attempts: cfg.retry.attempts || 3, baseMs: cfg.retry.baseMs || 1000, logger }
     : { attempts: 1, baseMs: 0, logger };
+
+  // Phase 1.8 — rate-limit the detail-panel open (it triggers an XHR to
+  // Google). Acquire before the openFn so the cap covers the actual request.
+  const rateLimiter = cfg && cfg.rateLimiter;
+  if (rateLimiter && typeof rateLimiter.acquire === 'function') {
+    await rateLimiter.acquire(`detail.open(${business && business.name ? business.name : '?'})`);
+  }
 
   const openFn = hasRetry
     ? () =>
@@ -764,6 +782,8 @@ async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
         })
     : () => backToListOnPage(page, { logger });
 
+  // Phase 1.8 — prefer antiblock detail delay range (1500-3500ms) when present;
+  // fall back to detailCfg values (1000-3000) for backward compat.
   return deepScrapeDetails({
     business,
     openFn,
@@ -773,8 +793,8 @@ async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
         maxPhotos: detailCfg.maxPhotos ?? 5,
       }),
     backFn,
-    delayMinMs: detailCfg.delayMinMs ?? 1000,
-    delayMaxMs: detailCfg.delayMaxMs ?? 3000,
+    delayMinMs: ab.detailDelayMinMs ?? detailCfg.delayMinMs ?? 1500,
+    delayMaxMs: ab.detailDelayMaxMs ?? detailCfg.delayMaxMs ?? 3500,
     timeoutMs: detailCfg.timeoutMs ?? 15000,
     logger,
   });
@@ -795,12 +815,20 @@ async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
  * @param {(progress: {index, attempted, succeeded, failed}) => void} [hooks.onProgress]
  *        Called after each business is deep-scraped; index.js uses this to
  *        write a checkpoint file every N records.
+ * @param {() => Promise<{detected: boolean, indicator: string|null}>} [hooks.captchaCheck]
+ *        Phase 1.8 — async function checked after each business; if it reports
+ *        a CAPTCHA, the run pauses + alerts the operator, then aborts.
+ * @param {number} [hooks.captchaWaitMs]
+ *        Phase 1.8 — how long to pause when a CAPTCHA is detected (default 300000).
  * @returns {Promise<{ successRate, attempted, succeeded, failed, durations }>}
  */
 async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
   const detailCfg = (cfg && cfg.detail) || {};
+  const ab = (cfg && cfg.antiblock) || {};
   const sampleStep = detailCfg.sampleStep ?? 1; // 1 = every business; 5 = every 5th (QA mode)
   const onProgress = hooks.onProgress || (() => {});
+  const captchaCheck = hooks.captchaCheck || null;
+  const captchaWaitMs = hooks.captchaWaitMs ?? ab.captchaWaitMs ?? 300_000;
 
   let attempted = 0;
   let succeeded = 0;
@@ -811,7 +839,9 @@ async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
   logger.info('Deep-scrape started', {
     total: businesses.length,
     sampleStep,
-    delayRangeMs: [detailCfg.delayMinMs ?? 1000, detailCfg.delayMaxMs ?? 3000],
+    delayRangeMs: [ab.detailDelayMinMs ?? detailCfg.delayMinMs ?? 1500, ab.detailDelayMaxMs ?? detailCfg.delayMaxMs ?? 3500],
+    rateLimited: !!(cfg && cfg.rateLimiter),
+    captchaCheck: !!captchaCheck,
   });
 
   for (let i = 0; i < businesses.length; i++) {
@@ -851,6 +881,45 @@ async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
 
     // Phase 1.7 — notify caller after each scrape so it can checkpoint.
     onProgress({ index: i, attempted, succeeded, failed });
+
+    // Phase 1.8 — CAPTCHA check after each business. If Google throttled us,
+    // pause + alert the operator, then abort the deep-scrape phase (auto-solve
+    // is Phase 2). The checkpoint stays on disk for a --resume rerun.
+    if (captchaCheck) {
+      let captcha;
+      try {
+        captcha = await captchaCheck();
+      } catch (err) {
+        logger.debug('captchaCheck hook threw (non-fatal)', { error: err.message });
+        captcha = { detected: false, indicator: null };
+      }
+      if (captcha.detected) {
+        logger.error('CAPTCHA / block detected during deep-scrape — pausing', {
+          indicator: captcha.indicator,
+          pauseMs: captchaWaitMs,
+          attemptedSoFar: attempted,
+          business: b && b.name ? b.name : '(unknown)',
+        });
+        // eslint-disable-next-line no-console
+        console.error(
+          '\n========================================\n' +
+            'CAPTCHA DETECTED — Google is throttling this run.\n' +
+            `Indicator: ${captcha.indicator}\n` +
+            `Pausing ${Math.round(captchaWaitMs / 1000)}s for operator action.\n` +
+            'In --headed mode: solve the CAPTCHA in the browser window.\n' +
+            'The checkpoint is preserved — rerun with --resume after the block clears.\n' +
+            '========================================\n',
+        );
+        await sleep(captchaWaitMs);
+        const err = new Error(
+          `CAPTCHA detected during deep-scrape (indicator: "${captcha.indicator}"). ` +
+            'Run aborted after operator pause. Rerun with --resume once the block clears.',
+        );
+        err.code = 'CAPTCHA_DETECTED';
+        err.captchaIndicator = captcha.indicator;
+        throw err;
+      }
+    }
   }
 
   const successRate = attempted === 0 ? 0 : Math.round((succeeded / attempted) * 1000) / 10;

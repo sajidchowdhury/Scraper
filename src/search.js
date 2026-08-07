@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * src/search.js — Phase 1.2 (Phase 1.7: retry on transient failures)
+ * src/search.js — Phase 1.2 (Phase 1.7: retry; Phase 1.8: anti-block)
  *
  * Navigates to Google Maps and performs the search for `query` in `location`.
  * Returns once the results feed (div[role="feed"]) is detected.
@@ -10,14 +10,30 @@
  *   - page.goto wrapped in withRetry (transient network blips)
  *   - feed-detection waits wrapped in withRetry (slow first-paint)
  *   - On final failure, throws — the caller (index.js) logs + exits 3.
+ *
+ * Phase 1.8 additions:
+ *   - Rate limiter: acquire a slot before page.goto (the only HTTP request
+ *     this module makes). Pass cfg.rateLimiter from index.js.
+ *   - Human typing: replace searchInput.fill() with humanType() (char-by-char
+ *     with 50-150ms jitter) unless cfg.antiblock.humanTyping is false.
+ *   - Pre-Enter randomized delay (500-1500ms) — looks like a human reading
+ *     the autocomplete before submitting.
+ *   - CAPTCHA detection after the feed appears: if Google throttled us, the
+ *     feed won't render and detectCaptcha() will surface the reason instead
+ *     of a cryptic "feed did not appear" error.
  */
 
 const { withRetry } = require('./retry');
+const { humanType, randomDelay, detectCaptcha } = require('./antiblock');
 
 const MAPS_URL = 'https://www.google.com/maps?hl=en';
 
-async function navigateToMaps(page, logger, retryOpts = {}) {
+async function navigateToMaps(page, logger, retryOpts = {}, rateLimiter = null) {
   logger.info('Navigating to Google Maps', { url: MAPS_URL });
+  // Phase 1.8 — rate-limit the only outbound HTTP request this module makes.
+  if (rateLimiter && typeof rateLimiter.acquire === 'function') {
+    await rateLimiter.acquire('page.goto(maps)');
+  }
   // Retry only when retryOpts is explicitly provided (production path).
   const hasRetry = retryOpts && retryOpts.attempts > 1;
   const gotoFn = () => page.goto(MAPS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -62,19 +78,49 @@ async function getSearchInput(page) {
   return null;
 }
 
-async function performSearch(page, { query, location }, logger, retryOpts = {}) {
-  await navigateToMaps(page, logger, retryOpts);
+/**
+ * Phase 1.8 — type the query char-by-char with randomized jitter, unless
+ * antiblock.humanTyping is false (then fall back to instant .fill()).
+ */
+async function typeSearchQuery(page, searchInput, fullQuery, cfg, logger) {
+  const ab = (cfg && cfg.antiblock) || {};
+  if (ab.humanTyping === false) {
+    logger.debug('Human typing disabled — using instant fill', { chars: fullQuery.length });
+    await searchInput.fill(fullQuery);
+    return { typed: 'fill', chars: fullQuery.length, delays: [] };
+  }
+  const minMs = ab.typeKeyMinMs ?? 50;
+  const maxMs = ab.typeKeyMaxMs ?? 150;
+  const result = await humanType(page, fullQuery, { minMs, maxMs });
+  logger.debug('Human-typed search query', {
+    chars: result.chars,
+    keyDelayRange: [minMs, maxMs],
+    totalTypedMs: result.delays.reduce((a, b) => a + b, 0),
+  });
+  return { typed: 'human', ...result };
+}
+
+async function performSearch(page, cfg, logger, retryOpts = {}, rateLimiter = null) {
+  const ab = (cfg && cfg.antiblock) || {};
+  await navigateToMaps(page, logger, retryOpts, rateLimiter);
 
   const searchInput = await getSearchInput(page);
   if (!searchInput) {
     throw new Error('Search input not found — Google Maps DOM may have changed');
   }
 
-  const fullQuery = `${query} in ${location}`;
-  logger.info('Submitting search', { query: fullQuery });
+  const fullQuery = `${cfg.query} in ${cfg.location}`;
+  logger.info('Submitting search', { query: fullQuery, humanTyping: ab.humanTyping !== false });
 
   await searchInput.click();
-  await searchInput.fill(fullQuery);
+  await typeSearchQuery(page, searchInput, fullQuery, cfg, logger);
+
+  // Phase 1.8 — randomized pre-Enter delay (500-1500ms). Looks like a human
+  // glancing at the autocomplete suggestions before submitting.
+  const preEnterMin = ab.preEnterDelayMinMs ?? 500;
+  const preEnterMax = ab.preEnterDelayMaxMs ?? 1500;
+  const preWait = await randomDelay(preEnterMin, preEnterMax);
+  logger.debug('Pre-Enter delay', { ms: preWait, range: [preEnterMin, preEnterMax] });
   await page.keyboard.press('Enter');
 
   // Wait for the results feed to appear — wrapped in retry so a slow
@@ -91,6 +137,16 @@ async function performSearch(page, { query, location }, logger, retryOpts = {}) 
     }
     logger.info('Results feed detected');
   } catch {
+    // Phase 1.8 — before declaring failure, check whether Google is actually
+    // showing a CAPTCHA / "unusual traffic" page. If so, surface that as the
+    // root cause instead of the generic "feed did not appear" message.
+    const captcha = await detectCaptcha(page);
+    if (captcha.detected) {
+      throw new Error(
+        `Google CAPTCHA / block detected during search (indicator: "${captcha.indicator}"). ` +
+          'Rerun later, lower --maxRPM, or solve the CAPTCHA manually in a --headed run.',
+      );
+    }
     // Fallback: wait for any result card
     try {
       if (hasRetry) {
@@ -107,4 +163,4 @@ async function performSearch(page, { query, location }, logger, retryOpts = {}) 
   return { fullQuery };
 }
 
-module.exports = { performSearch, navigateToMaps, getSearchInput, MAPS_URL };
+module.exports = { performSearch, navigateToMaps, getSearchInput, typeSearchQuery, MAPS_URL };
