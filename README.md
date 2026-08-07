@@ -1,161 +1,110 @@
-# Google Maps Scraper
+# gmaps-scraper
 
-A Node.js scraper that extracts business data from Google Maps and exports it to CSV.
+Google Maps business scraper — **Phase 1**: search → paginate → extract → export.
 
-## Current status: Phase 1.3 — Pagination / Infinite-Scroll Handling
-
-The project is structured into clean modules, the search target is fully
-configurable, the browser lifecycle is bulletproof, and the scraper now
-**paginates through all results** in the feed (not just the first ~20).
-Field extraction and CSV export land in subsequent phases.
-
-- Full roadmap (Phases 1–5): see [`SCRAPER_FEATURES.md`](./SCRAPER_FEATURES.md)
-- Phase 1 step-by-step plan: see [`PHASE1_EXECUTION_PLAN.md`](./PHASE1_EXECUTION_PLAN.md)
-
-## Requirements
-
-- **Node.js** >= 20 LTS
-- **Chromium** (installed via Playwright)
+> Implements sub-phases 1.0 through 1.4 of `PHASE1_EXECUTION_PLAN.md`.
 
 ## Quick start
 
 ```bash
-npm install
-npx playwright install chromium
-cp .env.example .env      # then edit .env to taste
-npm start                 # uses .env defaults
+# 1. Install (Playwright is symlinked from the global install — no npm install needed
+#    in this sandbox; in a fresh checkout run `npm install playwright`.)
+cp .env.example .env
+
+# 2. Run
+npm start -- --query "Restaurant" --location "Toronto" --maxResults 50
+# or headed for debugging:
+npm start -- --query "Cafe" --location "Berlin" --headed --verbose
 ```
 
-## Usage
+Output JSON is written to `data/{query}_{location}_{timestamp}.json` and includes
+a run summary plus the full extracted business list.
 
-The scraper accepts CLI flags that override `.env` values. Precedence is
-**CLI > env > defaults**.
+## CLI
 
-```bash
-# Use .env defaults (DEFAULT_QUERY / DEFAULT_LOCATION)
-npm start
-
-# Override search target via CLI
-npm start -- --query "Cafe" --location "Berlin"
-
-# Limit the number of results (enforced starting in Phase 1.3)
-npm start -- --query "Restaurant" --location "Toronto" --max-results 50
-
-# Specify a custom output file path (used starting in Phase 1.6)
-npm start -- --query "Restaurant" --location "Toronto" --output-file ./data/my-run.csv
-
-# Combine multiple flags
-npm start -- -q "Plumber" -l "Dhaka, Bangladesh" -m 100 -o ./data/plumbers.csv
-
-# Show help
-npm start -- --help
-
-# Show version
-npm start -- --version
 ```
+Required:
+  --query, -q <string>      What to search (e.g. "Restaurant")
+  --location, -l <string>   Where to search (e.g. "Toronto")
 
-### CLI flags
-
-| Flag                          | Env var                | Required | Description                                              |
-|-------------------------------|------------------------|----------|----------------------------------------------------------|
-| `-q, --query <query>`         | `DEFAULT_QUERY`        | yes      | What to search for (e.g. `"Restaurant"`)                 |
-| `-l, --location <location>`   | `DEFAULT_LOCATION`     | yes      | Where to search (e.g. `"Toronto"`)                       |
-| `-m, --max-results <number>`  | `DEFAULT_MAX_RESULTS`  | no       | Max businesses to scrape (default: all available)        |
-| `-o, --output-file <path>`    | `OUTPUT_FILE`          | no       | Output CSV path (default: auto-generated in `OUTPUT_DIR`)|
-
-If neither the CLI flag nor the env var supplies a required field, the script
-prints a friendly error and exits with code `2`.
-
-## Configuration
-
-Environment variables (see [`.env.example`](./.env.example)) provide defaults
-that CLI flags override.
-
-| Variable                | Default      | Description                                              |
-|-------------------------|--------------|----------------------------------------------------------|
-| `DEFAULT_QUERY`         | `Restaurant` | What to search for (overridden by `--query`)             |
-| `DEFAULT_LOCATION`      | `Toronto`    | Where to search (overridden by `--location`)             |
-| `DEFAULT_MAX_RESULTS`   | *(empty)*    | Max businesses; empty = all (overridden by `--max-results`) |
-| `HEADLESS`              | `false`      | `true` to run without a visible browser                  |
-| `SLOW_MO`               | `200`        | Ms delay between Playwright actions (debug aid)          |
-| `VIEWPORT_WIDTH`        | `1400`       | Browser viewport width                                   |
-| `VIEWPORT_HEIGHT`       | `900`        | Browser viewport height                                  |
-| `OUTPUT_DIR`            | `./data`     | Directory where CSV/JSON outputs are written             |
-| `OUTPUT_FILE`           | *(empty)*    | Output CSV path; empty = auto-generated (overridden by `--output-file`) |
-| `RUN_TIMEOUT_MS`        | `300000`     | Global run timeout in ms (min `5000`); prevents hangs → exit `3` |
-| `SCROLL_TIMEOUT_MS`     | `60000`      | Per-pagination budget in ms (min `5000`); scroll gives up after this |
-| `SCROLL_STALL_THRESHOLD`| `3`          | Consecutive no-progress scrolls before declaring results exhausted (min `1`) |
-| `LOG_LEVEL`             | `info`       | `debug` \| `info` \| `warn` \| `error`                    |
-
-## Lifecycle & exit codes
-
-The scraper is built to **never hang** and **never leak browser processes**.
-
-- **Global timeout**: if the run exceeds `RUN_TIMEOUT_MS` (default 5 min), the
-  browser is force-closed and the process exits with code `3`.
-- **Ctrl-C (SIGINT)**: the first Ctrl-C closes the browser gracefully and exits
-  with code `130`. A second Ctrl-C forces an immediate exit with code `137`
-  (escape hatch if `browser.close()` itself is hung).
-- **`try/finally`**: the browser is always torn down, even on error.
-- **Idempotent close**: `closeBrowser()` is safe to call from both the signal
-  handler and the `finally` block.
-
-| Exit code | Meaning                                                       |
-|-----------|---------------------------------------------------------------|
-| `0`       | Success                                                       |
-| `1`       | Partial success (some businesses failed — used in Phase 1.4+) |
-| `2`       | Configuration error (missing/invalid CLI args or env)         |
-| `3`       | Runtime error (browser crash, network failure, timeout)       |
-| `130`     | Interrupted by user (Ctrl-C, graceful shutdown)               |
-| `137`     | Interrupted by user (second Ctrl-C, forced shutdown)          |
-
-## Pagination
-
-Google Maps only loads ~20 results initially and lazy-loads more as you
-scroll the results feed. The scraper handles this automatically — after the
-feed appears, `scrollFeedToBottom()` scrolls until one of these stop
-conditions is met:
-
-| Stop reason   | Trigger                                                            |
-|---------------|--------------------------------------------------------------------|
-| `maxResults`  | `--max-results` / `DEFAULT_MAX_RESULTS` count reached               |
-| `exhausted`   | `SCROLL_STALL_THRESHOLD` consecutive scrolls with no new results    |
-| `timeout`     | `SCROLL_TIMEOUT_MS` budget exceeded                                |
-| `noResults`   | Feed contained zero business cards (e.g., bad query)               |
-
-Scroll progress is logged in real time, e.g. `Scroll progress {scroll: 3,
-loaded: 60, delta: "+20", stall: 0}`.
+Optional:
+  --maxResults, --limit <n>  Cap result count (default: all available)
+  --outputFile, -o <path>    Output path (default: auto-generated)
+  --outputDir <path>         Output directory (default: ./data)
+  --headless / --headed      Force browser mode (default: headless)
+  --logLevel <level>         debug | info | warn | error (default: info)
+  --verbose                  Alias for --logLevel debug
+  --dryRun                   Run pipeline but skip writing output files
+  --version                  Print version and exit
+  --help, -h                 Show this help
+```
 
 ## Project structure
 
 ```
 scraper/
 ├── src/
-│   ├── index.js      # CLI entry point — orchestrates the run
-│   ├── browser.js    # Browser launch / teardown
-│   ├── search.js     # Maps navigation + search
-│   ├── scroll.js     # Pagination / infinite-scroll (Phase 1.3)
-│   ├── extract.js    # Core field extraction (Phase 1.4)
-│   ├── export.js     # CSV / JSON export (Phase 1.6)
-│   ├── config.js     # Environment + (future) CLI config loader
-│   └── logger.js     # Structured logging
-├── data/             # Output CSVs (gitignored, kept via .gitkeep)
-├── logs/             # Log files (gitignored, kept via .gitkeep)
-├── scripts/          # Utility / archived scripts
-│   └── manual-browser-test.js
-├── .env.example      # Documented environment variables
-├── .gitignore
-├── package.json
-└── README.md
+│   ├── index.js     (CLI entry; pipeline orchestration)
+│   ├── browser.js   (Playwright launch/teardown, withBrowser helper)
+│   ├── search.js    (Maps navigation + search submit)
+│   ├── scroll.js    (Phase 1.3 — infinite-scroll pagination w/ stall detection)
+│   ├── extract.js   (Phase 1.4 — core field extraction, 15-field schema)
+│   ├── config.js    (env + CLI config loader, validation)
+│   └── logger.js    (dual-sink logger: console + JSON-lines file)
+├── tests/
+│   └── extract.test.js   (Phase 1.4 unit tests — parsers, normalization, rates)
+├── data/            (output JSON, gitignored)
+├── logs/            (run logs, gitignored)
+├── .env.example
+└── package.json
 ```
 
-## Roadmap
+## Phase 1.4 — Core Field Extraction
 
-Phase 1 is broken into 12 sub-phases (1.0 through 1.11). The current
-milestone, **1.3**, makes the scraper paginate through all results in the
-feed (stall detection + maxResults + scroll-timeout). See
-[`PHASE1_EXECUTION_PLAN.md`](./PHASE1_EXECUTION_PLAN.md) for the full breakdown.
+Each extracted business record has these **15 canonical fields**:
 
-## License
+| Field | Type | Source | Notes |
+|---|---|---|---|
+| `name` | string | List card | Business name |
+| `rating` | float | List card | 0–5, `null` if absent |
+| `reviews_count` | int | List card | Commas/parens stripped, `null` if absent |
+| `price_level` | string | List card | `$` / `$$` / `$$$` / `$$$$`, `null` if absent |
+| `category` | string | List card | e.g. "Mexican restaurant" |
+| `address` | string | List card | Full address string |
+| `phone` | string | List card | Raw tel: string (full normalization is Phase 3) |
+| `website` | string | List card | Tracking params (utm_*, gclid, fbclid) stripped |
+| `maps_url` | string | Constructed | Absolute Google Maps place URL |
+| `place_id` | string | Parsed from URL | `0x…:0x…` CID or `ChIJ…` place_id |
+| `plus_code` | string | List card | Open-location code, `null` if absent |
+| `open_now` | bool | List card | `true`/`false`/`null` at time of scrape |
+| `business_status` | enum | List card | `open` / `temporarily_closed` / `permanently_closed` |
+| `is_sponsored` | bool | List card | `true` for ad/sponsored results |
+| `scraped_at` | ISO string | Generated | Scrape timestamp |
+| `query` | string | From config | What was searched |
+| `location` | string | From config | Where it was searched |
 
-ISC
+### Extraction resilience
+
+- **Multiple fallback selectors per field** — Google reshuffles the DOM often;
+  each field has 2–4 candidate selectors tried in order.
+- **Per-field extraction-rate log** — printed at end of every run, e.g.
+  `phone: 198/200 = 99%`. Fields below 80% trigger a `WARN`.
+- **Normalization** — `rating` → float, `reviews_count` → int, `website` →
+  tracking-stripped, `phone` → raw, `place_id`/`plus_code` → parsed.
+- **Closed businesses are not skipped** — flagged via `business_status`.
+- **Sponsored results are flagged** — `is_sponsored: true`.
+
+## Testing
+
+```bash
+npm test          # bun test tests/
+npm run syntax    # node --check on every src file
+```
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 2 | Config error (missing/invalid args) |
+| 3 | Runtime error (browser crash, selector failure, timeout) |

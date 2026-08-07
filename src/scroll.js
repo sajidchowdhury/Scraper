@@ -1,246 +1,201 @@
+'use strict';
+
 /**
- * Pagination / infinite-scroll handling.
+ * src/scroll.js — Phase 1.3
  *
- * Phase 1.3: scrolls the div[role="feed"] container until all results are
- *            loaded, maxResults is reached, end-of-list is detected (via stall),
- *            or a total scroll-timeout is hit.
+ * Scrolls the Google Maps results feed to the bottom, loading all lazy-
+ * loaded results. Stops on:
+ *   - maxResults reached
+ *   - "end of list" indicator
+ *   - stall (no new results for N consecutive scroll attempts)
+ *   - total timeout
  *
- * Stop conditions (checked in order each iteration):
- *   1. maxResults met        -> stopReason = 'maxResults'
- *   2. stallThreshold reached -> stopReason = 'exhausted'  (results finished loading)
- *   3. totalTimeoutMs exceeded-> stopReason = 'timeout'
- *
- * Design notes:
- *   - The three helpers (countResults, scrollToLastCard, waitForCountStable) are
- *     exported so they can be unit-tested with a mocked page.
- *   - scrollFeedToBottom() accepts optional _countResults / _scrollToLastCard /
- *     _waitForCountStable injections (underscore-prefixed) so the main loop can
- *     be tested end-to-end without a real browser.
+ * Functions accept an injectable `countFn` / `scrollFn` / `endFn` for unit
+ * testing without a real browser (DI pattern).
  */
-const logger = require('./logger');
 
 /**
- * Selectors for the results feed container (re-exported from search.js for
- * local convenience; the feed is already located before scroll starts).
- */
-const FEED_SELECTORS = [
-  'div[role="feed"]',
-  'div[aria-label*="Results" i]',
-];
-
-/**
- * Selectors for individual business cards. Tried in order; the first non-zero
- * match count is used. Add new fallbacks as Google rolls out DOM changes.
- */
-const CARD_SELECTORS = [
-  'div[role="feed"] a[role="article"]',   // primary: article-role links inside feed
-  'a[role="article"]',                     // fallback: any article-role link
-  'div[role="feed"] div[role="article"]',  // fallback: article-role div inside feed
-];
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * Count the number of business cards currently loaded in the feed.
- * Tries multiple selectors; returns the first non-zero count, else 0.
- *
- * @param {import('playwright').Page} page
- * @returns {Promise<number>}
+ * Count current result cards on the page.
+ * Result cards are anchors with href containing "/maps/place/" OR
+ * div[role="article"] inside the feed.
  */
 async function countResults(page) {
-  return page.evaluate((selectors) => {
-    for (const sel of selectors) {
-      try {
-        const cards = document.querySelectorAll(sel);
-        if (cards.length > 0) return cards.length;
-      } catch (e) {
-        /* ignore selector errors, try next */
-      }
+  return page.evaluate(() => {
+    // Anchors linking to a place page — most reliable signal
+    const anchors = document.querySelectorAll('a[href*="/maps/place/"]');
+    // Dedupe by href (Google sometimes renders duplicates during scroll)
+    const seen = new Set();
+    let n = 0;
+    for (const a of anchors) {
+      const href = a.getAttribute('href') || '';
+      if (seen.has(href)) continue;
+      seen.add(href);
+      n++;
     }
-    return 0;
-  }, CARD_SELECTORS);
+    return n;
+  });
 }
 
 /**
- * Scroll the feed to bring the last loaded card into view, triggering Google
- * Maps to lazy-load the next batch. Falls back to scrolling the feed container
- * itself if no cards are found.
- *
- * @param {import('playwright').Page} page
- * @returns {Promise<boolean>} true if a scroll action was performed
+ * Scroll the feed container to its bottom.
  */
 async function scrollToLastCard(page) {
-  return page.evaluate((selectors) => {
-    // Try scrolling the last card into view first.
-    for (const sel of selectors) {
-      try {
-        const cards = document.querySelectorAll(sel);
-        if (cards.length > 0) {
-          cards[cards.length - 1].scrollIntoView({ behavior: 'instant', block: 'end' });
-          return true;
-        }
-      } catch (e) {
-        /* ignore */
-      }
-    }
-    // Fallback: scroll the feed container by ~one viewport.
-    const feed = document.querySelector('div[role="feed"]') ||
-                 document.querySelector('div[aria-label*="Results" i]');
-    if (feed) {
-      feed.scrollBy(0, feed.clientHeight * 0.8);
-      return true;
-    }
-    return false;
-  }, CARD_SELECTORS);
+  return page.evaluate(() => {
+    const feed = document.querySelector('div[role="feed"]');
+    if (!feed) return false;
+    feed.scrollTo({ top: feed.scrollHeight, behavior: 'auto' });
+    return true;
+  });
 }
 
 /**
- * Wait for the result count to stabilize (no new cards loading).
- * Polls the count; if it hasn't changed for `stableForMs`, returns.
- *
- * @param {import('playwright').Page} page
- * @param {object} [options]
- * @param {number} [options.pollIntervalMs=300]   how often to re-check the count
- * @param {number} [options.maxWaitMs=4000]       hard cap on wait time per scroll
- * @param {number} [options.stableForMs=800]      count must be unchanged this long
- * @returns {Promise<{count: number, stable: boolean}>}
+ * Detect the "end of list" indicator Google shows when results are exhausted.
  */
-async function waitForCountStable(page, options = {}) {
-  const pollIntervalMs = options.pollIntervalMs || 300;
-  const maxWaitMs = options.maxWaitMs || 4000;
-  const stableForMs = options.stableForMs || 800;
+async function isEndOfList(page) {
+  return page.evaluate(() => {
+    const bodyText = document.body.innerText || '';
+    // Google shows variations of these when the list ends
+    const markers = [
+      "You've reached the end of the list",
+      'reached the end',
+      'No results found',
+      'Try different search',
+    ];
+    return markers.some((m) => bodyText.includes(m));
+  });
+}
 
+/**
+ * Wait until result count is stable (no growth) for `pollIntervalMs` * `stableTicks`.
+ */
+async function waitForCountStable(countFn, { pollIntervalMs = 500, stableTicks = 2, maxWaitMs = 8000 } = {}) {
+  let last = -1;
+  let stable = 0;
   const start = Date.now();
-  let lastCount = await countResults(page);
-  let lastChangeTime = Date.now();
-
   while (Date.now() - start < maxWaitMs) {
-    await sleep(pollIntervalMs);
-    const currentCount = await countResults(page);
-    if (currentCount !== lastCount) {
-      lastCount = currentCount;
-      lastChangeTime = Date.now();
-    } else if (Date.now() - lastChangeTime >= stableForMs) {
-      return { count: lastCount, stable: true };
+    const cur = await countFn();
+    if (cur === last) {
+      stable++;
+      if (stable >= stableTicks) return { stable: true, count: cur };
+    } else {
+      stable = 0;
     }
+    last = cur;
+    await sleep(pollIntervalMs);
   }
-  return { count: lastCount, stable: false };
+  return { stable: false, count: last };
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
- * Scroll the results feed to load all available businesses.
+ * Main scroll loop. Accepts dependency-injected functions for testability.
  *
- * @param {import('playwright').Page} page
- * @param {object} [options]
- * @param {number|null} [options.maxResults]       stop once this many results are visible (null = all)
- * @param {number} [options.totalTimeoutMs=60000]  hard cap on total scrolling time
- * @param {number} [options.stallThreshold=3]      consecutive no-progress scrolls before stopping
- * @param {Function} [options._countResults]       (test injection) override countResults
- * @param {Function} [options._scrollToLastCard]   (test injection) override scrollToLastCard
- * @param {Function} [options._waitForCountStable] (test injection) override waitForCountStable
- * @returns {Promise<{totalLoaded: number, scrollCount: number, stopReason: string, durationMs: number}>}
- *          stopReason is one of: 'maxResults' | 'exhausted' | 'timeout' | 'noResults'
+ * @param {object} opts
+ * @param {() => Promise<number>} opts.countFn        - returns current result count
+ * @param {() => Promise<boolean>} opts.scrollFn      - scrolls feed to bottom
+ * @param {() => Promise<boolean>} opts.endFn         - returns true if end-of-list detected
+ * @param {number} opts.maxResults                    - stop early if reached (null = unlimited)
+ * @param {number} opts.totalTimeoutMs                - hard cap
+ * @param {number} opts.stallThreshold                - consecutive no-growth scrolls to stop
+ * @param {number} opts.batchDelayMs                  - delay between scroll attempts
+ * @param {object} opts.logger
  */
-async function scrollFeedToBottom(page, options = {}) {
-  const maxResults = options.maxResults != null ? options.maxResults : null;
-  const totalTimeoutMs = options.totalTimeoutMs || 60000;
-  const stallThreshold = options.stallThreshold || 3;
-
-  // Injectable helpers for unit testing (underscore = internal/test-only).
-  const countFn = options._countResults || ((p) => countResults(p));
-  const scrollFn = options._scrollToLastCard || ((p) => scrollToLastCard(p));
-  const waitFn = options._waitForCountStable || ((p, o) => waitForCountStable(p, o));
-
-  const startTime = Date.now();
-  const deadline = startTime + totalTimeoutMs;
-
-  logger.info('Starting pagination', { maxResults, totalTimeoutMs, stallThreshold });
-
-  let scrollCount = 0;
+async function scrollFeedToBottom({
+  countFn,
+  scrollFn,
+  endFn,
+  maxResults = null,
+  totalTimeoutMs = 90000,
+  stallThreshold = 3,
+  batchDelayMs = 800,
+  pollIntervalMs = 500,
+  logger = { info() {}, debug() {}, warn() {} },
+}) {
+  const start = Date.now();
+  let count = await countFn();
+  let lastCount = count;
   let stallCount = 0;
-  let currentCount = await countFn(page);
-  let lastProgressCount = currentCount;
-  let stopReason = 'unknown';
+  let reason = 'maxResults';
 
-  logger.info('Initial result count', { count: currentCount });
+  logger.info('Scroll loop started', { initialCount: count, maxResults });
 
-  // Edge case: zero results found at all.
-  if (currentCount === 0) {
-    stopReason = 'noResults';
-    logger.warn('No results found in feed');
-    return { totalLoaded: 0, scrollCount: 0, stopReason, durationMs: Date.now() - startTime };
-  }
-
-  // Edge case: maxResults already met/exceeded by the initial load.
-  if (maxResults != null && currentCount >= maxResults) {
-    stopReason = 'maxResults';
-    logger.info('maxResults met by initial load', { count: currentCount, maxResults });
-    return { totalLoaded: currentCount, scrollCount: 0, stopReason, durationMs: Date.now() - startTime };
-  }
-
-  // Main scroll loop.
   while (true) {
-    // Check total timeout FIRST so a misconfigured tiny timeout still exits.
-    if (Date.now() >= deadline) {
-      stopReason = 'timeout';
-      logger.warn('Pagination timed out', { count: currentCount, totalTimeoutMs });
+    // Stop conditions
+    if (maxResults !== null && count >= maxResults) {
+      reason = 'maxResults';
+      logger.info('Scroll stop: maxResults reached', { count, maxResults });
+      break;
+    }
+    if (Date.now() - start > totalTimeoutMs) {
+      reason = 'timeout';
+      logger.warn('Scroll stop: total timeout reached', { count, elapsedMs: Date.now() - start });
+      break;
+    }
+    if (await endFn()) {
+      reason = 'endOfList';
+      logger.info('Scroll stop: end-of-list indicator detected', { count });
+      break;
+    }
+    if (stallCount >= stallThreshold) {
+      reason = 'stall';
+      logger.info('Scroll stop: stall threshold reached', { count, stallCount });
       break;
     }
 
-    // Scroll + wait for the next batch to settle.
-    await scrollFn(page);
-    scrollCount += 1;
+    await scrollFn();
+    await sleep(batchDelayMs);
 
-    const { count: settledCount } = await waitFn(page);
-    currentCount = settledCount;
-
-    const delta = currentCount - lastProgressCount;
-    logger.info('Scroll progress', {
-      scroll: scrollCount,
-      loaded: currentCount,
-      delta: delta >= 0 ? `+${delta}` : `${delta}`,
-      stall: stallCount,
+    // Wait for count to settle after this scroll
+    const { count: newCount } = await waitForCountStable(countFn, {
+      pollIntervalMs,
+      stableTicks: 2,
+      maxWaitMs: 5000,
     });
 
-    // Stop condition 1: maxResults reached.
-    if (maxResults != null && currentCount >= maxResults) {
-      stopReason = 'maxResults';
-      logger.info('maxResults reached, stopping pagination', { count: currentCount, maxResults });
-      break;
-    }
-
-    // Stop condition 2: stall (no progress on this scroll).
-    if (currentCount === lastProgressCount) {
-      stallCount += 1;
-      logger.debug('No progress on this scroll', { stallCount, threshold: stallThreshold });
-      if (stallCount >= stallThreshold) {
-        stopReason = 'exhausted';
-        logger.info('Results exhausted (stall threshold reached)', { count: currentCount, stallCount });
-        break;
-      }
-    } else {
-      // Progress made — reset stall counter and update baseline.
+    if (newCount > lastCount) {
+      logger.info('Scroll progress', { from: lastCount, to: newCount });
       stallCount = 0;
-      lastProgressCount = currentCount;
+    } else {
+      stallCount++;
+      logger.debug('Scroll stall', { stallCount, count: newCount });
     }
+    lastCount = newCount;
+    count = newCount;
   }
 
-  const durationMs = Date.now() - startTime;
-  logger.info('Pagination complete', {
-    totalLoaded: currentCount,
-    scrollCount,
-    stopReason,
-    durationMs,
-  });
+  return {
+    finalCount: count,
+    reason,
+    elapsedMs: Date.now() - start,
+  };
+}
 
-  return { totalLoaded: currentCount, scrollCount, stopReason, durationMs };
+/**
+ * Production wrapper: wires real page-based count/scroll/end functions.
+ */
+async function scrollFeedToBottomOnPage(page, cfg, logger) {
+  return scrollFeedToBottom({
+    countFn: () => countResults(page),
+    scrollFn: () => scrollToLastCard(page),
+    endFn: () => isEndOfList(page),
+    maxResults: cfg.maxResults,
+    totalTimeoutMs: cfg.scroll.totalTimeoutMs,
+    stallThreshold: cfg.scroll.stallThreshold,
+    batchDelayMs: cfg.scroll.batchDelayMs,
+    pollIntervalMs: cfg.scroll.pollIntervalMs,
+    logger,
+  });
 }
 
 module.exports = {
-  FEED_SELECTORS,
-  CARD_SELECTORS,
   countResults,
   scrollToLastCard,
+  isEndOfList,
   waitForCountStable,
   scrollFeedToBottom,
+  scrollFeedToBottomOnPage,
+  sleep,
 };

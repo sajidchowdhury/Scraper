@@ -1,188 +1,179 @@
-/**
- * Scraper entry point.
- *
- * Phase 1.2: bulletproof browser lifecycle.
- *            - Global run timeout (config.run.timeoutMs, default 5 min). When
- *              it fires, the browser is force-closed and the process exits 3.
- *              The script can NEVER hang forever.
- *            - SIGINT (Ctrl-C) handler: first Ctrl-C closes the browser
- *              gracefully and exits 130; second Ctrl-C forces exit 137.
- *            - try/finally guarantees the browser is always torn down.
- *            - Removed the Phase 1.0/1.1 demo pause — the lifecycle is now
- *              real: launch → navigate → search → confirm feed → close.
- *
- * Phase 1.3: pagination / infinite-scroll handling. After the feed is found,
- *            scrollFeedToBottom() scrolls through all results (or until
- *            maxResults / exhaustion / scroll-timeout), logging progress.
- *
- * Exit codes:
- *   0    success
- *   1    partial success (some businesses failed — used once extraction exists)
- *   2    configuration error (missing/invalid CLI args or env)
- *   3    runtime error (browser crash, network failure, timeout)
- *   130  interrupted by user (SIGINT, graceful shutdown)
- *   137  interrupted by user (second SIGINT, forced shutdown)
- *
- * Phase 1.4 (TODO): extract structured business data from the loaded feed.
- * Phase 1.6 (TODO): export the extracted data to CSV.
- */
-const { resolveConfig, ConfigError } = require('./config');
-const logger = require('./logger');
-const { launchBrowser, closeBrowser } = require('./browser');
-const { navigateToMaps, performSearch } = require('./search');
-const { scrollFeedToBottom } = require('./scroll');
+'use strict';
 
 /**
- * Thrown when the global run timeout fires. Caught by the main try/catch to
- * produce a clear "timed out" log line + exit code 3.
+ * src/index.js — CLI entry point (Phases 1.0 → 1.4)
+ *
+ * Pipeline:
+ *   loadConfig → launchBrowser → performSearch → scrollFeedToBottom
+ *              → extractBusinesses → logExtractionRates → write JSON
+ *              → closeBrowser
+ *
+ * Exit codes (Phase 1.10 prep):
+ *   0 = success
+ *   2 = config error
+ *   3 = runtime error
  */
-class TimeoutError extends Error {
-  constructor(timeoutMs) {
-    super(`Run exceeded global timeout of ${timeoutMs} ms`);
-    this.name = 'TimeoutError';
-    this.timeoutMs = timeoutMs;
-  }
+
+const fs = require('fs');
+const path = require('path');
+
+const { loadConfig, HELP_TEXT } = require('./config');
+const { createLogger } = require('./logger');
+const { withBrowser } = require('./browser');
+const { performSearch } = require('./search');
+const { scrollFeedToBottomOnPage } = require('./scroll');
+const { extractBusinesses, logExtractionRates, CANONICAL_FIELDS } = require('./extract');
+
+function sanitizeName(s) {
+  return String(s || 'run').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 40);
+}
+
+function stamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+}
+
+function autoOutputPath(cfg, ext = 'json') {
+  const base = `${sanitizeName(cfg.query)}_${sanitizeName(cfg.location)}_${stamp()}`;
+  return path.join(cfg.outputDir, `${base}.${ext}`);
 }
 
 async function main() {
-  // ---- Resolve + validate config (CLI > env > defaults) ----
-  let config;
-  try {
-    config = resolveConfig();
-  } catch (err) {
-    if (err instanceof ConfigError) {
-      console.error('\n  Configuration error:');
-      console.error('  ' + err.message.split('\n').join('\n  '));
-      console.error('\n  Run with --help for usage.\n');
-      process.exit(2);
-    }
-    if (err && typeof err.code === 'string' && err.code.startsWith('commander.')) {
-      // --help / --version / unknown flag: commander already printed its message.
-      process.exit(2);
-    }
-    logger.error('Unexpected error during config resolution', { message: err.message, stack: err.stack });
+  const cfg = loadConfig(process.argv.slice(2));
+
+  if (cfg.help) {
+    process.stdout.write(HELP_TEXT + '\n');
+    process.exit(0);
+  }
+  if (cfg.version) {
+    const pkg = require('../package.json');
+    process.stdout.write(`gmaps-scraper v${pkg.version}\n`);
+    process.exit(0);
+  }
+
+  if (cfg.errors.length > 0) {
+    // eslint-disable-next-line no-console
+    console.error('Configuration errors:\n  - ' + cfg.errors.join('\n  - '));
+    process.exit(2);
+  }
+
+  const logger = createLogger({
+    level: cfg.logLevel,
+    query: cfg.query,
+    location: cfg.location,
+    logDir: './logs',
+  });
+
+  logger.info('Config resolved', {
+    query: cfg.query,
+    location: cfg.location,
+    maxResults: cfg.maxResults,
+    headless: cfg.headless,
+    dryRun: cfg.dryRun,
+  });
+
+  const globalTimer = setTimeout(() => {
+    logger.error('Global timeout exceeded — aborting', { ms: cfg.globalTimeoutMs });
     process.exit(3);
-  }
+  }, cfg.globalTimeoutMs);
 
-  logResolvedConfig(config);
-
-  // ---- Lifecycle state shared with signal handlers ----
-  let browser = null;
-  let interrupted = false;     // SIGINT received during the run
-  let timedOut = false;        // global timeout fired during the run
-  let timeoutId = null;        // global timeout timer handle
-  let handlersInstalled = false;
-
-  /**
-   * SIGINT / SIGTERM handler.
-   * - First signal: initiate graceful shutdown by closing the browser. The
-   *   in-flight Playwright ops will reject, the main catch block sees
-   *   `interrupted`, sets exit code 130, and the finally block finishes cleanup.
-   * - Second signal: force exit immediately (escape hatch if browser.close()
-   *   itself is hung).
-   */
-  const signalHandler = () => {
-    if (interrupted) {
-      logger.error('Second interrupt received — forcing immediate exit');
-      process.exit(137);
-    }
-    interrupted = true;
-    logger.warn('Interrupt received — shutting down gracefully (press Ctrl-C again to force exit)');
-    // Closing the browser will cause any in-flight Playwright operations to
-    // reject, which the main try/catch will handle and exit cleanly via finally.
-    closeBrowser(browser).catch(() => {});
+  // Graceful Ctrl-C
+  let browserClosed = false;
+  const onSigInt = async () => {
+    logger.warn('SIGINT received — shutting down');
+    process.exit(130);
   };
+  process.on('SIGINT', onSigInt);
 
-  // ---- Run with global timeout ----
+  const startedAt = Date.now();
+  let result;
+
   try {
-    // Install signal handlers
-    process.on('SIGINT', signalHandler);
-    process.on('SIGTERM', signalHandler);
-    handlersInstalled = true;
+    result = await withBrowser(cfg, async ({ page }) => {
+      await performSearch(page, cfg, logger);
 
-    // Arm the global timeout. When it fires, mark timedOut and force-close
-    // the browser so in-flight ops reject and the try/catch can take over.
-    timeoutId = setTimeout(() => {
-      timedOut = true;
-      logger.warn('Global run timeout reached — force-closing browser', {
-        timeoutMs: config.run.timeoutMs,
+      const scrollResult = await scrollFeedToBottomOnPage(page, cfg, logger);
+      logger.info('Scroll complete', {
+        finalCount: scrollResult.finalCount,
+        reason: scrollResult.reason,
+        elapsedMs: scrollResult.elapsedMs,
       });
-      closeBrowser(browser).catch(() => {});
-    }, config.run.timeoutMs);
 
-    // ----- The actual work -----
-    const { browser: b, page } = await launchBrowser(config);
-    browser = b;
+      const { businesses, extractionRates } = await extractBusinesses(page, {
+        query: cfg.query,
+        location: cfg.location,
+        logger,
+      });
 
-    await navigateToMaps(page);
-    await performSearch(page, config.search.query, config.search.location);
+      logExtractionRates(extractionRates, logger);
 
-    // Phase 1.3: paginate through all results (or until maxResults / exhaustion / timeout).
-    const scrollResult = await scrollFeedToBottom(page, {
-      maxResults: config.search.maxResults,
-      totalTimeoutMs: config.scroll.totalTimeoutMs,
-      stallThreshold: config.scroll.stallThreshold,
-    });
-    logger.info('Pagination result', scrollResult);
+      logger.info('Extraction complete', {
+        total: businesses.length,
+        sponsored: businesses.filter((b) => b.is_sponsored).length,
+        permanentlyClosed: businesses.filter((b) => b.business_status === 'permanently_closed').length,
+        temporarilyClosed: businesses.filter((b) => b.business_status === 'temporarily_closed').length,
+      });
 
-    // Phase 1.3 scaffold: all available results are now loaded in the feed.
-    // Extraction (Phase 1.4) and CSV export (Phase 1.6) land next.
-    logger.info('Phase 1.3 scaffold reached — pagination complete, closing cleanly.', {
-      query: config.search.query,
-      location: config.search.location,
-      totalLoaded: scrollResult.totalLoaded,
-      stopReason: scrollResult.stopReason,
+      return { businesses, extractionRates, scrollResult };
     });
   } catch (err) {
-    if (interrupted) {
-      logger.warn('Run interrupted by user');
-      process.exitCode = 130; // 128 + SIGINT(2)
-    } else if (timedOut) {
-      logger.error('Run timed out', { timeoutMs: config.run.timeoutMs });
-      process.exitCode = 3;
-    } else {
-      logger.error('Run failed', { message: err.message, stack: err.stack });
-      process.exitCode = 3;
-    }
+    logger.error('Runtime error during pipeline', { message: err.message, stack: err.stack });
+    clearTimeout(globalTimer);
+    process.removeListener('SIGINT', onSigInt);
+    logger.close();
+    process.exit(3);
   } finally {
-    // Cancel the global timeout (no-op if already fired).
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-      timeoutId = null;
-    }
-    // Detach signal handlers so they don't fire during/after final teardown.
-    if (handlersInstalled) {
-      process.off('SIGINT', signalHandler);
-      process.off('SIGTERM', signalHandler);
-      handlersInstalled = false;
-    }
-    // Idempotent: safe even if the signal handler or timeout already closed it.
-    await closeBrowser(browser);
-    logger.info('Scraper finished');
+    browserClosed = true;
   }
-}
 
-/**
- * Print the resolved configuration in a scannable block so the operator can
- * confirm what's about to run before any browser activity begins.
- */
-function logResolvedConfig(config) {
-  const summary = {
-    query: config.search.query,
-    location: config.search.location,
-    maxResults: config.search.maxResults == null ? 'all available' : config.search.maxResults,
-    outputFile: config.output.file == null ? 'auto-generated' : config.output.file,
-    outputDir: config.output.dir,
-    headless: config.browser.headless,
-    slowMo: config.browser.slowMo,
-    viewport: `${config.browser.viewport.width}x${config.browser.viewport.height}`,
-    runTimeoutMs: config.run.timeoutMs,
-    scrollTimeoutMs: config.scroll.totalTimeoutMs,
-    scrollStallThreshold: config.scroll.stallThreshold,
-    logLevel: config.log.level,
-  };
-  logger.info('Scraper starting');
-  logger.info('Resolved configuration', summary);
+  const durationMs = Date.now() - startedAt;
+
+  // Write JSON output (Phase 1.6 will add CSV; JSON is enough for Phase 1.4 verification)
+  const outFile = cfg.outputFile
+    ? cfg.outputFile.replace(/\.\w+$/, '') + '.json'
+    : autoOutputPath(cfg, 'json');
+
+  if (!cfg.dryRun) {
+    fs.mkdirSync(path.dirname(path.resolve(outFile)), { recursive: true });
+    const summary = {
+      query: cfg.query,
+      location: cfg.location,
+      total: result.businesses.length,
+      sponsored: result.businesses.filter((b) => b.is_sponsored).length,
+      permanentlyClosed: result.businesses.filter((b) => b.business_status === 'permanently_closed').length,
+      temporarilyClosed: result.businesses.filter((b) => b.business_status === 'temporarily_closed').length,
+      extractionRates: result.extractionRates,
+      scroll: result.scrollResult,
+      startedAt: new Date(startedAt).toISOString(),
+      durationMs,
+      outputFile: outFile,
+      fields: CANONICAL_FIELDS,
+    };
+    const payload = { summary, businesses: result.businesses };
+    fs.writeFileSync(outFile, JSON.stringify(payload, null, 2));
+    logger.info('JSON written', { path: path.resolve(outFile), rows: result.businesses.length });
+  } else {
+    logger.info('Dry run — skipping file output', { wouldWrite: outFile });
+  }
+
+  // Clean summary
+  const banner = [
+    '========================================',
+    'Run complete',
+    `Query:    ${cfg.query} in ${cfg.location}`,
+    `Results:  ${result.businesses.length} extracted (${result.scrollResult.finalCount} loaded, reason=${result.scrollResult.reason})`,
+    `Duration: ${(durationMs / 1000).toFixed(1)}s`,
+    cfg.dryRun ? 'Output:   (dry run, no file written)' : `JSON:     ${path.resolve(outFile)}`,
+    '========================================',
+  ].join('\n');
+  // eslint-disable-next-line no-console
+  console.log(banner);
+
+  clearTimeout(globalTimer);
+  process.removeListener('SIGINT', onSigInt);
+  logger.close();
+  process.exit(0);
 }
 
 main();

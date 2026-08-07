@@ -1,71 +1,65 @@
+'use strict';
+
 /**
- * Browser lifecycle management.
+ * src/browser.js — Phase 1.2
  *
- * Phase 1.0: launches Chromium with config-driven options and tears it down.
- * Phase 1.2: makes closeBrowser() idempotent (safe to call from both a SIGINT
- *            handler and the main finally block), and adds isBrowserOpen() so
- *            callers can check whether teardown is still pending.
- *
- * Phase 1.3+ (TODO): accept an external proxy config, randomize fingerprint,
- *                    support multi-context concurrency.
+ * Launches Playwright Chromium with config-driven options (headless, slowMo,
+ * viewport). Returns { browser, page }. Caller is responsible for closing
+ * in a try/finally — see withBrowser() helper below.
  */
+
 const { chromium } = require('playwright');
-const logger = require('./logger');
 
-/**
- * Track which browser instances we've already initiated a close on, so that
- * closeBrowser() is idempotent. A WeakSet lets garbage collection reclaim
- * browser entries once nothing else references them.
- */
-const closingBrowsers = new WeakSet();
+const USER_AGENTS = [
+  // Real recent desktop Chrome UAs — picked at random per launch (Phase 1.8 prep)
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+];
 
-/**
- * Launch a Chromium browser and a single page with the configured viewport.
- * @param {object} config - application config (config.browser used here)
- * @returns {Promise<{ browser: import('playwright').Browser, page: import('playwright').Page }>}
- */
-async function launchBrowser(config) {
-  const { headless, slowMo, viewport } = config.browser;
-  logger.info('Launching browser', { headless, slowMo, viewport });
-
-  const browser = await chromium.launch({ headless, slowMo });
-  const page = await browser.newPage({ viewport });
-
-  logger.info('Browser launched');
-  return { browser, page };
+function pickUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
-/**
- * Gracefully close the browser. Idempotent — safe to call multiple times
- * (e.g. from a SIGINT handler AND the main finally block). Resolves silently
- * if the browser is null/undefined or already being closed.
- *
- * @param {import('playwright').Browser|null|undefined} browser
- * @returns {Promise<void>}
- */
+async function launchBrowser(cfg) {
+  const browser = await chromium.launch({
+    headless: cfg.headless,
+    slowMo: cfg.slowMo || undefined,
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: cfg.viewportWidth, height: cfg.viewportHeight },
+    userAgent: pickUserAgent(),
+    locale: 'en-US',
+    timezoneId: 'America/Toronto',
+  });
+
+  context.setDefaultTimeout(cfg.navTimeoutMs || 60000);
+
+  const page = await context.newPage();
+  return { browser, context, page };
+}
+
 async function closeBrowser(browser) {
   if (!browser) return;
-  if (closingBrowsers.has(browser)) {
-    // Already closing/closed — don't issue a second browser.close() call.
-    return;
-  }
-  closingBrowsers.add(browser);
-  logger.info('Closing browser');
   try {
     await browser.close();
-  } catch (err) {
-    logger.warn('Error while closing browser', { message: err.message });
+  } catch {
+    /* best-effort */
   }
 }
 
 /**
- * Returns true if closeBrowser() has NOT yet been called on this browser.
- * Useful for the SIGINT handler to decide whether to initiate teardown.
- * @param {import('playwright').Browser|null|undefined} browser
- * @returns {boolean}
+ * Convenience wrapper: ensures browser closes even on error.
+ * Usage: await withBrowser(cfg, async ({ page }) => { ... })
  */
-function isBrowserOpen(browser) {
-  return !!browser && !closingBrowsers.has(browser);
+async function withBrowser(cfg, fn) {
+  const { browser, page } = await launchBrowser(cfg);
+  try {
+    return await fn({ browser, page });
+  } finally {
+    await closeBrowser(browser);
+  }
 }
 
-module.exports = { launchBrowser, closeBrowser, isBrowserOpen };
+module.exports = { launchBrowser, closeBrowser, withBrowser, pickUserAgent };

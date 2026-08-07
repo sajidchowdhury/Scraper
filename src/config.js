@@ -1,180 +1,184 @@
-/**
- * Configuration loader.
- *
- * Phase 1.1: merges CLI arguments (commander) > environment variables (.env via
- *            dotenv) > defaults, then validates the result. Exposes
- *            `resolveConfig()` so the entry point can catch ConfigError and
- *            exit with a friendly message + code 2.
- *
- * Phase 1.2: added `run.timeoutMs` (global run timeout, default 5 min) with
- *            validation, so the entry point can guarantee the process never
- *            hangs forever.
- *
- * Phase 1.3: added `scroll.totalTimeoutMs` (per-pagination budget, default 60s)
- *            and `scroll.stallThreshold` (consecutive no-progress scrolls
- *            before stopping, default 3) with validation.
- *
- * Precedence (highest → lowest):
- *   1. CLI flags:    --query --location --max-results --output-file
- *   2. Environment:  DEFAULT_QUERY / DEFAULT_LOCATION / DEFAULT_MAX_RESULTS /
- *                    OUTPUT_FILE / HEADLESS / SLOW_MO / VIEWPORT_* / OUTPUT_DIR /
- *                    RUN_TIMEOUT_MS / SCROLL_TIMEOUT_MS / SCROLL_STALL_THRESHOLD /
- *                    LOG_LEVEL
- *   3. Built-in defaults (only for non-required fields)
- *
- * Required fields (query, location) have NO built-in default — the operator
- * must supply them via CLI or .env, otherwise resolveConfig() throws.
- */
-require('dotenv').config();
-const { Command } = require('commander');
+'use strict';
 
 /**
- * Thrown when required config is missing or invalid. The entry point catches
- * this, prints a friendly message, and exits with code 2.
+ * src/config.js — Phase 1.1
+ *
+ * Resolves runtime configuration from (in priority order):
+ *   1. CLI args (--query, --location, --maxResults, --headless/--headed, ...)
+ *   2. Process environment variables (DEFAULT_QUERY, HEADLESS, ...)
+ *   3. .env file (tiny hand-rolled loader — no external dep)
+ *   4. Hardcoded defaults
+ *
+ * Validates on startup and fails fast with a clear message.
  */
-class ConfigError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'ConfigError';
+
+const fs = require('fs');
+const path = require('path');
+
+// ---------------------------------------------------------------------------
+// Tiny .env loader (hand-rolled to avoid pulling in dotenv for Phase 1)
+// ---------------------------------------------------------------------------
+
+function loadDotEnv(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  const raw = fs.readFileSync(filePath, 'utf8');
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let val = trimmed.slice(eq + 1).trim();
+    // strip surrounding quotes
+    if (
+      (val.startsWith('"') && val.endsWith('"')) ||
+      (val.startsWith("'") && val.endsWith("'"))
+    ) {
+      val = val.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = val;
   }
 }
 
-/**
- * Parse a maxResults value into a positive integer or null.
- * Returns null for empty/undefined. Returns NaN for garbage (caller validates).
- * @param {string|number|undefined} value
- * @returns {number|null}
- */
-function parseMaxResults(value) {
-  if (value == null || value === '') return null;
-  if (typeof value === 'number') return value;
-  return parseInt(value, 10);
-}
+// ---------------------------------------------------------------------------
+// CLI arg parser (hand-rolled, no commander/yargs dependency for Phase 1)
+// ---------------------------------------------------------------------------
 
-/**
- * Build the commander program. Kept separate so resolveConfig() can construct
- * a fresh instance on each call (safe to call multiple times, e.g. in tests).
- * @returns {Command}
- */
-function buildProgram() {
-  const program = new Command();
-  program
-    .name('googlemaps-scraper')
-    .description('A Google Maps business scraper that exports CSVs of business data.')
-    .version('1.0.0')
-    .option('-q, --query <query>', 'what to search for (e.g. "Restaurant")')
-    .option('-l, --location <location>', 'where to search (e.g. "Toronto")')
-    .option('-m, --max-results <number>', 'max businesses to scrape (default: all available)', parseMaxResults)
-    .option('-o, --output-file <path>', 'output CSV file path (default: auto-generated)')
-    .allowExcessArguments(false);
-  return program;
-}
-
-/**
- * Resolve the full application config from CLI + env + defaults.
- *
- * @param {string[]} [argv] - argv including node + script path (defaults to process.argv)
- * @returns {object} resolved config
- * @throws {ConfigError} if required fields are missing or invalid
- */
-function resolveConfig(argv = process.argv) {
-  const program = buildProgram();
-  program.exitOverride(); // convert commander's process.exit() into throws (so --help is catchable in tests)
-  let opts;
-  try {
-    program.parse(argv);
-    opts = program.opts();
-  } catch (err) {
-    // --help / --version produce commander errors with exitCode; rethrow as-is
-    // so the entry point can let the process exit naturally.
-    throw err;
+function parseArgs(argv) {
+  const out = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--query' || a === '-q') out.query = argv[++i];
+    else if (a === '--location' || a === '-l') out.location = argv[++i];
+    else if (a === '--maxResults' || a === '--limit') out.maxResults = argv[++i];
+    else if (a === '--outputFile' || a === '-o') out.outputFile = argv[++i];
+    else if (a === '--outputDir') out.outputDir = argv[++i];
+    else if (a === '--headless') out.headless = true;
+    else if (a === '--headed') out.headless = false;
+    else if (a === '--logLevel') out.logLevel = argv[++i];
+    else if (a === '--verbose') out.logLevel = 'debug';
+    else if (a === '--help' || a === '-h') out.help = true;
+    else if (a === '--version') out.version = true;
+    else if (a === '--dryRun') out.dryRun = true;
   }
+  return out;
+}
 
-  // ---- Merge: CLI > env > default ----
-  const query = opts.query || process.env.DEFAULT_QUERY || null;
-  const location = opts.location || process.env.DEFAULT_LOCATION || null;
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
 
-  const maxResults =
-    opts.maxResults != null
-      ? opts.maxResults
-      : parseMaxResults(process.env.DEFAULT_MAX_RESULTS);
+function toIntOrNull(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number.parseInt(String(v), 10);
+  return Number.isFinite(n) ? n : null;
+}
 
-  const outputFile = opts.outputFile || process.env.OUTPUT_FILE || null;
+function validate(cfg) {
+  const errors = [];
+  if (!cfg.query || !cfg.query.trim()) {
+    errors.push('Missing required input: --query (or DEFAULT_QUERY in .env)');
+  }
+  if (!cfg.location || !cfg.location.trim()) {
+    errors.push('Missing required input: --location (or DEFAULT_LOCATION in .env)');
+  }
+  if (cfg.maxResults !== null && (cfg.maxResults < 1 || cfg.maxResults > 100000)) {
+    errors.push(`maxResults must be between 1 and 100000 (got ${cfg.maxResults})`);
+  }
+  const validLevels = ['debug', 'info', 'warn', 'error'];
+  if (!validLevels.includes(cfg.logLevel)) {
+    errors.push(`logLevel must be one of ${validLevels.join(', ')} (got ${cfg.logLevel})`);
+  }
+  return errors;
+}
 
-  const config = {
-    search: { query, location, maxResults },
-    browser: {
-      headless: process.env.HEADLESS === 'true',
-      slowMo: parseInt(process.env.SLOW_MO || '200', 10),
-      viewport: {
-        width: parseInt(process.env.VIEWPORT_WIDTH || '1400', 10),
-        height: parseInt(process.env.VIEWPORT_HEIGHT || '900', 10),
-      },
-    },
-    output: {
-      dir: process.env.OUTPUT_DIR || './data',
-      file: outputFile,
-    },
-    run: {
-      // Global run timeout in ms. If the run exceeds this, the browser is
-      // force-closed and the process exits with code 3. Default: 5 minutes.
-      timeoutMs: parseInt(process.env.RUN_TIMEOUT_MS || '300000', 10),
-    },
+// ---------------------------------------------------------------------------
+// Main loader
+// ---------------------------------------------------------------------------
+
+function loadConfig(argv = process.argv.slice(2)) {
+  loadDotEnv(path.join(process.cwd(), '.env'));
+
+  const cli = parseArgs(argv);
+
+  const headless =
+    cli.headless !== undefined
+      ? cli.headless
+      : process.env.HEADLESS === undefined
+        ? true
+        : process.env.HEADLESS === 'true';
+
+  const cfg = {
+    // Search inputs
+    query: cli.query || process.env.DEFAULT_QUERY || '',
+    location: cli.location || process.env.DEFAULT_LOCATION || '',
+    maxResults: toIntOrNull(cli.maxResults ?? process.env.DEFAULT_MAX_RESULTS),
+
+    // Output
+    outputDir: cli.outputDir || process.env.OUTPUT_DIR || './data',
+    outputFile: cli.outputFile || null, // null = auto-generate
+    dryRun: !!cli.dryRun,
+
+    // Browser
+    headless,
+    slowMo: toIntOrNull(process.env.SLOW_MO) ?? 0,
+    viewportWidth: toIntOrNull(process.env.VIEWPORT_WIDTH) ?? 1400,
+    viewportHeight: toIntOrNull(process.env.VIEWPORT_HEIGHT) ?? 900,
+
+    // Timeouts
+    globalTimeoutMs: toIntOrNull(process.env.GLOBAL_TIMEOUT_MS) ?? 5 * 60 * 1000,
+    navTimeoutMs: toIntOrNull(process.env.NAV_TIMEOUT_MS) ?? 60 * 1000,
+
+    // Scroll (Phase 1.3)
     scroll: {
-      // Per-pagination budget in ms. The scroll loop gives up after this even
-      // if results haven't been exhausted. Default: 60 seconds.
-      totalTimeoutMs: parseInt(process.env.SCROLL_TIMEOUT_MS || '60000', 10),
-      // Consecutive no-progress scrolls before the loop declares results
-      // exhausted and stops. Default: 3.
-      stallThreshold: parseInt(process.env.SCROLL_STALL_THRESHOLD || '3', 10),
+      totalTimeoutMs: toIntOrNull(process.env.SCROLL_TIMEOUT_MS) ?? 90 * 1000,
+      stallThreshold: toIntOrNull(process.env.SCROLL_STALL_THRESHOLD) ?? 3,
+      batchDelayMs: toIntOrNull(process.env.SCROLL_BATCH_DELAY_MS) ?? 800,
+      pollIntervalMs: toIntOrNull(process.env.SCROLL_POLL_INTERVAL_MS) ?? 500,
     },
-    log: {
-      level: process.env.LOG_LEVEL || 'info',
+
+    // Extract (Phase 1.4)
+    extract: {
+      interBatchMs: toIntOrNull(process.env.EXTRACT_INTER_BATCH_MS) ?? 250,
+      fieldWarnThreshold: toIntOrNull(process.env.EXTRACT_FIELD_WARN_THRESHOLD) ?? 80,
     },
+
+    // Logging
+    logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
+
+    // CLI meta
+    help: !!cli.help,
+    version: !!cli.version,
   };
 
-  // ---- Validate ----
-  const errors = [];
-  if (!query || !query.trim()) {
-    errors.push('Missing required search query. Provide --query <value> on the CLI or set DEFAULT_QUERY in .env.');
-  }
-  if (!location || !location.trim()) {
-    errors.push('Missing required search location. Provide --location <value> on the CLI or set DEFAULT_LOCATION in .env.');
-  }
-  if (maxResults != null) {
-    if (!Number.isInteger(maxResults) || Number.isNaN(maxResults) || maxResults <= 0) {
-      errors.push(`maxResults must be a positive integer greater than 0 (got: ${JSON.stringify(opts.maxResults != null ? opts.maxResults : process.env.DEFAULT_MAX_RESULTS)}).`);
-    }
-  }
-  // Validate viewport dimensions
-  const { width, height } = config.browser.viewport;
-  if (!Number.isInteger(width) || width <= 0) {
-    errors.push(`VIEWPORT_WIDTH must be a positive integer (got: ${JSON.stringify(process.env.VIEWPORT_WIDTH)}).`);
-  }
-  if (!Number.isInteger(height) || height <= 0) {
-    errors.push(`VIEWPORT_HEIGHT must be a positive integer (got: ${JSON.stringify(process.env.VIEWPORT_HEIGHT)}).`);
-  }
-  // Validate run timeout (must be a positive integer; minimum 5s to avoid
-  // accidental instant-timeout misconfigurations).
-  const { timeoutMs } = config.run;
-  if (!Number.isInteger(timeoutMs) || Number.isNaN(timeoutMs) || timeoutMs < 5000) {
-    errors.push(`RUN_TIMEOUT_MS must be a positive integer >= 5000 ms (got: ${JSON.stringify(process.env.RUN_TIMEOUT_MS)}).`);
-  }
-  // Validate scroll timeout (must be a positive integer >= 5000 ms).
-  const { totalTimeoutMs: scrollTimeout, stallThreshold } = config.scroll;
-  if (!Number.isInteger(scrollTimeout) || Number.isNaN(scrollTimeout) || scrollTimeout < 5000) {
-    errors.push(`SCROLL_TIMEOUT_MS must be a positive integer >= 5000 ms (got: ${JSON.stringify(process.env.SCROLL_TIMEOUT_MS)}).`);
-  }
-  if (!Number.isInteger(stallThreshold) || Number.isNaN(stallThreshold) || stallThreshold < 1) {
-    errors.push(`SCROLL_STALL_THRESHOLD must be a positive integer >= 1 (got: ${JSON.stringify(process.env.SCROLL_STALL_THRESHOLD)}).`);
-  }
-
-  if (errors.length > 0) {
-    const message = errors.length === 1 ? errors[0] : errors.map((e, i) => `  ${i + 1}. ${e}`).join('\n');
-    throw new ConfigError(message);
-  }
-
-  return config;
+  cfg.errors = validate(cfg);
+  return cfg;
 }
 
-module.exports = { resolveConfig, ConfigError, parseMaxResults };
+const HELP_TEXT = `gmaps-scraper — Google Maps business scraper (Phase 1)
+
+Usage:
+  npm start -- --query <q> --location <loc> [options]
+  node src/index.js --query <q> --location <loc> [options]
+
+Required:
+  --query, -q <string>      What to search (e.g. "Restaurant")
+  --location, -l <string>   Where to search (e.g. "Toronto")
+
+Optional:
+  --maxResults, --limit <n>  Cap result count (default: all available)
+  --outputFile, -o <path>    Output CSV/JSON path (default: auto-generated)
+  --outputDir <path>         Output directory (default: ./data)
+  --headless / --headed      Force browser mode (default: headless)
+  --logLevel <level>         debug | info | warn | error (default: info)
+  --verbose                  Alias for --logLevel debug
+  --dryRun                   Run pipeline but skip writing output files
+  --version                  Print version and exit
+  --help, -h                 Show this help
+
+Examples:
+  npm start -- --query "Cafe" --location "Berlin" --maxResults 50
+  npm start -- --query "Plumber" --location "Dhaka, Bangladesh" --headed --verbose
+`;
+
+module.exports = { loadConfig, parseArgs, validate, HELP_TEXT };

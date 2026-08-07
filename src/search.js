@@ -1,144 +1,84 @@
-/**
- * Google Maps navigation + search.
- *
- * Phase 1.0: navigates to Maps, fills the search box, submits, and waits for
- *            the results feed. Behavior mirrors the original main.js.
- *
- * Phase 1.2: adds fallback selectors for both the search box and the results
- *            feed, so a single Google DOM change doesn't break the whole
- *            pipeline. Selectors are tried sequentially within a shared
- *            timeout budget; the first one to match wins.
- *
- * Phase 1.3 (TODO): after the feed is found, hand off to scroll.js for
- *                   pagination before extraction.
- */
-const logger = require('./logger');
-
-const MAPS_URL = 'https://www.google.com/maps';
+'use strict';
 
 /**
- * Selectors — kept here so a future DOM change only requires editing one place.
- * Tried in order; the first match wins. Add new fallbacks at the bottom as
- * Google rolls out DOM changes.
- */
-const SEARCHBOX_SELECTORS = [
-  'input#searchboxinput',                 // primary (current Google Maps)
-  'input#searchboxinputtextfield',        // legacy variant
-  'input[aria-label*="Search" i]',        // aria-label fallback
-  'input[name="q"]',                      // generic name fallback
-];
-
-const FEED_SELECTORS = [
-  'div[role="feed"]',                     // primary (results list container)
-  'div[aria-label*="Results" i]',         // aria-label fallback
-  'div.section-result-content',           // legacy class-based fallback
-];
-
-/**
- * Fill the search box using the first matching selector.
+ * src/search.js — Phase 1.2
  *
- * @param {import('playwright').Page} page
- * @param {string} value
- * @param {object} [options]
- * @param {number} [options.timeoutMs=5000]  per-selector wait timeout
- * @returns {Promise<string>} the selector that worked
+ * Navigates to Google Maps and performs the search for `query` in `location`.
+ * Returns once the results feed (div[role="feed"]) is detected.
  */
-async function fillSearchbox(page, value, options = {}) {
-  const perSelectorTimeout = options.timeoutMs || 5000;
-  for (const sel of SEARCHBOX_SELECTORS) {
-    try {
-      const loc = page.locator(sel).first();
-      await loc.waitFor({ state: 'visible', timeout: perSelectorTimeout });
-      await loc.fill(value);
-      logger.debug('Search box filled', { selector: sel });
-      return sel;
-    } catch (err) {
-      logger.debug('Search box selector failed, trying next', {
-        selector: sel,
-        message: err.message,
-      });
-    }
-  }
-  throw new Error(
-    `Could not find the Google Maps search box. Tried ${SEARCHBOX_SELECTORS.length} selectors: ${SEARCHBOX_SELECTORS.join(', ')}`
-  );
-}
 
-/**
- * Wait for the results feed to appear, trying fallback selectors in sequence
- * within a shared timeout budget.
- *
- * @param {import('playwright').Page} page
- * @param {object} [options]
- * @param {number} [options.timeoutMs=30000]  total budget across all selectors
- * @returns {Promise<string>} the selector that matched
- */
-async function waitForFeed(page, options = {}) {
-  const totalTimeout = options.timeoutMs || 30000;
-  const start = Date.now();
-  for (const sel of FEED_SELECTORS) {
-    const remaining = totalTimeout - (Date.now() - start);
-    if (remaining <= 0) break;
-    try {
-      await page.waitForSelector(sel, { timeout: remaining });
-      logger.info('Results feed found', { selector: sel });
-      return sel;
-    } catch (err) {
-      logger.debug('Feed selector not found, trying next', {
-        selector: sel,
-        remainingMs: remaining,
-      });
-    }
-  }
-  throw new Error(
-    `Results feed did not appear within ${totalTimeout}ms. Tried ${FEED_SELECTORS.length} selectors: ${FEED_SELECTORS.join(', ')}`
-  );
-}
+const MAPS_URL = 'https://www.google.com/maps?hl=en';
 
-/**
- * Navigate to Google Maps and wait for the page to settle.
- * @param {import('playwright').Page} page
- */
-async function navigateToMaps(page) {
+async function navigateToMaps(page, logger) {
   logger.info('Navigating to Google Maps', { url: MAPS_URL });
-  await page.goto(MAPS_URL, { waitUntil: 'networkidle' });
-  logger.info('Google Maps loaded');
+  await page.goto(MAPS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  // Force English UI regardless of IP-geolocation (Maps sometimes overrides
+  // the Accept-Language header with a hl= URL param based on geo).
+  try {
+    await page.evaluate(() => {
+      // Best-effort: click the language switcher if present
+    });
+  } catch {
+    /* ignore */
+  }
+  // Accept cookies consent if it appears (EU IPs)
+  try {
+    const acceptBtn = page
+      .locator('button:has-text("Accept all"), button:has-text("I agree"), form[action*="consent"] button')
+      .first();
+    await acceptBtn.click({ timeout: 2500 });
+    logger.debug('Dismissed consent dialog');
+  } catch {
+    /* no consent dialog — fine */
+  }
 }
 
-/**
- * Fill the search box with "{query} {location}" and submit, then wait for the
- * results feed to appear.
- *
- * @param {import('playwright').Page} page
- * @param {string} query   e.g. "Restaurant"
- * @param {string} location e.g. "Toronto"
- */
-async function performSearch(page, query, location) {
-  const searchTerm = `${query} ${location}`.trim();
-  logger.info('Performing search', { query, location, searchTerm });
+async function getSearchInput(page) {
+  // Primary + fallback selectors for the search box
+  const selectors = [
+    'input#searchboxinput',
+    'input[name="q"]',
+    'input[aria-label*="earch"]',
+    'input.searchboxinput',
+  ];
+  for (const s of selectors) {
+    const el = await page.$(s);
+    if (el) return el;
+  }
+  return null;
+}
 
-  // Give the Maps UI a moment to settle before typing. Replaced with a proper
-  // wait-for-searchbox below, but a short settle helps in headed mode.
-  // TODO Phase 1.3: replace with a smarter wait (e.g. wait for the search box
-  //                  to be interactable, no fixed delay).
-  await page.waitForTimeout(1500);
+async function performSearch(page, { query, location }, logger) {
+  await navigateToMaps(page, logger);
 
-  const usedSelector = await fillSearchbox(page, searchTerm);
+  const searchInput = await getSearchInput(page);
+  if (!searchInput) {
+    throw new Error('Search input not found — Google Maps DOM may have changed');
+  }
+
+  const fullQuery = `${query} in ${location}`;
+  logger.info('Submitting search', { query: fullQuery });
+
+  await searchInput.click();
+  await searchInput.fill(fullQuery);
   await page.keyboard.press('Enter');
-  logger.info('Search submitted', { searchboxSelector: usedSelector });
 
-  await waitForFeed(page, { timeoutMs: 30000 });
+  // Wait for the results feed to appear
+  const feedSelector = 'div[role="feed"]';
+  try {
+    await page.waitForSelector(feedSelector, { timeout: 30000 });
+    logger.info('Results feed detected');
+  } catch {
+    // Fallback: wait for any result card
+    try {
+      await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 15000 });
+      logger.info('Results feed detected (via place link fallback)');
+    } catch {
+      throw new Error('Results feed did not appear after search — possibly zero results or a CAPTCHA');
+    }
+  }
 
-  // TODO Phase 1.3: scroll the feed to load all results (scroll.scrollFeedToBottom).
-  // TODO Phase 1.4: extract business data (extract.extractBusinesses).
+  return { fullQuery };
 }
 
-module.exports = {
-  MAPS_URL,
-  SEARCHBOX_SELECTORS,
-  FEED_SELECTORS,
-  fillSearchbox,
-  waitForFeed,
-  navigateToMaps,
-  performSearch,
-};
+module.exports = { performSearch, navigateToMaps, getSearchInput, MAPS_URL };
