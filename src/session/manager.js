@@ -32,6 +32,13 @@
 const DEFAULT_MAX_REQUESTS = 50;
 const DEFAULT_MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes
 
+// Phase 2.10 — periodic context restart. Default 0 = disabled (preserves
+// Phase 2.7 behavior exactly). When > 0, the context is force-restarted every
+// N tasks REGARDLESS of session rotation, to clear accumulated Chrome memory
+// that session rotation alone doesn't reclaim. This is the "memory mitigation"
+// knob — see PHASE2_EXECUTION_PLAN.md → Phase 2.10.
+const DEFAULT_CONTEXT_RESTART_EVERY = 0;
+
 class SessionError extends Error {
   constructor(message, { code } = {}) {
     super(message);
@@ -88,7 +95,17 @@ function createSessionRecord({ id, createdAt, proxy, fingerprint }) {
  * @param {()=>number} [opts.clock]          — injectable clock (default Date.now)
  * @param {(ms:number)=>Promise<void>} [opts.sleepFn] — injectable sleep
  * @param {object} [opts.logger]
- * @returns {{ getContext, tickRequest, shouldRotate, rotate, release, stats, current }}
+ * @param {number} [opts.contextRestartEvery=0] — Phase 2.10: force-restart the context
+ *                                              every N tasks (independent of rotation).
+ *                                              0 = off (preserves Phase 2.7 behavior).
+ * @param {()=>object} [opts.getMemory]      — Phase 2.10: DI process.memoryUsage accessor.
+ *                                              When supplied + memoryThresholdMb set, the
+ *                                              manager can force-restart the context on
+ *                                              heap pressure (see shouldRestartForMemory).
+ * @param {number} [opts.memoryThresholdMb]  — Phase 2.10: heap threshold (MB) that triggers
+ *                                              a forced context restart.
+ * @returns {{ getContext, tickRequest, shouldRotate, rotate, release, stats, current,
+ *             shouldRestartForMemory, restartForMemory, tasksSinceRestart, contextRestarts }}
  */
 function createSessionManager(opts = {}) {
   const maxRequests = opts.maxRequests ?? DEFAULT_MAX_REQUESTS;
@@ -99,6 +116,37 @@ function createSessionManager(opts = {}) {
   const clock = opts.clock || defaultClock;
   const sleepFn = opts.sleepFn || defaultSleep;
   const logger = opts.logger || null;
+  // Phase 2.10 — periodic context restart. When > 0, the context is force-
+  // restarted every N tasks (independent of session rotation) to reclaim
+  // Chrome memory. Default 0 = off (preserves Phase 2.7 behavior).
+  // Validation: an explicit negative number is an error (throw). A non-finite
+  // value or undefined falls back to the default.
+  let contextRestartEvery;
+  if (opts.contextRestartEvery === undefined || opts.contextRestartEvery === null) {
+    contextRestartEvery = DEFAULT_CONTEXT_RESTART_EVERY;
+  } else if (!Number.isFinite(opts.contextRestartEvery)) {
+    throw new SessionError(
+      `contextRestartEvery must be a finite number (got ${opts.contextRestartEvery})`,
+      { code: 'INVALID_CONTEXT_RESTART_EVERY' },
+    );
+  } else if (opts.contextRestartEvery < 0) {
+    throw new SessionError(
+      `contextRestartEvery must be 0 (off) or >= 1 (got ${opts.contextRestartEvery})`,
+      { code: 'INVALID_CONTEXT_RESTART_EVERY' },
+    );
+  } else {
+    contextRestartEvery = opts.contextRestartEvery > 0 ? Math.floor(opts.contextRestartEvery) : 0;
+  }
+  // Phase 2.10 — DI memory accessor for forced memory-based restart. When
+  // supplied, shouldRestartForMemory() reads it + returns true when heap
+  // exceeds the threshold. The main entry point wires this to a per-worker
+  // process.memoryUsage() reader. Default null = memory-based restart off.
+  const getMemory =
+    typeof opts.getMemory === 'function' ? opts.getMemory : null;
+  const memoryThresholdMb =
+    Number.isFinite(opts.memoryThresholdMb) && opts.memoryThresholdMb > 0
+      ? opts.memoryThresholdMb
+      : null;
 
   if (typeof createContext !== 'function') {
     throw new SessionError('createSessionManager requires a createContext function', {
@@ -115,6 +163,9 @@ function createSessionManager(opts = {}) {
       code: 'INVALID_MAX_AGE',
     });
   }
+  // (Phase 2.10 contextRestartEvery validation moved up to the resolution
+  // block — we need to throw on a bad EXPLICIT value, not the resolved
+  // default.)
 
   // --- Internal state -----------------------------------------------------
   // The "current" session is the one serving requests. It's replaced on
@@ -124,6 +175,15 @@ function createSessionManager(opts = {}) {
   let nextId = 1;
   const sessions = []; // all session records (for stats)
   let rotations = 0;
+  // Phase 2.10 — periodic context restart counters. `tasksSinceRestart` is
+  // reset to 0 every time the context is force-restarted (via contextRestartEvery
+  // OR via restartForMemory). `contextRestarts` is the lifetime count.
+  let tasksSinceRestart = 0;
+  let contextRestarts = 0;
+  // Phase 2.10 — high-water heap observed at the moment of the last forced
+  // restart (for the "Context restarted (tasks=50, heapBefore=X, heapAfter=Y)"
+  // log line). null before the first restart.
+  let lastRestartHeapMb = null;
 
   /**
    * Create a brand-new context + page, record it as the current session, and
@@ -202,21 +262,122 @@ function createSessionManager(opts = {}) {
 
   /**
    * Pure check: should the current session be rotated?
-   * True when requestCount >= maxRequests OR age >= maxAgeMs.
-   * Returns { rotate, reason, requestCount, ageMs }.
+   * True when requestCount >= maxRequests OR age >= maxAgeMs OR (Phase 2.10)
+   * tasksSinceRestart >= contextRestartEvery.
+   * Returns { rotate, reason, requestCount, ageMs, tasksSinceRestart }.
    */
   function shouldRotate() {
-    if (!current) return { rotate: false, reason: null, requestCount: 0, ageMs: 0 };
+    if (!current) {
+      return { rotate: false, reason: null, requestCount: 0, ageMs: 0, tasksSinceRestart };
+    }
     const now = clock();
     const ageMs = now - current.record.createdAt;
     const requestCount = current.record.requestCount;
     if (requestCount >= maxRequests) {
-      return { rotate: true, reason: 'max-requests', requestCount, ageMs };
+      return { rotate: true, reason: 'max-requests', requestCount, ageMs, tasksSinceRestart };
     }
     if (ageMs >= maxAgeMs) {
-      return { rotate: true, reason: 'max-age', requestCount, ageMs };
+      return { rotate: true, reason: 'max-age', requestCount, ageMs, tasksSinceRestart };
     }
-    return { rotate: false, reason: null, requestCount, ageMs };
+    // Phase 2.10 — periodic context restart takes precedence over normal
+    // session rotation when configured. The reason is distinct ('context-restart')
+    // so the caller can log it differently + the post-rotation tasksSinceRestart
+    // counter resets (a normal rotation does NOT reset it — only a forced
+    // context restart does, because the whole point is clearing Chrome memory).
+    if (contextRestartEvery > 0 && tasksSinceRestart >= contextRestartEvery) {
+      return {
+        rotate: true,
+        reason: 'context-restart',
+        requestCount,
+        ageMs,
+        tasksSinceRestart,
+      };
+    }
+    return { rotate: false, reason: null, requestCount, ageMs, tasksSinceRestart };
+  }
+
+  /**
+   * Phase 2.10 — Pure check: should the current context be force-restarted
+   * because of heap pressure? Reads getMemory() (DI) and compares heapUsed
+   * against memoryThresholdMb. Returns { restart, heapUsedMb, thresholdMb }.
+   * When getMemory or memoryThresholdMb is not configured, always returns
+   * { restart: false } (memory-based restart disabled — preserves Phase 2.7).
+   */
+  function shouldRestartForMemory() {
+    if (!getMemory || !memoryThresholdMb || !current) {
+      return { restart: false, heapUsedMb: null, thresholdMb: memoryThresholdMb || null };
+    }
+    let mem;
+    try {
+      mem = getMemory();
+    } catch {
+      return { restart: false, heapUsedMb: null, thresholdMb: memoryThresholdMb };
+    }
+    const heapUsedMb = Math.round((mem.heapUsed || 0) / (1024 * 1024));
+    return {
+      restart: heapUsedMb >= memoryThresholdMb,
+      heapUsedMb,
+      thresholdMb: memoryThresholdMb,
+    };
+  }
+
+  /**
+   * Phase 2.10 — Force a context restart for memory reclamation. Closes the
+   * current context (with a brief wait for Chrome to settle), opens a new one,
+   * and resets tasksSinceRestart. Logs the before/after heap so the operator
+   * can see the sawtooth pattern. Best-effort — never throws.
+   *
+   * @param {object} args { browser, proxy, fingerprint, reason }
+   * @returns {Promise<{ context, page, sessionInfo, heapBeforeMb, heapAfterMb }>}
+   */
+  async function restartForMemory({ browser, proxy, fingerprint, reason = 'memory' } = {}) {
+    const heapBeforeMb = (() => {
+      if (!getMemory) return null;
+      try {
+        return Math.round((getMemory().heapUsed || 0) / (1024 * 1024));
+      } catch {
+        return null;
+      }
+    })();
+    if (logger) {
+      logger.info('Context restart — reclaiming memory', {
+        reason,
+        tasksSinceRestart,
+        heapBeforeMb,
+        thresholdMb: memoryThresholdMb,
+      });
+    }
+    // Rotate (close + reopen). The rotation reason is recorded on the OLD
+    // session's record for stats. We pass reason='context-restart' so stats()
+    // can distinguish memory-driven restarts from rotation-driven ones.
+    const r = await rotate({ browser, proxy, fingerprint, reason: 'context-restart' });
+    contextRestarts++;
+    lastRestartHeapMb = heapBeforeMb;
+    tasksSinceRestart = 0;
+    // Give Chrome a moment to actually release the old context's memory before
+    // we sample heapAfter (otherwise we'd read the pre-GC number).
+    if (sleepFn) await sleepFn(50);
+    const heapAfterMb = (() => {
+      if (!getMemory) return null;
+      try {
+        return Math.round((getMemory().heapUsed || 0) / (1024 * 1024));
+      } catch {
+        return null;
+      }
+    })();
+    if (logger) {
+      logger.info(
+        `Context restarted (tasks=${tasksSinceRestart}, heapBefore=${heapBeforeMb === null ? '?' : heapBeforeMb + 'MB'}, heapAfter=${heapAfterMb === null ? '?' : heapAfterMb + 'MB'})`,
+        { reason, contextRestarts, heapBeforeMb, heapAfterMb },
+      );
+    }
+    return {
+      context: r.context,
+      page: r.page,
+      sessionInfo: r.sessionInfo,
+      heapBeforeMb,
+      heapAfterMb,
+    };
   }
 
   /**
@@ -273,6 +434,11 @@ function createSessionManager(opts = {}) {
    * (count OR age), rotate automatically. Returns the rotation result so the
    * caller knows whether the page reference changed (and must re-navigate).
    *
+   * Phase 2.10 — also bumps `tasksSinceRestart`. When a context-restart
+   * rotation fires (tasksSinceRestart >= contextRestartEvery), the counter
+   * is reset (a forced restart reclaims Chrome memory; the rotation alone
+   * does not, so we only reset on the forced-restart path).
+   *
    * @param {object} [args] { browser, proxy, fingerprint, label }
    * @returns {Promise<{ rotated: boolean, reason: string|null, page: object, sessionInfo: object }>}
    */
@@ -281,9 +447,11 @@ function createSessionManager(opts = {}) {
       // No session yet — open one. This counts as the first request.
       const r = await openSession({ browser, proxy, fingerprint });
       current.record.requestCount = 1;
+      tasksSinceRestart++;
       return { rotated: true, reason: 'initial', page: r.page, sessionInfo: r.sessionInfo };
     }
     current.record.requestCount++;
+    tasksSinceRestart++;
     const check = shouldRotate();
     if (!check.rotate) {
       return {
@@ -298,16 +466,32 @@ function createSessionManager(opts = {}) {
         reason: check.reason,
         requestCount: check.requestCount,
         ageMs: check.ageMs,
+        tasksSinceRestart: check.tasksSinceRestart,
         label: label || null,
       });
     }
     const r = await rotate({ browser, proxy, fingerprint, reason: check.reason });
+    // Phase 2.10 — only a context-restart rotation resets the counter. A
+    // normal max-requests / max-age rotation does NOT (the context was
+    // rotated for anti-block reasons, not memory reclamation).
+    if (check.reason === 'context-restart') {
+      contextRestarts++;
+      tasksSinceRestart = 0;
+      if (logger) {
+        logger.info('Context restarted (periodic)', {
+          reason: check.reason,
+          contextRestarts,
+          requestCount: check.requestCount,
+        });
+      }
+    }
     return { rotated: true, reason: check.reason, page: r.page, sessionInfo: r.sessionInfo };
   }
 
   /**
    * Aggregate stats across all sessions (current + historical).
-   * Returns { sessionsCreated, rotations, totalRequests, avgRequestsPerSession, avgAgeMs, current }.
+   * Returns { sessionsCreated, rotations, totalRequests, avgRequestsPerSession, avgAgeMs, current,
+   *            contextRestarts, tasksSinceRestart, lastRestartHeapMb }.
    */
   function stats() {
     const closedSessions = sessions.filter((s) => s.closedAt !== null);
@@ -327,6 +511,11 @@ function createSessionManager(opts = {}) {
       maxRequests,
       maxAgeMs,
       warmup: warmupEnabled,
+      // Phase 2.10
+      contextRestartEvery,
+      contextRestarts,
+      tasksSinceRestart,
+      lastRestartHeapMb,
     };
   }
 
@@ -343,6 +532,15 @@ function createSessionManager(opts = {}) {
     release,
     stats,
     current: currentSession,
+    // Phase 2.10
+    shouldRestartForMemory,
+    restartForMemory,
+    get tasksSinceRestart() {
+      return tasksSinceRestart;
+    },
+    get contextRestarts() {
+      return contextRestarts;
+    },
   };
 }
 
@@ -369,6 +567,7 @@ module.exports = {
   SessionError,
   DEFAULT_MAX_REQUESTS,
   DEFAULT_MAX_AGE_MS,
+  DEFAULT_CONTEXT_RESTART_EVERY,
   defaultClock,
   defaultSleep,
 };

@@ -141,6 +141,32 @@ function parseArgs(argv) {
     else if (a === '--queuePriority') out.queuePriority = argv[++i];
     else if (a === '--queueAttempts') out.queueAttempts = argv[++i];
     else if (a === '--queueConcurrency') out.queueConcurrency = argv[++i];
+    // Phase 2.10 — memory management & long-run stability. These flags keep
+    // the scraper running 8+ hours without OOM or zombie Chromium processes:
+    //   --contextRestartEvery N — force-restart the browser context every N
+    //                             tasks (clears Chrome memory leaks; 0 = off).
+    //   --maxHeapMb N           — per-worker heap threshold (MB). Crossing it
+    //                             fires the memory monitor's onThreshold
+    //                             callback (which restarts the context).
+    //   --maxRssMb N            — total process RSS threshold (MB). Crossing it
+    //                             triggers graceful degradation (pause queue,
+    //                             restart contexts, reduce pool size).
+    //   --endless               — keep pulling jobs from the queue indefinitely
+    //                             (Phase 5 continuous scraping). Implies an
+    //                             aggressive memory monitor + hourly zombie
+    //                             reaper + HTTP /health endpoint.
+    //   --healthCheckIntervalMs — memory monitor + worker probe cadence (ms).
+    //                             Default 30000 (memory) / 60000 (worker probe).
+    //   --healthPort N          — bind a GET /health HTTP endpoint on this port
+    //                             (default: off; auto-on when --endless).
+    else if (a === '--contextRestartEvery') out.contextRestartEvery = argv[++i];
+    else if (a === '--maxHeapMb') out.maxHeapMb = argv[++i];
+    else if (a === '--maxRssMb') out.maxRssMb = argv[++i];
+    else if (a === '--endless') out.endless = true;
+    else if (a === '--healthCheckIntervalMs') out.healthCheckIntervalMs = argv[++i];
+    else if (a === '--healthPort') out.healthPort = argv[++i];
+    else if (a === '--healthHost') out.healthHost = argv[++i];
+    else if (a === '--noHealthServer') out.noHealthServer = true;
   }
   return out;
 }
@@ -482,6 +508,57 @@ function validate(cfg) {
   // a single-worker pool can still process queue jobs but with no concurrency
   // benefit). We WARN (not error) — a single worker + queue is a valid config
   // for low-throughput crash-resilient runs.
+  // Phase 2.10 — memory management validation.
+  if (cfg.health.contextRestartEvery !== 0 && cfg.health.contextRestartEvery < 1) {
+    errors.push(
+      `contextRestartEvery must be 0 (off) or >= 1 (got ${cfg.health.contextRestartEvery}). ` +
+        'Force-restart the browser context every N tasks to clear Chrome memory.',
+    );
+  }
+  if (cfg.health.contextRestartEvery > 10000) {
+    errors.push(
+      `contextRestartEvery is suspiciously large (got ${cfg.health.contextRestartEvery}). ` +
+        'For 8+ hour runs use 50–200; 10000+ defeats the memory-reclamation purpose.',
+    );
+  }
+  if (cfg.health.maxHeapMb < 64 || cfg.health.maxHeapMb > 8192) {
+    errors.push(
+      `maxHeapMb must be between 64 and 8192 (got ${cfg.health.maxHeapMb}). ` +
+        'Per-worker heap threshold for the memory monitor (default 1024).',
+    );
+  }
+  if (cfg.health.maxRssMb < 256 || cfg.health.maxRssMb > 32768) {
+    errors.push(
+      `maxRssMb must be between 256 and 32768 (got ${cfg.health.maxRssMb}). ` +
+        'Total process RSS threshold for graceful degradation (default 4096).',
+    );
+  }
+  if (cfg.health.maxRssMb <= cfg.health.maxHeapMb) {
+    errors.push(
+      `maxRssMb (${cfg.health.maxRssMb}) must be > maxHeapMb (${cfg.health.maxHeapMb}). ` +
+        'The total-process threshold must exceed the per-worker threshold.',
+    );
+  }
+  if (cfg.health.memoryIntervalMs < 1000 || cfg.health.memoryIntervalMs > 60 * 60 * 1000) {
+    errors.push(
+      `healthCheckIntervalMs must be between 1000 and 3600000 (got ${cfg.health.memoryIntervalMs}). ` +
+        'Memory monitor + worker probe cadence (default 30000).',
+    );
+  }
+  if (cfg.health.port !== null && (cfg.health.port < 1 || cfg.health.port > 65535)) {
+    errors.push(
+      `healthPort must be between 1 and 65535 (got ${cfg.health.port}). ` +
+        'Set to 0 or omit to disable the HTTP /health endpoint.',
+    );
+  }
+  // --endless requires --queue on (the endless loop pulls jobs from the queue;
+  // without a queue there's nothing to pull).
+  if (cfg.health.endless && !cfg.queue.enabled) {
+    errors.push(
+      '--endless requires --queue on (the endless loop pulls jobs from the ' +
+        'BullMQ queue; without a queue there is nothing to pull). See .env.example → Phase 2.10.',
+    );
+  }
   return errors;
 }
 
@@ -770,6 +847,57 @@ function loadConfig(argv = process.argv.slice(2)) {
       resolved: null,
     },
 
+    // Phase 2.10 — memory management & long-run stability.
+    //   --contextRestartEvery N    — force-restart the browser context every N
+    //                                tasks (clears Chrome memory leaks; 0 = off,
+    //                                preserves Phase 2.7 behavior). Default 50
+    //                                (matches the execution plan).
+    //   --maxHeapMb N              — per-worker heap threshold (MB). Crossing
+    //                                it fires the memory monitor's onThreshold
+    //                                callback (which restarts the context).
+    //                                Default 1024.
+    //   --maxRssMb N               — total process RSS threshold (MB). Crossing
+    //                                it triggers graceful degradation (pause
+    //                                queue, restart contexts, reduce pool size).
+    //                                Default 4096.
+    //   --endless                  — keep pulling jobs from the queue indefinitely
+    //                                (Phase 5 continuous scraping). Implies an
+    //                                aggressive memory monitor + hourly zombie
+    //                                reaper + HTTP /health endpoint. Requires
+    //                                --queue on.
+    //   --healthCheckIntervalMs N  — memory monitor + worker probe cadence.
+    //                                Default 30000 (memory) / 60000 (worker probe).
+    //   --healthPort N             — bind a GET /health HTTP endpoint on this
+    //                                port (default: off; auto-on when --endless).
+    //   --healthHost <host>        — bind host (default 127.0.0.1; set 0.0.0.0
+    //                                to expose externally — make sure the port
+    //                                is firewalled).
+    //   --noHealthServer           — force-disable the HTTP /health endpoint
+    //                                even when --endless is set.
+    health: {
+      contextRestartEvery:
+        toIntOrNull(cli.contextRestartEvery ?? process.env.CONTEXT_RESTART_EVERY) ?? 50,
+      maxHeapMb: toIntOrNull(cli.maxHeapMb ?? process.env.MAX_HEAP_MB) ?? 1024,
+      maxRssMb: toIntOrNull(cli.maxRssMb ?? process.env.MAX_RSS_MB) ?? 4096,
+      endless: !!cli.endless || process.env.ENDLESS === 'on' || process.env.ENDLESS === 'true',
+      memoryIntervalMs:
+        toIntOrNull(cli.healthCheckIntervalMs ?? process.env.HEALTH_CHECK_INTERVAL_MS) ?? 30_000,
+      workerProbeIntervalMs:
+        toIntOrNull(process.env.WORKER_PROBE_INTERVAL_MS) ?? 60_000,
+      workerMaxHeapMb: toIntOrNull(process.env.WORKER_MAX_HEAP_MB) ?? 500,
+      stuckAfterMs: toIntOrNull(process.env.WORKER_STUCK_AFTER_MS) ?? 10 * 60 * 1000,
+      probeTimeoutMs: toIntOrNull(process.env.WORKER_PROBE_TIMEOUT_MS) ?? 5_000,
+      probeThreshold: toIntOrNull(process.env.WORKER_PROBE_THRESHOLD) ?? 3,
+      logEveryMs: toIntOrNull(process.env.MEMORY_LOG_EVERY_MS) ?? 5 * 60 * 1000,
+      port: toIntOrNull(cli.healthPort ?? process.env.HEALTH_PORT) ?? null,
+      host: cli.healthHost || process.env.HEALTH_HOST || '127.0.0.1',
+      serverEnabled:
+        (!!cli.endless || process.env.ENDLESS === 'on' || process.env.ENDLESS === 'true') &&
+        !cli.noHealthServer,
+      // Resolved at runtime in index.js into { stack } (null when not started).
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -917,6 +1045,26 @@ Optional:
   --queueConcurrency <n>     Phase 2.9 — worker concurrency (how many jobs the
                              worker pulls off the queue in parallel; default 1).
                              Should be <= --workers.
+
+  --contextRestartEvery <n>  Phase 2.10 — force-restart the browser context every
+                             N tasks to clear Chrome memory leaks (default 50;
+                             0 = off, preserves Phase 2.7 behavior).
+  --maxHeapMb <n>            Phase 2.10 — per-worker heap threshold (MB) for the
+                             memory monitor (default 1024). Crossing it fires the
+                             onThreshold callback (which restarts the context).
+  --maxRssMb <n>             Phase 2.10 — total process RSS threshold (MB) for
+                             graceful degradation (default 4096). Crossing it
+                             pauses the queue, restarts contexts, reduces pool.
+  --endless                  Phase 2.10 — keep pulling jobs from the queue
+                             indefinitely (Phase 5 continuous scraping). Requires
+                             --queue on. Implies an aggressive memory monitor +
+                             hourly zombie reaper + HTTP /health endpoint.
+  --healthCheckIntervalMs <ms> Phase 2.10 — memory monitor + worker probe cadence
+                             (default 30000 for memory; 60000 for worker probe).
+  --healthPort <n>           Phase 2.10 — bind a GET /health HTTP endpoint on
+                             this port (default: off; auto-on when --endless).
+  --healthHost <host>        Phase 2.10 — /health bind host (default 127.0.0.1).
+  --noHealthServer           Phase 2.10 — force-disable the HTTP /health endpoint.
 
   --version                  Print version and exit
   --help, -h                 Show this help

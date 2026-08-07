@@ -10,9 +10,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 2.9 complete. 10 of 13 sub-phases shipped.
+> **Last updated:** Phase 2.10 complete. 11 of 13 sub-phases shipped.
 >
-> **Overall:** 10 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
+> **Overall:** 11 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -26,7 +26,7 @@
 | 2.7 — Session & Cookie Rotation | ✅ DONE | 59 tests | `src/session/manager.js`, `src/session/warmup.js`, `src/session/account-warmup.js`, `src/session/context-factory.js`, `src/session/index.js`, `src/detail.js` (sessionCheck hook + page swap), `src/config.js` (--sessionMaxRequests/--sessionMaxAgeMs/--warmup/--warmupDurationMs/--accountWarmup/--accountsFile), `src/banner.js` (Session row), `src/index.js` (construct manager, warmup before search, tickRequest in deep-scrape, rotate + re-navigate, end-of-run stats) | createSessionManager with injectable createContext/clock/sleep; rotation by request count OR age (whichever first); warmupContext visits google.com + random second site + benign search; accountWarmup opt-in (off by default, credentials never logged, email redacted); cookie isolation (each context fresh jar); createRealContextFactory bridges to browser.newContext + fingerprint + stealth; mid-deep-scrape rotation via sessionCheck hook + re-navigate to Maps search |
 | 2.8 — Worker Pool & Concurrency | ✅ DONE | 67 tests | `src/worker.js`, `src/pool.js`, `src/config.js` (--workers/--workerProxyStrategy/--workerCrashLimit/--workerCooldownMs/--workerLoadBalancer/--workerDetailBatchSize/--workerTaskRetries), `src/index.js` (runWithPool: getIdentity + runTask [search-task/detail-task] + dispatchBatchSettled + per-worker session aggregation + Pool: banner line), `.env.example` (Phase 2.8 section) | createWorker with DI runTask + state machine (idle/busy/cooldown/retired) + block/crash tracking + rotateIdentity; createPool with round-robin/least-busy + race-free acquireWorker + re-queue on block/crash + retire after crashLimit; serializable task types (search/detail/resume); --workers 1 preserves Phase 1 sequential pipeline byte-for-byte |
 | 2.9 — Job Queue & Orchestration | ✅ DONE | 96 tests | `src/queue/index.js` (createQueue adapter: add/addBatch/process/getStatus/getStats/getActive/pause/resume/deadLetter+retryDeadLetter/shutdown), `src/queue/job-types.js` (JOB_TYPES registry: search/detail-batch/enrich + validateJobRequest + resolvePriority + PRIORITY bands), `src/queue/mock-backend.js` (in-memory MockQueue+MockWorker+MockJob — mirrors BullMQ API surface for tests; priority queue, retry with exponential backoff, dead-letter, pause/resume, graceful close), `src/queue/dead-letter.js` (createDeadLetter: list/get/retry/retryAll/remove/clear/count + serializeJob), `src/config.js` (--queue/--redisUrl/--queuePriority/--queueAttempts/--queueConcurrency), `src/index.js` (runWithQueue: pool + queue + processor wiring; search job → detail-batch jobs; Queue: banner line), `src/banner.js` (Workers + Queue rows), `scripts/batch.js` (npm run batch -- --file queries.csv), `scripts/queue-status.js` (npm run queue:status — live top-style monitor + --job/--deadLetter/--retry/--retryAll), `data/queries.example.csv`, `.env.example` (Phase 2.9 section) | BullMQ + Redis backend (production) with injectable mock backend (tests — NO real Redis required, an explicit acceptance criterion); 3 job types (search/detail-batch/enrich) with schema validators; priority bands (1=high/5=normal/10=low); retry with exponential backoff (default 3 attempts) → dead-letter queue; batch submission CLI (CSV parser, quoted-comma support, --dryRun); live status CLI (2s refresh, active+failed jobs, --once/--job/--retry modes); crash-resilient (jobs persist in Redis, restart resumes queue); --queue off preserves Phase 2.8 in-process behavior exactly |
-| 2.10 — Memory Management & Long-Run Stability | ⬜ NOT STARTED | — | — | Context restart, leak mitigation, health probes |
+| 2.10 — Memory Management & Long-Run Stability | ✅ DONE | 78 tests | `src/health/memory-monitor.js` (startMemoryMonitor: DI getMemory/getWorkers/clock/setInterval; threshold callback with re-arm; high-water mark; periodic snapshot log), `src/health/worker-probe.js` (startWorkerProbe: heap-bloat / stuck / unresponsive detection with re-arm; DI getWorkers/probeFn; consecutive-timeout tracking), `src/health/zombie-reaper.js` (createZombieReaper: scan/reapOnStartup/reapOnShutdown/killWithEscalation SIGTERM→SIGKILL; DI listPids/killPid — no real OS calls in tests; pattern defense-in-depth), `src/health/degradation.js` (createDegradation: shouldRun re-arm semantics; full handlePressure sequence pause→wait→restart→gc→resume→reducePool; reducePoolLimit floor), `src/health/server.js` (createHealthServer: node:http GET /health → JSON snapshot; 200 ok/degraded, 503 unhealthy; default snapshot builder with status determination), `src/health/index.js` (createHealthStack orchestrator + barrel), `src/session/manager.js` (contextRestartEvery periodic restart + shouldRestartForMemory + restartForMemory + tasksSinceRestart counter + stats() new fields), `src/config.js` (--contextRestartEvery/--maxHeapMb/--maxRssMb/--endless/--healthCheckIntervalMs/--healthPort/--healthHost/--noHealthServer + validation), `src/banner.js` (Memory row), `src/index.js` (buildHealthStack/stopHealthStack wired into runWithPool + runWithQueue; zombie reaper startup sweep; SIGINT zombie reap; endless mode keeps queue+pool+health stack alive + 1-min heartbeat), `.env.example` (Phase 2.10 section), `package.json` (syntax script + version bump) | Memory monitor polls process.memoryUsage every 30s (DI — tests inject mock getMemory + no-op setInterval); worker probe inspects every worker every 60s + pings page.evaluate (DI probeFn); zombie reaper uses pgrep + process.kill (DI listPids/killPid — tests never touch real OS); graceful degradation pauses queue + restarts contexts + runs global.gc (if --expose-gc) + reduces pool size when RSS still high; HTTP /health endpoint serves JSON snapshot (status, uptime, heap, workers, queueDepth, endless) — 200 ok/degraded, 503 unhealthy; --endless keeps the process alive pulling queue jobs (queue+pool+health stack skip teardown on success); SIGINT handler reaps zombies before exit (acceptance criterion: zero orphaned Chromium processes); --contextRestartEvery 0 (off) preserves Phase 2.7 behavior exactly |
 | 2.11 — Self-Healing Selectors & Health Checks | ⬜ NOT STARTED | — | — | Auto-discovery, extraction-rate alerting, selector versioning |
 | 2.12 — Incremental Scraping & Detail Caching | ⬜ NOT STARTED | — | — | `last_seen` freshness, detail-page cache, only-re-scrape-modified |
 | 2.13 — Final Integration, Docs & Handoff | ⬜ NOT STARTED | — | — | End-to-end 10k run, docs update, `v2.0.0-phase2` tag |
@@ -817,7 +817,7 @@ A persistent job queue that enables batch processing, priorities, and crash-resi
 
 ## Phase 2.10 — Memory Management & Long-Run Stability
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE**
 
 ### Goal
 Keep the scraper running for 8+ hours without memory leaks, zombie processes, or degraded performance. Implement periodic browser-context restarts, memory monitoring, and health probes that trigger corrective action before a crash.
@@ -826,24 +826,24 @@ Keep the scraper running for 8+ hours without memory leaks, zombie processes, or
 Playwright/Chromium has known memory leaks on long runs. A 10,000-listing overnight run will OOM (out-of-memory) kill the process around hour 4 without mitigation. This phase makes "overnight unattended" actually achievable.
 
 ### Task checklist
-- [ ] **Memory monitor.** `src/health.js`:
+- [x] **Memory monitor.** `src/health/memory-monitor.js`:
   - `startMemoryMonitor({ intervalMs, thresholdMb, logger, onThreshold })` — polls `process.memoryUsage().heapUsed` every 30s.
   - If heap exceeds `thresholdMb` (default: 1024), triggers `onThreshold` callback (usually: restart the current browser context).
   - Logs memory usage every 5 min: `Memory: heap=512MB rss=894MB workers=5`.
   - Tracks high-water mark: `Memory high-water: heap=1024MB at 2026-08-07T03:14:22Z`.
-- [ ] **Periodic context restart.** In the session manager (Phase 2.7):
+- [x] **Periodic context restart.** In the session manager (Phase 2.7):
   - `--contextRestartEvery N` — restart the browser context every N tasks (default: 50), regardless of session rotation. This clears accumulated memory.
   - On restart: close context, explicitly call `context.close()` + wait, then create a new context. Log: `Context restarted (tasks=50, heapBefore=480MB, heapAfter=120MB)`.
-- [ ] **Worker health probe.** `src/health/worker-probe.js`:
+- [x] **Worker health probe.** `src/health/worker-probe.js`:
   - Every 60s, each worker reports: `{ workerId, heapUsed, taskCount, lastTaskAge, blocked }`.
   - If a worker's heap exceeds 500MB → force-restart its context.
   - If a worker hasn't completed a task in 10 min (stuck) → kill and restart.
   - If a worker's browser process is unresponsive (page.evaluate times out 3× in a row) → kill and restart.
-- [ ] **Zombie process cleanup.** `src/health/zombie-reaper.js`:
+- [x] **Zombie process cleanup.** `src/health/zombie-reaper.js`:
   - On shutdown, ensure all Chromium processes are killed (not just the browser object — check the PID).
   - On startup, scan for orphaned Chromium processes from a previous crashed run and kill them.
   - Log: `Zombie reaper: killed 2 orphaned chromium processes (PIDs 12345, 12346)`.
-- [ ] **Graceful degradation under memory pressure.**
+- [x] **Graceful degradation under memory pressure.** `src/health/degradation.js`:
   - If total process RSS exceeds `--maxRssMb` (default: 4096):
     1. Stop accepting new tasks (pause the queue).
     2. Finish active tasks.
@@ -851,22 +851,27 @@ Playwright/Chromium has known memory leaks on long runs. A 10,000-listing overni
     4. Run `global.gc()` if `--expose-gc` is set.
     5. Resume the queue.
   - If RSS still exceeds threshold after restart → reduce pool size by 1 worker and log a warning.
-- [ ] **Endless-run mode.** `--endless` flag:
+- [x] **Endless-run mode.** `--endless` flag:
   - For continuous scraping (Phase 5): the scraper never exits; it keeps pulling jobs from the queue.
   - In endless mode: context restarts every N tasks, memory monitor is aggressive, zombie reaper runs hourly.
   - Health endpoint: `GET /health` (if an HTTP server is running) returns `{ status, uptime, heap, workers, queueDepth }`.
-- [ ] **Config flags.**
+- [x] **Config flags.** `src/config.js`:
   - `--contextRestartEvery N` (default: 50)
   - `--maxHeapMb` (default: 1024 per worker)
   - `--maxRssMb` (default: 4096 total)
   - `--endless` (default: off)
-  - `--healthCheckIntervalMs` (default: 60000)
-- [ ] **Unit tests.** `tests/health.test.js`:
+  - `--healthCheckIntervalMs` (default: 30000 — memory; 60000 — worker probe)
+  - `--healthPort` / `--healthHost` / `--noHealthServer` (HTTP /health endpoint control)
+- [x] **Unit tests.** `tests/health.test.js` (78 tests):
   - Memory monitor triggers callback when threshold exceeded (mock `process.memoryUsage`).
   - Context restart counter increments correctly.
   - Zombie reaper identifies orphaned PIDs (mock `ps` output).
   - Graceful degradation reduces pool size when RSS exceeds threshold.
   - DI: monitor accepts mock `getMemory` and `getWorkers` functions.
+  - Worker probe: heap/stuck/unresponsive detection + re-arm semantics.
+  - Health server: 200/503/404 status codes, snapshot builder.
+  - Config: all Phase 2.10 flags + validation + env vars.
+  - Banner: Memory row.
 
 ### Acceptance criteria
 - A 4-hour test run with `--workers 3` completes without OOM; heap stays below 1GB per worker.
@@ -880,6 +885,8 @@ Phase 2.8 (workers), Phase 2.9 (queue — for pause/resume under memory pressure
 
 ### Deliverable
 A memory-stable scraper that survives 8+ hour runs without degradation or zombie processes.
+
+**Shipped:** `src/health/memory-monitor.js` (startMemoryMonitor with full DI — getMemory/getWorkers/clock/setIntervalFn/clearIntervalFn; threshold callback with re-arm semantics so the same crossing doesn't fire twice; high-water mark tracking for heap + rss independently with ISO timestamp; periodic snapshot log line `Memory: heap=512MB rss=894MB workers=5`; first-tick baseline reading; pollCount + armed accessors), `src/health/worker-probe.js` (startWorkerProbe with DI getWorkers/probeFn/clock; three failure modes — heap bloat [>maxHeapMb], stuck [busy > stuckAfterMs with no completion], unresponsive [N consecutive probe timeouts]; per-worker tracker with re-arm after issue clears; retired workers skipped; page.evaluate ping with timeout via Promise.race; onIssue callback per worker), `src/health/zombie-reaper.js` (createZombieReaper with DI listPids/killPid/sleepFn/platform; scan/reapOnStartup/reapOnShutdown/killWithEscalation [SIGTERM → graceMs → SIGKILL]; DEFAULT_PATTERN matches chromium|chrome|headless_shell|headless-shell; defense-in-depth pattern re-filter in scan; protectPids list; logReport emits the spec format `Zombie reaper: killed N orphaned chromium processes (PIDs ...)`), `src/health/degradation.js` (createDegradation with DI getRss/getWorkers/pauseFn/resumeFn/restartWorkerFn/reducePoolFn/gcFn/waitFn; shouldRun re-arm semantics [disarm after acting, re-arm when RSS drops below threshold]; full handlePressure sequence — pause → wait-for-in-flight → restart contexts → gc → resume → conditional pool reduce; reducePoolLimit floor [never reduce below 1]; per-step logging + steps array in result), `src/health/server.js` (createHealthServer using node:http — no Express dep; createDefaultSnapshotBuilder with status determination [ok/degraded/unhealthy based on heap/activeSize/queueDepth thresholds]; GET /health → 200 JSON for ok/degraded, 503 for unhealthy, 404 for other paths/methods, 500 on snapshot error; start/stop lifecycle with idempotent re-bind; getPort accessor for port-0 binds; Cache-Control: no-store), `src/health/index.js` (createHealthStack orchestrator — wires monitor + probe + reaper + degradation + server into a single start/stop object; snapshot() for the /health endpoint), `src/session/manager.js` Phase 2.10 extensions (contextRestartEvery periodic restart — fires every N tasks independent of session rotation, reason='context-restart', resets tasksSinceRestart counter; shouldRestartForMemory — pure check against getMemory DI + memoryThresholdMb; restartForMemory — closes + reopens context, logs before/after heap `Context restarted (tasks=50, heapBefore=480MB, heapAfter=120MB)`; tasksSinceRestart + contextRestarts + lastRestartHeapMb in stats(); validation rejects negative contextRestartEvery), `src/config.js` (--contextRestartEvery [default 50, 0=off preserves Phase 2.7], --maxHeapMb [1024], --maxRssMb [4096], --endless, --healthCheckIntervalMs [30000], --healthPort, --healthHost, --noHealthServer + CONTEXT_RESTART_EVERY/MAX_HEAP_MB/MAX_RSS_MB/ENDLESS/HEALTH_PORT/HEALTH_HOST/MEMORY_LOG_EVERY_MS/WORKER_* env vars + validation [maxRssMb > maxHeapMb, --endless requires --queue on, healthPort 1-65535, etc.] + HELP_TEXT + examples), `src/banner.js` (Memory row — restart interval · heap · rss · endless · health port), `src/index.js` (buildHealthStack/stopHealthStack helpers; zombie reaper startup sweep before any browser launches; health stack started in runWithPool + runWithQueue after pool/queue built; onMemoryThreshold logs; onWorkerIssue calls worker.sessionManager.restartForMemory for heap issues; degradation pauseFn/resumeFn/restartWorkerFn/reducePoolFn wired to queue+pool; SIGINT handler reaps zombies with 2s deadline before exit 130; sequential path finally block also reaps; --endless mode skips runWithQueue teardown on success + keeps process alive with 1-min heartbeat + never-resolving promise; queueErrored flag drives teardown decision), `.env.example` (Phase 2.10 section expanded — CONTEXT_RESTART_EVERY, MAX_HEAP_MB, WORKER_MAX_HEAP_MB, MAX_RSS_MB, HEALTH_CHECK_INTERVAL_MS, MEMORY_LOG_EVERY_MS, WORKER_PROBE_*, WORKER_STUCK_AFTER_MS, ENDLESS, HEALTH_PORT, HEALTH_HOST), `package.json` (syntax script includes src/health/*.js; version bumped to 1.0.0-phase2.10), `tests/health.test.js` (78 tests / 228 assertions across memory-monitor [snapshot, threshold re-arm, high-water, getWorkers variants, periodic log, validation, getMemory failure, callback error], worker-probe [heap/stuck/unresponsive detection, re-arm, retired skip, getWorkers variants, callback error, stop idempotent], zombie-reaper [scan, reapOnStartup, SIGKILL escalation, ESRCH skip, reapOnShutdown, logReport format, DEFAULT_PATTERN], degradation [shouldRun re-arm, full sequence, no-reduce-when-drops, pool-limit, in-flight partial, currentRssMb], health server [snapshot builder status determination, 200/503/404/500, start/stop lifecycle, idempotent], createHealthStack orchestrator, session manager context-restart + memory-restart, config flags + validation + env vars, banner row). **1190 tests / 7730 assertions passing total** (78 new).
 
 ---
 
