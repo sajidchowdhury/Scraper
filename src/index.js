@@ -77,12 +77,22 @@ const {
   buildDedupSet,
   dedupKey,
 } = require('./checkpoint');
-const { RateLimiter, detectCaptcha } = require('./antiblock');
+const { RateLimiter, detectCaptcha, detectCaptchaType } = require('./antiblock');
 const { showStartupBanner } = require('./banner');
 // Phase 2.4 — browser fingerprint randomization. Loaded eagerly so the
 // fingerprint can be generated + logged before the browser launches (and so
 // --fixedFingerprint coherence failures surface at config time, not at launch).
 const { generateFingerprint, summarizeFingerprint } = require('./fingerprint');
+// Phase 2.6 — CAPTCHA auto-solving. createSolver/BudgetGuard/handleCaptcha are
+// only invoked when cfg.captcha.provider != 'none' (otherwise Phase 1.8's
+// pause-and-alert behavior is preserved exactly).
+const {
+  createSolver,
+  createSolverChain,
+  BudgetGuard,
+  createCostLogger,
+  handleCaptcha,
+} = require('./captcha');
 // Phase 2.1 — PostgreSQL persistence (lazy-loaded; only used when
 // cfg.output includes 'db').
 const { createPool, persistRunResults, closePool } = require('./db');
@@ -272,6 +282,114 @@ async function main() {
   // Store on cfg so downstream code (banner, future worker pool) can read it.
   cfg.fingerprint.resolved = fingerprint;
 
+  // Phase 2.5 — resolve the stealth config. Stealth is ON by default in
+  // Phase 2.5; --noStealth / STEALTH=off disables it. --stealthDebug turns on
+  // per-patch console.warn output from the init script (for debugging which
+  // patches applied + the resulting navigator properties).
+  //
+  // Stealth complements (not replaces) the fingerprint:
+  //   fingerprint → WHO the browser claims to be (UA, platform, WebGL vendor, ...)
+  //   stealth     → WHETHER the browser looks automated (webdriver, chrome.runtime,
+  //                 plugins.length, permissions.query, outerWidth/Height, ...)
+  // A real Chrome user has BOTH a coherent identity AND no automation signals.
+  const stealthConfig = {
+    enabled: cfg.stealth.profile === 'on',
+    debug: cfg.stealth.debug,
+  };
+  cfg.stealth.resolved = stealthConfig;
+  if (stealthConfig.enabled) {
+    logger.info('Phase 2.5 — stealth hardening enabled', {
+      profile: cfg.stealth.profile,
+      debug: stealthConfig.debug,
+      hint: stealthConfig.debug
+        ? 'Init script will emit console.warn per patch — visible in browser console'
+        : 'Use --stealthDebug to see which patches applied',
+    });
+  } else {
+    logger.info('Phase 2.5 — stealth hardening disabled (Phase 1/2.4 behavior)', {
+      reason: '--noStealth flag or STEALTH=off',
+    });
+  }
+
+  // Phase 2.6 — resolve the CAPTCHA solver. When provider is 'none' (the
+  // default) OR --noCaptchaSolve is set, NO solver is constructed and the
+  // pipeline falls back to Phase 1.8's pause-and-alert behavior exactly. When
+  // a real/mock provider is set, we build the solver + a budget guard + a
+  // cost logger; the deep-scrape CAPTCHA hook then calls handleCaptcha()
+  // instead of the simple pause.
+  //
+  // The budget guard caps cumulative solver spend at cfg.captcha.budget (USD).
+  // Once exceeded, handleCaptcha() falls back to pause-and-alert — it does NOT
+  // spend more money.
+  // The cost logger appends one JSONL record per solve attempt to
+  // data/captcha_cost_log.jsonl and feeds the end-of-run summary.
+  let captchaSolver = null;
+  let captchaBudgetGuard = null;
+  let captchaCostLogger = null;
+  if (cfg.captcha.provider !== 'none') {
+    const primary = createSolver({
+      provider: cfg.captcha.provider,
+      apiKey: cfg.captcha.apiKey,
+      logger: logger.phase('captcha'),
+      // For the mock provider, default to 0ms delay so tests/dry runs are instant.
+      mockDelayMs: cfg.captcha.provider === 'mock' ? 0 : undefined,
+    });
+    let solver = primary;
+    if (cfg.captcha.fallbackProvider) {
+      const fallback = createSolver({
+        provider: cfg.captcha.fallbackProvider,
+        apiKey: cfg.captcha.apiKey,
+        logger: logger.phase('captcha'),
+        mockDelayMs: cfg.captcha.fallbackProvider === 'mock' ? 0 : undefined,
+      });
+      solver = createSolverChain({ primary, fallback, logger: logger.phase('captcha') });
+    }
+    captchaSolver = solver;
+    captchaBudgetGuard = new BudgetGuard({
+      budget: cfg.captcha.budget,
+      logger: logger.phase('captcha'),
+    });
+    captchaCostLogger = createCostLogger({
+      logger: logger.phase('captcha'),
+    });
+    // Log the balance ONCE at startup (per the execution plan). Best-effort —
+    // a balance fetch failure is non-fatal (the solver still works).
+    try {
+      const bal = await solver.balance();
+      if (bal !== null && bal !== undefined) {
+        logger.phase('captcha').info('CAPTCHA solver balance', {
+          provider: cfg.captcha.provider,
+          balance: `$${Number(bal).toFixed(4)}`,
+          budget: `$${cfg.captcha.budget.toFixed(2)}`,
+          hint: bal < cfg.captcha.budget ? 'Balance below budget — top up if you expect many CAPTCHAs' : 'OK',
+        });
+      }
+    } catch (err) {
+      logger.phase('captcha').warn('CAPTCHA balance check failed (non-fatal)', {
+        provider: cfg.captcha.provider,
+        error: err.message,
+      });
+    }
+    logger.phase('captcha').info('Phase 2.6 — CAPTCHA auto-solving enabled', {
+      provider: cfg.captcha.provider,
+      fallback: cfg.captcha.fallbackProvider || null,
+      budget: `$${cfg.captcha.budget.toFixed(2)}`,
+      costLog: captchaCostLogger.filePath,
+    });
+  } else {
+    logger.phase('captcha').info('Phase 2.6 — CAPTCHA auto-solving disabled (Phase 1.8 pause-and-alert)', {
+      reason: 'provider=none (default) or --noCaptchaSolve',
+      hint: 'Set --captchaProvider mock for a dry-run solver, or 2captcha/anticaptcha/capsolver for real solves',
+    });
+  }
+  // Store the resolved solver/guard/logger on cfg so the banner + deep-scrape
+  // hook + end-of-run summary can read them.
+  cfg.captcha.resolved = {
+    solver: captchaSolver,
+    budgetGuard: captchaBudgetGuard,
+    costLogger: captchaCostLogger,
+  };
+
   // Phase 1.10 — startup banner. Prints the resolved config and waits 1s so
   // the operator can eyeball it and Ctrl-C if it looks wrong. Skipped (no
   // delay) when --yes is set, for scripted / CI runs.
@@ -430,9 +548,50 @@ async function main() {
 
         detailStats = await deepScrapeAll(page, allBusinesses, cfg, logger, {
           onProgress,
-          // Phase 1.8 — CAPTCHA hook: check after each business. If detected,
-          // deepScrapeAll pauses + aborts with err.code === 'CAPTCHA_DETECTED'.
-          captchaCheck: cfg.antiblock.captchaPause ? () => detectCaptcha(page) : null,
+          // Phase 1.8 + 2.6 — CAPTCHA hook: check after each business. If
+          // detected AND no solver is configured → deepScrapeAll pauses +
+          // aborts with err.code === 'CAPTCHA_DETECTED' (Phase 1.8 behavior).
+          // If a solver IS configured (Phase 2.6) → handleCaptcha() tries to
+          // auto-solve; on success it returns {detected:false} (scrape
+          // continues unattended); on failure it returns {detected:true} so
+          // deepScrapeAll falls back to the Phase 1.8 pause-and-alert.
+          captchaCheck: cfg.antiblock.captchaPause
+            ? async () => {
+                // Phase 2.6 — auto-solve path. Only when a solver is resolved.
+                if (cfg.captcha.resolved && cfg.captcha.resolved.solver) {
+                  const result = await handleCaptcha(page, {
+                    solver: cfg.captcha.resolved.solver,
+                    budgetGuard: cfg.captcha.resolved.budgetGuard,
+                    costLogger: cfg.captcha.resolved.costLogger,
+                    logger: logger.phase('captcha'),
+                    // The orchestrator does NOT pause here (captchaWaitMs: 0).
+                    // detail.js does the real pause when we return {detected:true}.
+                    // We only want the operator alert from the orchestrator.
+                    captchaWaitMs: 0,
+                    onFallback: ({ detection }) => {
+                      // eslint-disable-next-line no-console
+                      console.error(
+                        '\n========================================\n' +
+                          'CAPTCHA DETECTED — auto-solve unavailable or failed.\n' +
+                          `Type: ${detection.type}  Indicator: ${detection.indicator}\n` +
+                          `Falling back to operator pause (${Math.round(cfg.antiblock.captchaWaitMs / 1000)}s).\n` +
+                          'In --headed mode: solve the CAPTCHA in the browser window.\n' +
+                          'The checkpoint is preserved — rerun with --resume after the block clears.\n' +
+                          '========================================\n',
+                      );
+                    },
+                  });
+                  if (result.resolved) {
+                    // Solved — scrape continues unattended.
+                    return { detected: false, indicator: null };
+                  }
+                  // Not solved — let detail.js pause + abort (Phase 1.8 behavior).
+                  return { detected: true, indicator: result.indicator };
+                }
+                // Phase 1.8 path — no solver configured, plain text detection.
+                return detectCaptcha(page);
+              }
+            : null,
           captchaWaitMs: cfg.antiblock.captchaWaitMs,
         });
         const detailDuration = Date.now() - detailStart;
@@ -475,6 +634,23 @@ async function main() {
           rateLimitWaits: cfg.rateLimiter ? cfg.rateLimiter.totalWaits : 0,
           humanTyping: cfg.antiblock.humanTyping,
         },
+        // Phase 2.6 — CAPTCHA solver stats for this run. Null when provider is
+        // 'none' (Phase 1.8 pause-and-alert, no solver constructed).
+        captcha: cfg.captcha.resolved && cfg.captcha.resolved.costLogger
+          ? {
+              provider: cfg.captcha.provider,
+              fallback: cfg.captcha.fallbackProvider || null,
+              budget: cfg.captcha.budget,
+              spent: cfg.captcha.resolved.budgetGuard
+                ? cfg.captcha.resolved.budgetGuard.spent
+                : 0,
+              budgetExceeded: cfg.captcha.resolved.budgetGuard
+                ? cfg.captcha.resolved.budgetGuard.exceeded
+                : false,
+              costLog: cfg.captcha.resolved.costLogger.summary(),
+              costLogPath: cfg.captcha.resolved.costLogger.filePath,
+            }
+          : { provider: 'none', costLog: { count: 0, totalCost: 0, avgMs: 0 } },
       };
     },
     {
@@ -486,6 +662,9 @@ async function main() {
       // Phase 2.4 — pass the per-run fingerprint through to launchBrowser.
       // null when --noFingerprint / profile 'off' → Phase 1 context defaults.
       fingerprint: cfg.fingerprint.resolved,
+      // Phase 2.5 — pass the stealth config through to launchBrowser.
+      // { enabled: false } when --noStealth → vanilla playwright, no patches.
+      stealth: cfg.stealth.resolved,
       onBlocked: ({ status, url, count }) => {
         logger.warn('Google returned a block-status response', { status, url, count });
         // Phase 2.3 — a 429/503 from Google while using a proxy is a strong
@@ -585,6 +764,8 @@ async function main() {
     fields: [...CANONICAL_FIELDS, ...DETAIL_FIELDS],
     // Phase 2.3 — proxy pool stats for this run (null when proxy disabled).
     proxy: proxyPool ? proxyPool.stats() : { enabled: false },
+    // Phase 2.6 — CAPTCHA solver stats for this run (provider/spend/cost log).
+    captcha: result.captcha,
   };
 
   // Phase 2.1 — output dispatch. cfg.output is a normalized array of targets
@@ -715,6 +896,25 @@ async function main() {
       `Proxy:    ${ps.healthy}/${ps.total} healthy, ${ps.cooldown} cooling, ${ps.burned} burned (${ps.strategy}, ${rate})`,
     );
   }
+  // Phase 2.6 — CAPTCHA solver stats line. Per the execution plan's end-of-run
+  // summary format: "CAPTCHA: 3 solved ($0.009 total, avg 4.1s)". When the
+  // provider is 'none' (Phase 1.8 behavior), the line is omitted. When solves
+  // happened, show count + total cost + avg time + budget-exceeded flag.
+  const captchaLines = [];
+  if (result.captcha && result.captcha.provider && result.captcha.provider !== 'none') {
+    const cl = result.captcha.costLog || {};
+    if (cl.count > 0) {
+      const avgS = cl.avgMs > 0 ? (cl.avgMs / 1000).toFixed(1) : '0.0';
+      const budgetFlag = result.captcha.budgetExceeded ? ' [BUDGET EXCEEDED]' : '';
+      captchaLines.push(
+        `CAPTCHA:  ${cl.successCount}/${cl.count} solved ($${cl.totalCost.toFixed(4)} total, avg ${avgS}s, provider ${result.captcha.provider})${budgetFlag}`,
+      );
+    } else {
+      captchaLines.push(
+        `CAPTCHA:  none encountered (provider ${result.captcha.provider}, budget $${result.captcha.budget.toFixed(2)})`,
+      );
+    }
+  }
   // Phase 1.9 — include the log file path in the banner so the operator knows
   // where the full JSON-lines record of this run lives.
   const logFile = logger.getLogFile ? logger.getLogFile() : null;
@@ -730,6 +930,7 @@ async function main() {
     ...(extractFailLine ? [extractFailLine] : []),
     ...outputLines,
     ...proxyLines,
+    ...captchaLines,
     ...(logLine ? [logLine] : []),
     '========================================',
   ].join('\n');

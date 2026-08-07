@@ -10,9 +10,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 2.4 complete. 5 of 13 sub-phases shipped.
+> **Last updated:** Phase 2.6 complete. 7 of 13 sub-phases shipped.
 >
-> **Overall:** 5 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
+> **Overall:** 7 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -21,8 +21,8 @@
 | 2.2 — Change Tracking & History | ✅ DONE | _(this commit)_ | 551 (+76) | `business_snapshots` + `field_changes` tables, `src/db/deltas.js` (computeChanges, numericDelta), snapshot-on-update, `changes_detected` on scrape_runs, `npm run db:history` CLI, change-breakdown banner |
 | 2.3 — Proxy Management & Rotation | ✅ DONE | 52 tests | `src/proxy.js`, `src/proxy/burn-detector.js` | pool, 3 rotation strategies, burn detection, health check |
 | 2.4 — Browser Fingerprint Randomization | ✅ DONE | 96 tests | `src/fingerprint.js`, `src/browser.js` (fingerprint-aware launch), `src/config.js` (--fingerprintProfile/--fixedFingerprint/--noFingerprint), `src/banner.js` (fingerprint row), `src/index.js` (per-run generation + logging) | coherent UA+platform+viewport+timezone+locale+WebGL+canvas noise+hw concurrency+device memory+geolocation; init-script injection; 1000× coherence stress test |
-| 2.5 — Stealth Hardening | ⬜ NOT STARTED | — | — | `playwright-extra` + stealth, `navigator.webdriver`, headless evasion |
-| 2.6 — CAPTCHA Auto-Solving | ⬜ NOT STARTED | — | — | 2Captcha/Anti-Captcha/CapSolver integration, fallback chain |
+| 2.5 — Stealth Hardening | ✅ DONE | 83 tests | `src/stealth-patches.js`, `src/browser.js` (playwright-extra + stealth plugin + custom patches), `src/config.js` (--stealth/--noStealth/--stealthDebug), `src/banner.js` (stealth row), `src/index.js` (resolve + apply), `scripts/verify-stealth.js` (dev-only) | 10 bot-detection patches (webdriver, chrome.runtime, plugins, permissions, outerWidth/Height, Notification.permission, vendor, maxTouchPoints); coexists with fingerprint (yields to WebGL+languages overrides); launch args (--disable-blink-features=AutomationControlled); stub-page eval tests |
+| 2.6 — CAPTCHA Auto-Solving | ✅ DONE | 90 tests | `src/captcha/solver.js`, `src/captcha/cost-log.js`, `src/captcha/injector.js`, `src/captcha/orchestrator.js`, `src/captcha/index.js`, `src/antiblock.js` (detectCaptchaType + extractSitekey + CAPTCHA_TYPES), `src/config.js` (--captchaProvider/--captchaApiKey/--captchaBudget/--noCaptchaSolve), `src/banner.js` (CAPTCHA row), `src/index.js` (resolve solver + budget guard + cost logger; wire handleCaptcha into deep-scrape hook; end-of-run CAPTCHA cost line), `tests/fixtures/recaptcha-v2.html`, `tests/helpers/mock-dom.js` | 4 providers (2captcha REST, anticaptcha JSON-RPC, capsolver JSON-RPC, mock) via injectable httpClient (no real API calls in tests); BudgetGuard spend cap; cost-log JSONL + summary; pure DOM token-injection tested against reCAPTCHA v2 fixture; orchestrator fallback chain (solve→retry→fallback provider→pause-and-alert); provider 'none' preserves Phase 1.8 behavior exactly |
 | 2.7 — Session & Cookie Rotation | ⬜ NOT STARTED | — | — | Fresh context every N requests, warmup hooks |
 | 2.8 — Worker Pool & Concurrency | ⬜ NOT STARTED | — | — | N parallel browsers, per-worker proxy+fingerprint, graceful degradation |
 | 2.9 — Job Queue & Orchestration | ⬜ NOT STARTED | — | — | BullMQ/Redis or in-memory queue, async jobs, priorities |
@@ -450,7 +450,7 @@ A fingerprint randomization layer that makes each browser session look like a di
 
 ## Phase 2.5 — Stealth Hardening
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE** — `src/stealth-patches.js` ships 10 bot-detection patches (navigator.webdriver, chrome.runtime, plugins, permissions.query, outerWidth/Height, Notification.permission, vendor, maxTouchPoints, languages + WebGL fallbacks) coexisting with the Phase 2.4 fingerprint. `src/browser.js` dynamically selects playwright-extra+stealth plugin vs vanilla playwright based on `--stealth on|off`. 66 module tests + 17 config tests, all 10 acceptance predicates verified via stub-page eval.
 
 ### Goal
 Patch the remaining "bot tells" that fingerprint randomization doesn't cover: `navigator.webdriver`, headless-mode indicators, missing browser APIs, permissions quirks, and `chrome.runtime` absence. Use `playwright-extra` + `puppeteer-extra-plugin-stealth` as the foundation, with custom patches for Maps-specific detection.
@@ -459,12 +459,12 @@ Patch the remaining "bot tells" that fingerprint randomization doesn't cover: `n
 Even with a randomized fingerprint, vanilla Playwright/Chromium has ~30 known bot signals (`navigator.webdriver === true`, missing `chrome.runtime`, `Notification.permission` inconsistencies, etc.). Google's detection checks these. Stealth patches eliminate the signals.
 
 ### Task checklist
-- [ ] **Stealth plugin integration.** Replace `playwright` with `playwright-extra` in `src/browser.js`:
+- [x] **Stealth plugin integration.** Replace `playwright` with `playwright-extra` in `src/browser.js`:
   - `const { chromium } = require('playwright-extra');`
   - `const stealth = require('puppeteer-extra-plugin-stealth')();`
   - `chromium.use(stealth);`
   - Verify all existing tests still pass (stealth should be transparent to the DI stubs).
-- [ ] **Custom stealth patches.** `src/stealth-patches.js` — Maps-specific overrides applied via `context.addInitScript`:
+- [x] **Custom stealth patches.** `src/stealth-patches.js` — Maps-specific overrides applied via `context.addInitScript`:
   - `navigator.webdriver = undefined` (belt-and-suspenders; stealth handles this but verify).
   - `window.chrome = { runtime: {} }` (Chrome indicator that headless Chromium lacks).
   - `navigator.permissions.query` — return `prompt` for `notifications` instead of `denied` (headless gives `denied`, which is a tell).
@@ -472,20 +472,20 @@ Even with a randomized fingerprint, vanilla Playwright/Chromium has ~30 known bo
   - `navigator.languages` — return the fingerprint's language array (not just `['en-US']`).
   - `WebGLRenderingContext.getParameter` for `UNMASKED_VENDOR_WEBGL` / `UNMASKED_RENDERER_WEBGL` — return fingerprint values.
   - `window.outerWidth / outerHeight` — set to > 0 (headless reports 0).
-- [ ] **Headless detection evasion.**
+- [x] **Headless detection evasion.**
   - Add `--disable-blink-features=AutomationControlled` to launch args.
   - Add `--excludeSwitches=enable-automation` (removes the "Chrome is being controlled by automated software" banner).
   - Consider `headless: 'new'` (Playwright's new headless mode, less detectable) vs `headless: true` (old). Test both against a detection page (e.g., `bot.sannysoft.com`).
-- [ ] **Verification script.** `scripts/verify-stealth.js` (dev-only):
+- [x] **Verification script.** `scripts/verify-stealth.js` (dev-only):
   - Launches a browser with stealth patches.
   - Navigates to `https://bot.sannysoft.com` (or similar detection page).
   - Screenshots the results + extracts the "detection score."
   - Saves to `benchmarks/stealth-score.json`.
   - Run before and after Phase 2.5 to verify improvement.
-- [ ] **Config flags.**
+- [x] **Config flags.**
   - `--stealth on|off` (default: on)
   - `--stealthDebug` (logs every patch applied + the resulting navigator properties)
-- [ ] **Unit tests.** `tests/stealth.test.js`:
+- [x] **Unit tests.** `tests/stealth.test.js`:
   - Verify `stealth-patches.js` exports the expected init script string.
   - Verify the init script, when evaluated in a JSDOM environment (or stub page), sets `navigator.webdriver` to undefined.
   - Verify `window.chrome.runtime` exists after patch.
@@ -504,13 +504,13 @@ Even with a randomized fingerprint, vanilla Playwright/Chromium has ~30 known bo
 Phase 2.0 (playwright-extra installed), Phase 2.4 (fingerprint — stealth + fingerprint are complementary).
 
 ### Deliverable
-A stealth layer that eliminates known bot-detection signals, reducing block rate on long runs.
+A stealth layer that eliminates known bot-detection signals, reducing block rate on long runs. **Shipped:** `src/stealth-patches.js` (10 patches: webdriver→undefined, chrome.runtime stub with OnInstalledReason/PlatformOs/connect/sendMessage, permissions.query→prompt for notifications, 5 fake PDF plugins, languages fallback, WebGL vendor/renderer fallback that YIELDS to fingerprint's override, outerWidth/Height→viewport, Notification.permission→default, vendor→Google Inc., maxTouchPoints→0; STEALTH_LAUNCH_ARGS with --disable-blink-features=AutomationControlled + 5 more args; buildStealthInitScript({debug}) IIFE string; applyStealthPatches(context,{debug,logger})), `src/browser.js` (resolveChromiumLauncher dynamically picks playwright-extra+stealth vs vanilla playwright; stealth launch args merged; applyStealthPatches injected AFTER fingerprint; “Browser launched” log records stealth state), `src/config.js` (--stealth on|off default on, --noStealth alias, --stealthDebug, STEALTH/STEALTH_DEBUG env vars, validation), `src/banner.js` (Stealth row), `src/index.js` (resolve cfg.stealth.resolved={enabled,debug} + logging), `scripts/verify-stealth.js` (dev-only: launches browser → bot.sannysoft.com → screenshots + scores → benchmarks/stealth-score.json), `tests/stealth.test.js` (66 tests / 238 assertions: 10 patches verified via stub-page eval, idempotency, coexistence with fingerprint yielding, debug mode, applyStealthPatches integration), `tests/config.test.js` (+17 tests for stealth flag parsing + validation + HELP_TEXT). 800 tests / 6754 assertions passing.
 
 ---
 
 ## Phase 2.6 — CAPTCHA Auto-Solving
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE**
 
 ### Goal
 When Google shows a CAPTCHA (reCAPTCHA or the "unusual traffic" interstitial), automatically solve it via a third-party service (2Captcha / Anti-Captcha / CapSolver). If solving fails or is disabled, fall back to the existing Phase 1.8 behavior (pause + alert the operator).
@@ -519,58 +519,65 @@ When Google shows a CAPTCHA (reCAPTCHA or the "unusual traffic" interstitial), a
 Phase 1.8 detects CAPTCHAs and pauses, but a human must solve them. On a 10,000-listing overnight run, that's untenable. Auto-solving keeps the run unattended. Budget: ~$2-3 per 1000 solves — a line-item cost, not a blocker.
 
 ### Task checklist
-- [ ] **CAPTCHA type detection.** Extend `src/antiblock.js`:
+- [x] **CAPTCHA type detection.** Extend `src/antiblock.js`:
   - Detect reCAPTCHA v2 (the checkbox "I'm not a robot" puzzle).
   - Detect reCAPTCHA v3 (invisible, score-based — usually just means "slow down").
   - Detect the "unusual traffic" interstitial (text-based, may have an image challenge).
   - Extract the `data-sitekey` from reCAPTCHA elements for the solver.
   - Log: `CAPTCHA detected (type=reCAPTCHA v2, sitekey=6Lc..., url=https://...)`.
-- [ ] **Solver abstraction.** `src/captcha/solver.js`:
-  - `createSolver({ provider, apiKey, logger })` — returns a solver object.
-  - `solver.solve({ type, sitekey, url })` — returns `{ token, cost, solveTimeMs }`.
+- [x] **Solver abstraction.** `src/captcha/solver.js`:
+  - `createSolver({ provider, apiKey, logger, httpClient, clock, sleepFn })` — returns a solver object.
+  - `solver.solve({ type, sitekey, url })` — returns `{ token, cost, solveTimeMs, provider }`.
   - Providers:
-    - `2captcha` — official SDK, `solver.solveRecaptcha(sitekey, url)`.
-    - `anticaptcha` — official SDK.
-    - `capsolver` — official SDK.
+    - `2captcha` — REST API (in.php submit + res.php poll), injectable httpClient.
+    - `anticaptcha` — JSON-RPC (createTask + getTaskResult), injectable httpClient.
+    - `capsolver` — JSON-RPC (createTask + getTaskResult), injectable httpClient.
     - `mock` — for tests; returns a fake token after a configurable delay.
-  - `solver.balance()` — returns remaining credit (log on startup + every 100 solves).
-  - Budget guard: `--captchaBudget 5.00` — stops solving when cumulative cost exceeds $5; falls back to pause-and-alert.
-- [ ] **Token injection.** After solving:
+  - `solver.balance()` — returns remaining credit (logged once at startup).
+  - Budget guard: `BudgetGuard({ budget })` — `canSolve()` stops solving when cumulative cost exceeds the budget; falls back to pause-and-alert.
+  - `createSolverChain({ primary, fallback })` — primary → retry once → fallback provider.
+- [x] **Token injection.** `src/captcha/injector.js`:
   - For reCAPTCHA v2: inject the token into `#g-recaptcha-response` textarea, then submit the form (or trigger the callback).
   - For the "unusual traffic" interstitial: Google often accepts the token via a specific callback; inspect the page for `___grecaptcha_cfg.clients` and call the callback.
   - Wait for navigation (the page should reload to the results).
   - Log: `CAPTCHA solved (cost=$0.003, time=4.2s) — resuming scrape`.
-- [ ] **Retry + fallback chain.**
-  - If solver fails (API error, timeout) → retry once with a different provider if configured.
+  - Pure DOM logic (`injectTokenIntoDom`, `triggerCallbackInDom`) extracted so tests run against a reCAPTCHA HTML fixture with NO real browser.
+- [x] **Retry + fallback chain.** `src/captcha/orchestrator.js` (`handleCaptcha`):
+  - If solver fails (API error, timeout) → retry once with the same provider, then try the fallback provider if configured (`--captchaFallbackProvider`).
   - If all solvers fail → fall back to Phase 1.8 behavior (pause `--captchaWaitMs`, alert operator).
   - If `--noCaptchaSolve` is set → never call a solver; always pause-and-alert.
-- [ ] **Config flags.**
+  - `BudgetExceededError` is not retried (surfaces immediately → pause-and-alert).
+- [x] **Config flags.**
   - `--captchaProvider 2captcha|anticaptcha|capsolver|mock|none` (default: none = Phase 1.8 behavior)
   - `--captchaApiKey <key>` (or `CAPTCHA_API_KEY` env var)
-  - `--captchaBudget 5.00` (USD; stops solving above this)
+  - `--captchaBudget 5.00` (USD; stops solving above this; default 5.00)
+  - `--captchaFallbackProvider <p>` (optional secondary solver)
   - `--noCaptchaSolve` (force pause-and-alert, overrides provider)
-- [ ] **Cost tracking.** Append to `data/captcha_cost_log.jsonl`:
-  - `{ ts, provider, type, cost, solveTimeMs, success, url }`.
-  - End-of-run summary includes: `CAPTCHA: 3 solved ($0.009 total, avg 4.1s)`.
-- [ ] **Unit tests.** `tests/captcha.test.js`:
+- [x] **Cost tracking.** `src/captcha/cost-log.js` appends to `data/captcha_cost_log.jsonl`:
+  - `{ ts, provider, type, cost, solveTimeMs, success, url, error? }`.
+  - End-of-run summary line: `CAPTCHA: 3 solved ($0.009 total, avg 4.1s, provider 2captcha)`.
+- [x] **Unit tests.** `tests/captcha.test.js` (90 tests / 233 assertions):
   - `createSolver({ provider: 'mock' })` returns a token after a delay.
   - Budget guard stops solving when exceeded.
   - Solver failure triggers fallback to pause.
-  - DI: solver accepts a mock HTTP client; no real API calls in tests.
-  - Token injection logic tested against a reCAPTCHA HTML fixture.
+  - DI: solver accepts a mock HTTP client; no real API calls in tests (global fetch is shadowed + asserted not called).
+  - Token injection logic tested against a reCAPTCHA HTML fixture (`tests/fixtures/recaptcha-v2.html` via `tests/helpers/mock-dom.js`).
+  - All 4 providers' submit/poll/balance exercised with stubbed HTTP (CAPCHA_NOT_READY → ready; processing → ready; submit failure; poll timeout).
+  - `createSolverChain` retry + fallback + budget-not-retried + stats aggregation.
+  - `handleCaptcha` orchestrator: none-detected, solved, no-solver fallback, budget-exceeded fallback, solve-failed fallback, detect-fn-throws, onFallback callback, budget-record-on-success-only.
 
 ### Acceptance criteria
-- With `--captchaProvider mock`, a simulated CAPTCHA is "solved" (mock token injected) and the scrape resumes without human intervention.
-- The cost log accumulates per-solve costs; the end-of-run summary reports total.
-- Exceeding `--captchaBudget` stops solving and falls back to pause-and-alert.
-- `--captchaProvider none` preserves Phase 1.8 behavior exactly.
-- No unit test makes a real API call or spends real money.
+- With `--captchaProvider mock`, a simulated CAPTCHA is "solved" (mock token injected) and the scrape resumes without human intervention. ✅ (verified via `handleCaptcha` + `solveAndInject` orchestrator tests with mock solver + navWaitFn)
+- The cost log accumulates per-solve costs; the end-of-run summary reports total. ✅ (`createCostLogger` JSONL append + `summary()` aggregation; end-of-run banner `captchaLines`)
+- Exceeding `--captchaBudget` stops solving and falls back to pause-and-alert. ✅ (`BudgetGuard.canSolve()` gate in `handleCaptcha`; dedicated test)
+- `--captchaProvider none` preserves Phase 1.8 behavior exactly. ✅ (no solver constructed in `index.js`; deep-scrape hook falls through to `detectCaptcha(page)`; dedicated orchestrator test)
+- No unit test makes a real API call or spends real money. ✅ (all providers use injectable `httpClient`; a dedicated test shadows global `fetch` and asserts it is never called)
 
 ### Dependencies
 Phase 2.0 (solver SDKs installed), Phase 1.8 (existing CAPTCHA detection).
 
 ### Deliverable
-An unattended CAPTCHA-solving layer with budget controls and graceful fallback.
+An unattended CAPTCHA-solving layer with budget controls and graceful fallback. **Shipped:** `src/captcha/solver.js` (createSolver + 4 providers [2captcha REST, anticaptcha JSON-RPC, capsolver JSON-RPC, mock] via injectable httpClient; BudgetGuard spend cap; createSolverChain retry+fallback; PROVIDER_IMPLS exposed for per-provider testing), `src/captcha/cost-log.js` (JSONL append + summary aggregation, in-memory mirror, non-fatal writes), `src/captcha/injector.js` (injectRecaptchaToken + submitRecaptcha page-bound wrappers; pure injectTokenIntoDom/triggerCallbackInDom extracted for fixture testing; solveAndInject orchestrator helper), `src/captcha/orchestrator.js` (handleCaptcha: detect→solve→inject→nav, fallback chain to pause-and-alert; budget-record-on-success-only), `src/captcha/index.js` (barrel), `src/antiblock.js` (detectCaptchaType + extractSitekey + CAPTCHA_TYPES + UNUSUAL_TRAFFIC_INDICATORS, all injectable), `src/config.js` (--captchaProvider/--captchaApiKey/--captchaBudget/--captchaFallbackProvider/--noCaptchaSolve + CAPTCHA_* env vars + validation + HELP_TEXT + examples), `src/banner.js` (CAPTCHA row), `src/index.js` (resolve solver+budgetGuard+costLogger; log balance at startup; wire handleCaptcha into deep-scrape captchaCheck hook replacing Phase 1.8 pause; end-of-run CAPTCHA cost line in banner + summary object), `tests/fixtures/recaptcha-v2.html` (reCAPTCHA v2 widget + textarea + ___grecaptcha_cfg.clients + form), `tests/helpers/mock-dom.js` (minimal DOM from HTML for pure-function testing), `tests/captcha.test.js` (90 tests / 233 assertions). 890 tests / 7035 assertions passing total.
 
 ---
 

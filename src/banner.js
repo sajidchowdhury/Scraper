@@ -30,6 +30,9 @@ const DEFAULT_DELAY_MS = 1000;
 // row. Required lazily (not at module top) to keep banner.js free of any
 // fingerprint module side effects during unit tests of the pure builder.
 const { summarizeFingerprint } = require('./fingerprint');
+// Phase 2.5 — list of stealth patch ids (for the banner row count). Required
+// lazily so the pure builder is testable in isolation.
+const { STEALTH_PATCHES } = require('./stealth-patches');
 
 /**
  * Default sleep — a plain Promise-based delay. Exported so tests can stub it
@@ -105,6 +108,23 @@ function buildStartupBanner(cfg, opts = {}) {
         : cfg.fingerprint && cfg.fingerprint.profile && cfg.fingerprint.profile !== 'off'
           ? `${cfg.fingerprint.profile} (not yet generated)`
           : 'disabled (Phase 1 behavior)',
+    ],
+    // Phase 2.5 — stealth summary. Shows patch count + debug state when enabled,
+    // or "disabled" when --noStealth / profile 'off'.
+    [
+      'Stealth',
+      cfg.stealth && cfg.stealth.profile === 'on'
+        ? `on (${STEALTH_PATCHES.length} patches${cfg.stealth.debug ? ' +debug' : ''})`
+        : 'disabled (Phase 1/2.4 behavior)',
+    ],
+    // Phase 2.6 — CAPTCHA solver summary. Shows provider + budget when a solver
+    // is configured, or "none (pause+alert)" when provider is 'none' / unset
+    // (Phase 1.8 behavior preserved). --noCaptchaSolve forces 'none'.
+    [
+      'CAPTCHA',
+      cfg.captcha && cfg.captcha.provider && cfg.captcha.provider !== 'none'
+        ? `${cfg.captcha.provider} (budget $${cfg.captcha.budget.toFixed(2)}${cfg.captcha.fallbackProvider ? ` +fallback ${cfg.captcha.fallbackProvider}` : ''})`
+        : 'none (pause+alert)',
     ],
   ];
 

@@ -266,6 +266,152 @@ async function detectCaptcha(page, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2.6 — CAPTCHA type detection
+// ---------------------------------------------------------------------------
+// Phase 1.8's detectCaptcha() answers a yes/no question. Phase 2.6 needs more:
+//   - WHICH type of challenge (reCAPTCHA v2 checkbox, reCAPTCHA v3 invisible,
+//     or the text-based "unusual traffic" interstitial)?
+//   - WHAT is the data-sitekey (so a solver service can solve it)?
+//   - WHERE is it (url, for the solver's pageurl parameter)?
+//
+// detectCaptchaType() returns a richer object the CAPTCHA orchestrator
+// (src/captcha/orchestrator.js) consumes to drive a third-party solver.
+// All functions are pure / injectable so tests never touch a real browser.
+
+const CAPTCHA_TYPES = {
+  NONE: 'none',
+  RECAPTCHA_V2: 'recaptcha-v2',
+  RECAPTCHA_V3: 'recaptcha-v3',
+  UNUSUAL_TRAFFIC: 'unusual-traffic',
+};
+
+// Phrases Google shows specifically on the "unusual traffic" interstitial (a
+// full-page block, not a widget). Lowercased for substring matching.
+const UNUSUAL_TRAFFIC_INDICATORS = [
+  'our systems have detected unusual traffic',
+  'unusual traffic from your computer network',
+  'unusual traffic from your network',
+];
+
+/**
+ * Extract the reCAPTCHA data-sitekey from a page.
+ *
+ * Looks for:
+ *   1. `.g-recaptcha[data-sitekey]` (the standard v2 widget div)
+ *   2. `iframe[src*="recaptcha/api2"]` → parse the `render=` query param
+ *      (the sitekey is passed as render= in the iframe URL)
+ *   3. `[data-sitekey]` (generic fallback — some sites use a custom class)
+ *
+ * Returns the sitekey string, or null when none is found.
+ *
+ * Accepts an injectable `evalFn` (returns the raw extraction result) for unit
+ * tests so no real browser is needed.
+ *
+ * @param {object} page
+ * @param {object} [opts]
+ * @param {()=>Promise<string|null>} [opts.evalFn]
+ * @returns {Promise<string|null>}
+ */
+async function extractSitekey(page, opts = {}) {
+  try {
+    if (opts.evalFn) return await opts.evalFn();
+    return await page.evaluate(() => {
+      // 1. Standard v2 widget div.
+      const widget = document.querySelector('.g-recaptcha[data-sitekey]');
+      if (widget) return widget.getAttribute('data-sitekey');
+      // 2. Generic [data-sitekey] (covers enterprise + custom integrations).
+      const generic = document.querySelector('[data-sitekey]');
+      if (generic) return generic.getAttribute('data-sitekey');
+      // 3. reCAPTCHA iframe — parse the render= query param.
+      const iframe = document.querySelector('iframe[src*="recaptcha/api2"]');
+      if (iframe) {
+        try {
+          const u = new URL(iframe.getAttribute('src'));
+          const render = u.searchParams.get('render');
+          if (render && render !== 'explicit') return render;
+        } catch { /* not a valid URL — ignore */ }
+      }
+      return null;
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Detect the type of CAPTCHA / block currently on the page.
+ *
+ * Decision tree:
+ *   1. If body text matches an UNUSUAL_TRAFFIC_INDICATOR → type 'unusual-traffic'
+ *      (Google's full-page interstitial; may or may not have a sitekey).
+ *   2. Else if a reCAPTCHA sitekey is present AND a visible checkbox exists
+ *      (`.recaptcha-checkbox`) → type 'recaptcha-v2'.
+ *   3. Else if a reCAPTCHA sitekey is present but NO visible checkbox → type
+ *      'recaptcha-v3' (invisible, score-based — usually means "slow down").
+ *   4. Else if the body text matches any generic CAPTCHA_INDICATOR → type
+ *      'unusual-traffic' (conservative default for text-only blocks).
+ *   5. Else → type 'none'.
+ *
+ * Returns { detected, type, sitekey, url, indicator }.
+ *
+ * Accepts injectable `textFn`, `sitekeyFn`, `urlFn`, `checkboxFn` for tests.
+ *
+ * @param {object} page
+ * @param {object} [opts]
+ * @param {()=>Promise<string>} [opts.textFn]
+ * @param {()=>Promise<string|null>} [opts.sitekeyFn]
+ * @param {()=>Promise<string>} [opts.urlFn]
+ * @param {()=>Promise<boolean>} [opts.checkboxFn]
+ * @returns {Promise<{ detected: boolean, type: string, sitekey: string|null, url: string, indicator: string|null }>}
+ */
+async function detectCaptchaType(page, opts = {}) {
+  let text = '';
+  try {
+    text = opts.textFn ? await opts.textFn() : await page.evaluate(() =>
+      document.body ? (document.body.innerText || '') : ''
+    );
+  } catch { /* navigation mid-evaluate — treat as empty */ }
+  const haystack = String(text || '').toLowerCase();
+
+  let sitekey = null;
+  try {
+    sitekey = opts.sitekeyFn ? await opts.sitekeyFn() : await extractSitekey(page);
+  } catch { /* best-effort */ }
+  let url = '';
+  try {
+    url = opts.urlFn ? await opts.urlFn() : (page.url ? page.url() : '');
+  } catch { /* best-effort */ }
+  let hasCheckbox = false;
+  try {
+    hasCheckbox = opts.checkboxFn
+      ? await opts.checkboxFn()
+      : await page.evaluate(() => !!document.querySelector('.recaptcha-checkbox, [role="checkbox"]'));
+  } catch { /* best-effort */ }
+
+  // 1. "Unusual traffic" interstitial (text-based, full-page block).
+  for (const ind of UNUSUAL_TRAFFIC_INDICATORS) {
+    if (haystack.includes(ind.toLowerCase())) {
+      return { detected: true, type: CAPTCHA_TYPES.UNUSUAL_TRAFFIC, sitekey, url, indicator: ind };
+    }
+  }
+  // 2 + 3. reCAPTCHA widget present — distinguish v2 (checkbox) from v3 (invisible).
+  if (sitekey) {
+    if (hasCheckbox) {
+      return { detected: true, type: CAPTCHA_TYPES.RECAPTCHA_V2, sitekey, url, indicator: 'g-recaptcha' };
+    }
+    return { detected: true, type: CAPTCHA_TYPES.RECAPTCHA_V3, sitekey, url, indicator: '/recaptcha/api2/' };
+  }
+  // 4. Generic CAPTCHA indicator in the text (e.g. "not a robot") with no widget.
+  for (const ind of CAPTCHA_INDICATORS) {
+    if (haystack.includes(ind.toLowerCase())) {
+      return { detected: true, type: CAPTCHA_TYPES.UNUSUAL_TRAFFIC, sitekey: null, url, indicator: ind };
+    }
+  }
+  // 5. Nothing detected.
+  return { detected: false, type: CAPTCHA_TYPES.NONE, sitekey: null, url, indicator: null };
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 429 / 503 detection
 // ---------------------------------------------------------------------------
 
@@ -344,6 +490,11 @@ module.exports = {
   CAPTCHA_INDICATORS,
   detectCaptchaInText,
   detectCaptcha,
+  // Phase 2.6 — typed CAPTCHA detection
+  CAPTCHA_TYPES,
+  UNUSUAL_TRAFFIC_INDICATORS,
+  extractSitekey,
+  detectCaptchaType,
   BLOCK_STATUSES,
   isBlockStatus,
   attachBlockWatcher,

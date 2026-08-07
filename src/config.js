@@ -96,6 +96,19 @@ function parseArgs(argv) {
     else if (a === '--fingerprintProfile') out.fingerprintProfile = argv[++i];
     else if (a === '--fixedFingerprint') out.fixedFingerprint = argv[++i];
     else if (a === '--noFingerprint') out.noFingerprint = true;
+    // Phase 2.5 — stealth hardening (playwright-extra + stealth plugin +
+    // custom init-script patches for navigator.webdriver, chrome.runtime,
+    // plugins.length, permissions.query, outerWidth/Height, etc.)
+    else if (a === '--stealth') out.stealth = argv[++i];
+    else if (a === '--noStealth') out.noStealth = true;
+    else if (a === '--stealthDebug') out.stealthDebug = true;
+    // Phase 2.6 — CAPTCHA auto-solving (2captcha / anticaptcha / capsolver / mock / none).
+    // --noCaptchaSolve forces pause-and-alert (overrides --captchaProvider).
+    else if (a === '--captchaProvider') out.captchaProvider = argv[++i];
+    else if (a === '--captchaApiKey') out.captchaApiKey = argv[++i];
+    else if (a === '--captchaBudget') out.captchaBudget = argv[++i];
+    else if (a === '--captchaFallbackProvider') out.captchaFallbackProvider = argv[++i];
+    else if (a === '--noCaptchaSolve') out.noCaptchaSolve = true;
   }
   return out;
 }
@@ -254,6 +267,80 @@ function validate(cfg) {
       }
     }
   }
+  // Phase 2.5 — stealth validation. --stealth must be 'on' or 'off' (case-insensitive).
+  // --noStealth is an alias for --stealth off. --stealthDebug implies --stealth on.
+  if (cfg.stealth.profile !== 'on' && cfg.stealth.profile !== 'off') {
+    errors.push(
+      `stealth must be one of on, off (got "${cfg.stealth.profile}"). Use --stealth on|off or --noStealth.`,
+    );
+  }
+  // Phase 2.6 — CAPTCHA provider validation. Must be one of the registered
+  // providers (case-insensitive; normalized to lowercase). --noCaptchaSolve
+  // overrides to 'none' (Phase 1.8 pause-and-alert behavior).
+  const validCaptchaProviders = ['2captcha', 'anticaptcha', 'capsolver', 'mock', 'none'];
+  if (!validCaptchaProviders.includes(cfg.captcha.provider)) {
+    errors.push(
+      `captchaProvider must be one of ${validCaptchaProviders.join(', ')} (got "${cfg.captcha.provider}"). ` +
+        'Use --captchaProvider <p> or CAPTCHA_PROVIDER in .env.',
+    );
+  }
+  // Real providers (2captcha / anticaptcha / capsolver) require an API key.
+  // mock + none do not. We fail fast here so the operator doesn't discover a
+  // missing key at the first CAPTCHA mid-run.
+  if (
+    ['2captcha', 'anticaptcha', 'capsolver'].includes(cfg.captcha.provider) &&
+    !cfg.captcha.apiKey
+  ) {
+    errors.push(
+      `captchaProvider=${cfg.captcha.provider} requires --captchaApiKey <key> (or CAPTCHA_API_KEY in .env).`,
+    );
+  }
+  // Budget must be a non-negative finite number (0 = allow no solves; Infinity
+  // is rejected — use a large number instead). Default 5.00.
+  if (
+    !Number.isFinite(cfg.captcha.budget) ||
+    cfg.captcha.budget < 0 ||
+    cfg.captcha.budget > 1_000_000
+  ) {
+    errors.push(
+      `captchaBudget must be a finite number between 0 and 1000000 (got ${cfg.captcha.budget}).`,
+    );
+  }
+  // Fallback provider (optional) must be valid if set.
+  if (
+    cfg.captcha.fallbackProvider &&
+    !validCaptchaProviders.includes(cfg.captcha.fallbackProvider)
+  ) {
+    errors.push(
+      `captchaFallbackProvider must be one of ${validCaptchaProviders.join(', ')} (got "${cfg.captcha.fallbackProvider}").`,
+    );
+  }
+  // Fallback cannot be the same as the primary (pointless) and cannot be 'none'
+  // (use --noCaptchaSolve instead for the global disable).
+  if (
+    cfg.captcha.fallbackProvider &&
+    cfg.captcha.fallbackProvider === cfg.captcha.provider
+  ) {
+    errors.push(
+      'captchaFallbackProvider must differ from captchaProvider (it is the secondary solver tried when the primary fails).',
+    );
+  }
+  if (cfg.captcha.fallbackProvider === 'none') {
+    errors.push(
+      'captchaFallbackProvider cannot be "none" (use --noCaptchaSolve to disable all auto-solving).',
+    );
+  }
+  // Fallback real provider also requires the API key (a single key per service
+  // is the common case; mixed-provider fallback is a future enhancement).
+  if (
+    cfg.captcha.fallbackProvider &&
+    ['2captcha', 'anticaptcha', 'capsolver'].includes(cfg.captcha.fallbackProvider) &&
+    !cfg.captcha.apiKey
+  ) {
+    errors.push(
+      `captchaFallbackProvider=${cfg.captcha.fallbackProvider} also requires --captchaApiKey <key>.`,
+    );
+  }
   return errors;
 }
 
@@ -404,6 +491,46 @@ function loadConfig(argv = process.argv.slice(2)) {
       resolved: null,
     },
 
+    // Phase 2.5 — Stealth hardening (playwright-extra + stealth plugin + custom
+    // init-script patches for navigator.webdriver, chrome.runtime, plugins.length,
+    // permissions.query, outerWidth/Height, Notification.permission, etc.).
+    //   --noStealth / STEALTH=off       → profile 'off' (Phase 1/2.4 behavior preserved)
+    //   --stealth on / STEALTH=on       → playwright-extra + stealth plugin + custom patches (DEFAULT)
+    //   --stealthDebug                  → init script emits console.warn per patch applied
+    // Stealth is ON by default in Phase 2.5 — it complements (not replaces) the fingerprint.
+    stealth: {
+      profile: cli.noStealth || process.env.STEALTH === 'off'
+        ? 'off'
+        : (cli.stealth || process.env.STEALTH || 'on'),
+      debug: !!cli.stealthDebug || process.env.STEALTH_DEBUG === 'true',
+      // Resolved at runtime in index.js into { enabled, debug } for launchBrowser().
+      resolved: null,
+    },
+
+    // Phase 2.6 — CAPTCHA auto-solving.
+    //   --captchaProvider 2captcha|anticaptcha|capsolver|mock|none (default: none)
+    //   --noCaptchaSolve   → force provider 'none' (Phase 1.8 pause-and-alert),
+    //                        overrides --captchaProvider / CAPTCHA_PROVIDER
+    //   --captchaApiKey    → solver API key (or CAPTCHA_API_KEY env)
+    //   --captchaBudget    → USD spend cap; stops solving above this (default 5.00)
+    //   --captchaFallbackProvider → optional secondary solver tried when the
+    //                                primary fails its retry
+    // provider 'none' preserves Phase 1.8 behavior EXACTLY: detectCaptcha() +
+    // pause(captchaWaitMs) + alert. The orchestrator is only constructed when a
+    // real/mock provider is set.
+    captcha: {
+      provider: cli.noCaptchaSolve
+        ? 'none'
+        : (cli.captchaProvider || process.env.CAPTCHA_PROVIDER || 'none').toLowerCase(),
+      apiKey: cli.captchaApiKey || process.env.CAPTCHA_API_KEY || null,
+      // Default budget: $5.00 (a line-item cost, per the execution plan). 0 is
+      // valid (allow no solves) but must be set explicitly.
+      budget: Number.parseFloat(cli.captchaBudget ?? process.env.CAPTCHA_BUDGET ?? '5.00'),
+      fallbackProvider: (cli.captchaFallbackProvider || process.env.CAPTCHA_FALLBACK_PROVIDER || '').toLowerCase() || null,
+      // Resolved at runtime in index.js into { solver, budgetGuard, costLogger }.
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -477,6 +604,30 @@ Optional:
                              userAgent, platform, locale, timezone, viewport, etc.
   --noFingerprint            Phase 2.4 — disable randomization (Phase 1 behavior)
 
+  --stealth on|off           Phase 2.5 — stealth hardening (default: on)
+                             Patches navigator.webdriver, chrome.runtime,
+                             plugins.length, permissions.query, outerWidth/Height
+                             via playwright-extra + stealth plugin + custom
+                             init script. Complements (not replaces) fingerprint.
+  --noStealth                Phase 2.5 — alias for --stealth off
+  --stealthDebug             Phase 2.5 — log every patch applied + resulting
+                             navigator properties (for debugging detection)
+
+  --captchaProvider <p>      Phase 2.6 — CAPTCHA solver: 2captcha | anticaptcha |
+                             capsolver | mock | none (default: none = Phase 1.8
+                             pause-and-alert). When a CAPTCHA is detected, the
+                             orchestrator solves it via the service, injects the
+                             token, and resumes — unattended. ~$0.003/solve.
+  --captchaApiKey <key>      Phase 2.6 — solver API key (or CAPTCHA_API_KEY env).
+                             Required for 2captcha/anticaptcha/capsolver.
+  --captchaBudget <usd>      Phase 2.6 — USD spend cap (default: 5.00). Stops
+                             solving once cumulative cost exceeds this; falls
+                             back to pause-and-alert.
+  --captchaFallbackProvider <p>  Phase 2.6 — secondary solver tried when the
+                             primary fails its retry (optional).
+  --noCaptchaSolve           Phase 2.6 — force pause-and-alert (overrides
+                             --captchaProvider). Preserves Phase 1.8 behavior.
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
@@ -504,6 +655,18 @@ Examples:
   npm start -- --query "Cafe" --location "Berlin" --noFingerprint   # Phase 1 behavior
   npm start -- --query "Cafe" --location "Berlin" --fingerprintProfile fixed \
     --fixedFingerprint '{"userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131","platform":"Win32","locale":"en-US","timezone":"America/New_York","languages":["en-US","en"],"viewport":{"width":1920,"height":1080},"screen":{"width":1920,"height":1080},"webglVendor":"Intel Inc.","webglRenderer":"Intel(R) UHD Graphics 630","canvasNoiseSeed":42,"hardwareConcurrency":8,"deviceMemory":8,"geolocation":{"latitude":40.7128,"longitude":-74.006}}'
+
+  # Phase 2.5 — stealth hardening (on by default)
+  npm start -- --query "Cafe" --location "Berlin"               # stealth on (default)
+  npm start -- --query "Cafe" --location "Berlin" --noStealth   # disable stealth (Phase 1/2.4 behavior)
+  npm start -- --query "Cafe" --location "Berlin" --stealthDebug   # log every patch applied
+
+  # Phase 2.6 — CAPTCHA auto-solving (provider 'none' = Phase 1.8 pause-and-alert)
+  npm start -- --query "Cafe" --location "Berlin"               # no solver (default — pause + alert)
+  npm start -- --query "Cafe" --location "Berlin" --captchaProvider mock   # dry-run solver (no API cost)
+  npm start -- --query "Cafe" --location "Berlin" \
+    --captchaProvider 2captcha --captchaApiKey $KEY --captchaBudget 5.00
+  npm start -- --query "Cafe" --location "Berlin" --noCaptchaSolve   # force pause-and-alert
 
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun
