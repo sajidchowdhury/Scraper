@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * src/extract.js — Phase 1.4 — Core Field Extraction (List View)
+ * src/extract.js — Phase 1.4 (Phase 1.7: per-business isolation + retry)
  *
  * Extracts the canonical "money fields" from each business card in the
  * Google Maps results feed.
@@ -19,7 +19,15 @@
  *   - "permanently closed" / "temporarily closed" → business_status flag, not skipped
  *   - Sponsored/ad results → is_sponsored: true
  *   - Legitimately absent fields → null, never "N/A" or wrong field's value
+ *
+ * Phase 1.7 additions:
+ *   - extractRawFromPage wrapped in withRetry (transient page.evaluate failure)
+ *   - Per-record normalizeRecord wrapped in try/catch — a bad card never
+ *     crashes the whole extraction; it's logged + counted as failed
+ *   - Returns stats: { total, succeeded, failed, failures: [{index, error}] }
  */
+
+const { withRetry } = require('./retry');
 
 // ---------------------------------------------------------------------------
 // Canonical schema (exported for CSV column order in Phase 1.6)
@@ -553,28 +561,71 @@ function cleanPhone(raw) {
 /**
  * Extract all business records from the current page state.
  *
+ * Phase 1.7:
+ *   - extractRawFromPage is wrapped in withRetry (transient page.evaluate
+ *     failures like a detached frame don't crash the whole run).
+ *   - Each normalizeRecord is wrapped in try/catch — a single malformed card
+ *     is logged + counted as failed, the rest still get extracted. This is
+ *     the "per-business error isolation" from the Phase 1.7 spec.
+ *
  * @param {import('playwright').Page} page
- * @param {object} ctx — { query, location, logger }
- * @returns {Promise<{ businesses: Array, extractionRates: object }>}
+ * @param {object} ctx — { query, location, logger, retry }
+ * @param {object} [ctx.retry] — { attempts, baseMs } for withRetry
+ * @returns {Promise<{ businesses: Array, extractionRates: object, stats: object }>}
+ *          stats: { total, succeeded, failed, failures: [{index, error}] }
  */
 async function extractBusinesses(page, ctx) {
-  const logger = ctx.logger || { info() {}, warn() {}, debug() {} };
+  const logger = ctx.logger || { info() {}, warn() {}, debug() {}, error() {} };
   const scrapedAt = new Date().toISOString();
+  // Retry only when ctx.retry is explicitly provided (production path).
+  // Unit tests pass a stub page without retry — no retry, preserves fast-fail.
+  const hasRetry = !!ctx.retry;
+  const retryOpts = hasRetry
+    ? { attempts: ctx.retry.attempts || 3, baseMs: ctx.retry.baseMs || 1000, logger }
+    : { attempts: 1, baseMs: 0, logger };
 
   logger.info('Extracting business records from feed');
-  const rawRecords = await extractRawFromPage(page);
+  const rawExtract = () => extractRawFromPage(page);
+  const rawRecords = hasRetry
+    ? await withRetry(rawExtract, { ...retryOpts, label: 'extractRawFromPage' })
+    : await rawExtract();
   logger.info('Raw records pulled from DOM', { count: rawRecords.length });
 
-  const businesses = rawRecords.map((r) =>
-    normalizeRecord(r, {
-      scrapedAt,
-      query: ctx.query,
-      location: ctx.location,
-    }),
-  );
+  const businesses = [];
+  const failures = [];
+  for (let i = 0; i < rawRecords.length; i++) {
+    try {
+      const normalized = normalizeRecord(rawRecords[i], {
+        scrapedAt,
+        query: ctx.query,
+        location: ctx.location,
+      });
+      businesses.push(normalized);
+    } catch (err) {
+      // Per-business error isolation: log + count, don't crash the run.
+      failures.push({ index: rawRecords[i].index ?? i, error: err.message });
+      logger.warn('Failed to normalize business record — skipping', {
+        index: rawRecords[i].index ?? i,
+        error: err.message,
+      });
+    }
+  }
 
   const extractionRates = computeExtractionRates(businesses);
-  return { businesses, extractionRates };
+  const stats = {
+    total: rawRecords.length,
+    succeeded: businesses.length,
+    failed: failures.length,
+    failures,
+  };
+  if (failures.length > 0) {
+    logger.warn('Extraction completed with failures', {
+      total: stats.total,
+      succeeded: stats.succeeded,
+      failed: stats.failed,
+    });
+  }
+  return { businesses, extractionRates, stats };
 }
 
 // ---------------------------------------------------------------------------

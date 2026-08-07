@@ -28,6 +28,8 @@
  * without a real browser (DI pattern, matching src/scroll.js).
  */
 
+const { withRetry } = require('./retry');
+
 // ---------------------------------------------------------------------------
 // Detail field schema (exported for CSV column order in Phase 1.6)
 // ---------------------------------------------------------------------------
@@ -723,18 +725,54 @@ async function backToListOnPage(page, { logger }) {
 
 /**
  * Production wrapper for deepScrapeDetails using a real Playwright page.
+ *
+ * Phase 1.7: the openFn (click + waitForSelector for the detail panel) and
+ * backFn (click back / page.goBack) are wrapped in withRetry so a transient
+ * click miss or navigation interrupt doesn't immediately fail the business.
+ * The DI core (deepScrapeDetails) stays retry-free so its unit tests remain
+ * deterministic with synthetic openFn/extractFn/backFn.
+ *
+ * Retry is only applied when cfg.retry is explicitly provided (production
+ * path via index.js). When absent (unit tests with stub pages), no retry
+ * happens — preserving backward compat with the existing fast-failing tests.
  */
 async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
   const detailCfg = (cfg && cfg.detail) || {};
+  const hasRetry = !!(cfg && cfg.retry);
+  const retryOpts = hasRetry
+    ? { attempts: cfg.retry.attempts || 3, baseMs: cfg.retry.baseMs || 1000, logger }
+    : { attempts: 1, baseMs: 0, logger };
+
+  const openFn = hasRetry
+    ? () =>
+        withRetry(
+          async () => {
+            const opened = await openDetailPanelOnPage(page, business, { logger });
+            if (!opened) throw new Error('detail panel did not open');
+            return opened;
+          },
+          { ...retryOpts, label: 'openDetailPanel' },
+        )
+    : () => openDetailPanelOnPage(page, business, { logger });
+
+  const backFn = hasRetry
+    ? () =>
+        withRetry(() => backToListOnPage(page, { logger }), {
+          ...retryOpts,
+          label: 'backToList',
+          attempts: Math.min(retryOpts.attempts, 2),
+        })
+    : () => backToListOnPage(page, { logger });
+
   return deepScrapeDetails({
     business,
-    openFn: () => openDetailPanelOnPage(page, business, { logger }),
+    openFn,
     extractFn: () =>
       extractDetailFromPage(page, {
         maxReviews: detailCfg.maxReviews ?? 5,
         maxPhotos: detailCfg.maxPhotos ?? 5,
       }),
-    backFn: () => backToListOnPage(page, { logger }),
+    backFn,
     delayMinMs: detailCfg.delayMinMs ?? 1000,
     delayMaxMs: detailCfg.delayMaxMs ?? 3000,
     timeoutMs: detailCfg.timeoutMs ?? 15000,
@@ -753,11 +791,16 @@ async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
  * @param {Array} businesses    - list-view records (mutated: detail fields merged in)
  * @param {object} cfg          - runtime config (uses cfg.detail + cfg.deepScrapeSampleStep)
  * @param {object} logger
+ * @param {object} [hooks]      - Phase 1.7 hooks for crash recovery
+ * @param {(progress: {index, attempted, succeeded, failed}) => void} [hooks.onProgress]
+ *        Called after each business is deep-scraped; index.js uses this to
+ *        write a checkpoint file every N records.
  * @returns {Promise<{ successRate, attempted, succeeded, failed, durations }>}
  */
-async function deepScrapeAll(page, businesses, cfg, logger) {
+async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
   const detailCfg = (cfg && cfg.detail) || {};
   const sampleStep = detailCfg.sampleStep ?? 1; // 1 = every business; 5 = every 5th (QA mode)
+  const onProgress = hooks.onProgress || (() => {});
 
   let attempted = 0;
   let succeeded = 0;
@@ -772,6 +815,12 @@ async function deepScrapeAll(page, businesses, cfg, logger) {
   });
 
   for (let i = 0; i < businesses.length; i++) {
+    // Phase 1.7 — skip businesses already deep-scraped in a prior run
+    // (loaded from checkpoint on --resume). Their detail fields are already
+    // merged in; re-scraping would waste time + requests.
+    if (businesses[i] && businesses[i].detail_scraped === true) {
+      continue;
+    }
     if (sampleStep > 1 && i % sampleStep !== 0) {
       // Not in sample — leave EMPTY_DETAIL on this record
       businesses[i] = mergeDetailFields(businesses[i], EMPTY_DETAIL);
@@ -799,6 +848,9 @@ async function deepScrapeAll(page, businesses, cfg, logger) {
         remaining: businesses.length - i - 1,
       });
     }
+
+    // Phase 1.7 — notify caller after each scrape so it can checkpoint.
+    onProgress({ index: i, attempted, succeeded, failed });
   }
 
   const successRate = attempted === 0 ? 0 : Math.round((succeeded / attempted) * 1000) / 10;

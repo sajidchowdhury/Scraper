@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * src/scroll.js — Phase 1.3
+ * src/scroll.js — Phase 1.3 (Phase 1.7: retry on transient page.evaluate)
  *
  * Scrolls the Google Maps results feed to the bottom, loading all lazy-
  * loaded results. Stops on:
@@ -11,8 +11,11 @@
  *   - total timeout
  *
  * Functions accept an injectable `countFn` / `scrollFn` / `endFn` for unit
- * testing without a real browser (DI pattern).
+ * testing without a real browser (DI pattern). The production wrapper
+ * (`scrollFeedToBottomOnPage`) wraps each in withRetry (Phase 1.7).
  */
+
+const { withRetry } = require('./retry');
 
 /**
  * Count current result cards on the page.
@@ -175,12 +178,29 @@ async function scrollFeedToBottom({
 
 /**
  * Production wrapper: wires real page-based count/scroll/end functions.
+ *
+ * Phase 1.7: each page-bound function is wrapped in withRetry so a transient
+ * page.evaluate failure (detached frame, navigation interrupt) doesn't crash
+ * the scroll loop. The DI core (scrollFeedToBottom) stays retry-free so its
+ * unit tests remain deterministic with synthetic functions.
  */
 async function scrollFeedToBottomOnPage(page, cfg, logger) {
+  // Retry only when cfg.retry is explicitly provided (production path via
+  // index.js). Unit tests call scrollFeedToBottom directly with synthetic
+  // functions, so this wrapper's retry doesn't affect them. But to be safe,
+  // we also guard here in case a test calls this wrapper without cfg.retry.
+  const hasRetry = !!(cfg && cfg.retry);
+  const retryOpts = hasRetry
+    ? { attempts: cfg.retry.attempts || 3, baseMs: cfg.retry.baseMs || 1000, logger }
+    : { attempts: 1, baseMs: 0, logger };
+
+  const wrap = (fn, label) =>
+    hasRetry ? () => withRetry(fn, { ...retryOpts, label }) : fn;
+
   return scrollFeedToBottom({
-    countFn: () => countResults(page),
-    scrollFn: () => scrollToLastCard(page),
-    endFn: () => isEndOfList(page),
+    countFn: wrap(() => countResults(page), 'countResults'),
+    scrollFn: wrap(() => scrollToLastCard(page), 'scrollToLastCard'),
+    endFn: wrap(() => isEndOfList(page), 'isEndOfList'),
     maxResults: cfg.maxResults,
     totalTimeoutMs: cfg.scroll.totalTimeoutMs,
     stallThreshold: cfg.scroll.stallThreshold,

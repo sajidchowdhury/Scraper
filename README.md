@@ -1,9 +1,10 @@
 # gmaps-scraper
 
-Google Maps business scraper — **Phase 1**: search → paginate → extract → (deep scrape) → CSV export.
+Google Maps business scraper — **Phase 1**: search → paginate → extract → (deep scrape) → CSV export, with crash recovery.
 
-> Implements sub-phases 1.0 through 1.6 of `PHASE1_EXECUTION_PLAN.md`. The Phase 1
-> deliverable — "a script that exports CSVs of business data" — is complete.
+> Implements sub-phases 1.0 through 1.7 of `PHASE1_EXECUTION_PLAN.md`. The script survives
+> transient failures (retry with backoff), resumes from checkpoints after a crash, and
+> isolates per-business errors so one bad record never crashes the run.
 
 ## Quick start
 
@@ -55,20 +56,25 @@ Optional:
 ```
 scraper/
 ├── src/
-│   ├── index.js     (CLI entry; pipeline orchestration)
+│   ├── index.js     (CLI entry; pipeline orchestration + checkpoint)
 │   ├── browser.js   (Playwright launch/teardown, withBrowser helper)
-│   ├── search.js    (Maps navigation + search submit)
+│   ├── search.js    (Maps navigation + search submit, retry-wrapped)
 │   ├── scroll.js    (Phase 1.3 — infinite-scroll pagination w/ stall detection)
-│   ├── extract.js   (Phase 1.4 — core field extraction, 17-field schema)
-│   ├── detail.js    (Phase 1.5 — detail-page deep scrape, 8 detail fields)
+│   ├── extract.js   (Phase 1.4 — core field extraction, 17-field schema, per-record isolation)
+│   ├── detail.js    (Phase 1.5 — detail-page deep scrape, 8 detail fields, retry-wrapped)
 │   ├── export.js    (Phase 1.6 — CSV + JSON + summary export, RFC 4180 + BOM)
+│   ├── retry.js     (Phase 1.7 — withRetry: exponential backoff for transient ops)
+│   ├── checkpoint.js (Phase 1.7 — crash-recovery checkpoint: read/write/clear/resume)
 │   ├── config.js    (env + CLI config loader, validation)
 │   └── logger.js    (dual-sink logger: console + JSON-lines file)
 ├── tests/
-│   ├── extract.test.js   (Phase 1.4 unit tests — parsers, normalization, rates)
-│   ├── detail.test.js    (Phase 1.5 unit tests — parsers, DI failure isolation, e2e)
-│   └── export.test.js    (Phase 1.6 unit tests — RFC 4180, BOM, multi-value, e2e)
-├── data/            (output CSV/JSON, gitignored)
+│   ├── extract.test.js    (Phase 1.4 unit tests — parsers, normalization, rates)
+│   ├── detail.test.js     (Phase 1.5 unit tests — parsers, DI failure isolation, e2e)
+│   ├── export.test.js     (Phase 1.6 unit tests — RFC 4180, BOM, multi-value, e2e)
+│   ├── retry.test.js      (Phase 1.7 unit tests — backoff, retryIf, edge cases)
+│   ├── checkpoint.test.js (Phase 1.7 unit tests — dedup, resume, corrupt handling)
+│   └── config.test.js     (Phase 1.7 config tests — new flags + validation)
+├── data/            (output CSV/JSON + .checkpoint.json, gitignored)
 ├── logs/            (run logs, gitignored)
 ├── .env.example
 └── package.json
@@ -207,7 +213,7 @@ the spec's exact acceptance criteria.
 ## Testing
 
 ```bash
-npm test          # bun test tests/
+npm test          # bun test tests/ (276 tests, 675 assertions)
 npm run syntax    # node --check on every src file
 ```
 
@@ -215,6 +221,70 @@ npm run syntax    # node --check on every src file
 
 | Code | Meaning |
 |---|---|
-| 0 | Success |
+| 0 | Success (all businesses extracted/scraped cleanly) |
+| 1 | Partial success (run completed but some businesses failed extraction or detail scrape) |
 | 2 | Config error (missing/invalid args) |
 | 3 | Runtime error (browser crash, selector failure, timeout) |
+| 130 | SIGINT (Ctrl-C) — checkpoint preserved for `--resume` |
+
+## Phase 1.7 — Reliability & Crash Recovery
+
+The scraper survives transient failures and resumes from where it left off after
+a crash. Three mechanisms work together:
+
+### 1. Retry with exponential backoff
+
+All transient operations (`page.goto`, `waitForSelector`, `page.evaluate`,
+detail-panel open/back) are wrapped in `withRetry()`:
+
+- **3 attempts** (configurable via `--maxRetries`)
+- **Exponential backoff**: 1s → 2s → 4s (base via `--retryBaseMs`)
+- On final failure, the error is re-thrown — the caller logs and skips the
+  business (or exits 3 for systemic failures)
+- Optional `retryIf` predicate: callers can exclude non-transient errors from
+  wasting retry budget
+
+```bash
+npm start -- --query "Cafe" --location "Berlin" --maxRetries 5 --retryBaseMs 500
+```
+
+### 2. Checkpoint-based crash recovery
+
+During the slow deep-scrape phase, a `.checkpoint.json` file is written to the
+output directory every N businesses (default 10, via `--checkpointInterval`).
+On the next run, if the checkpoint exists for the same query+location:
+
+- With `--resume`: automatically loads the checkpoint and skips already-
+  extracted businesses (deduped by `place_id` or name+address+phone hash)
+- Without `--resume` (interactive TTY): prompts `Resume from checkpoint? [y/N]`
+- With `--fresh`: ignores and deletes the checkpoint, starts from scratch
+
+On successful completion, the checkpoint is **cleared automatically** — a
+leftover checkpoint would cause a stale prompt on the next run. On crash
+(Ctrl-C or runtime error), the checkpoint stays on disk for `--resume`.
+
+```bash
+# A 500-result run dies at result 200:
+npm start -- --query "Restaurant" --location "Toronto" --deepScrape true
+# Ctrl-C at result 200
+
+# Resume — continues from ~200, doesn't restart:
+npm start -- --query "Restaurant" --location "Toronto" --deepScrape true --resume
+```
+
+Already-deep-scraped businesses (with `detail_scraped: true`) are skipped on
+resume — only the unfinished ones get re-scraped.
+
+### 3. Per-business error isolation
+
+A failed extraction or detail-scrape is **logged and counted**, never crashes
+the run. The run summary tracks:
+
+- **Total found** (from scroll)
+- **Successfully extracted** (list-view fields)
+- **Failed extraction** (with per-record error reasons)
+- **Skipped** (already in checkpoint on resume)
+- **Deep-scrape succeeded/failed** (with error breakdown)
+
+The exit code reflects the outcome: `0` = all clean, `1` = partial success
+(some failures but run completed), `3` = systemic crash.

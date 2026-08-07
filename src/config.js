@@ -69,6 +69,12 @@ function parseArgs(argv) {
     } else if (a === '--deepScrapeSampleStep') {
       out.deepScrapeSampleStep = argv[++i];
     }
+    // Phase 1.7 — crash recovery / resume
+    else if (a === '--resume') out.resume = true;
+    else if (a === '--fresh') out.fresh = true;
+    else if (a === '--checkpointInterval') out.checkpointInterval = argv[++i];
+    else if (a === '--maxRetries') out.maxRetries = argv[++i];
+    else if (a === '--retryBaseMs') out.retryBaseMs = argv[++i];
   }
   return out;
 }
@@ -97,6 +103,18 @@ function validate(cfg) {
   const validLevels = ['debug', 'info', 'warn', 'error'];
   if (!validLevels.includes(cfg.logLevel)) {
     errors.push(`logLevel must be one of ${validLevels.join(', ')} (got ${cfg.logLevel})`);
+  }
+  if (cfg.checkpointInterval !== null && (cfg.checkpointInterval < 1 || cfg.checkpointInterval > 10000)) {
+    errors.push(`checkpointInterval must be between 1 and 10000 (got ${cfg.checkpointInterval})`);
+  }
+  if (cfg.retry.attempts < 1 || cfg.retry.attempts > 10) {
+    errors.push(`maxRetries must be between 1 and 10 (got ${cfg.retry.attempts})`);
+  }
+  if (cfg.retry.baseMs < 0 || cfg.retry.baseMs > 60000) {
+    errors.push(`retryBaseMs must be between 0 and 60000 (got ${cfg.retry.baseMs})`);
+  }
+  if (cfg.resume && cfg.fresh) {
+    errors.push('--resume and --fresh are mutually exclusive');
   }
   return errors;
 }
@@ -168,6 +186,15 @@ function loadConfig(argv = process.argv.slice(2)) {
       sampleStep: toIntOrNull(cli.deepScrapeSampleStep ?? process.env.DEEP_SCRAPE_SAMPLE_STEP) ?? 1,
     },
 
+    // Phase 1.7 — Reliability & crash recovery
+    resume: !!cli.resume,
+    fresh: !!cli.fresh,
+    checkpointInterval: toIntOrNull(cli.checkpointInterval ?? process.env.CHECKPOINT_INTERVAL) ?? 10,
+    retry: {
+      attempts: toIntOrNull(cli.maxRetries ?? process.env.MAX_RETRIES) ?? 3,
+      baseMs: toIntOrNull(cli.retryBaseMs ?? process.env.RETRY_BASE_MS) ?? 1000,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -205,6 +232,12 @@ Optional:
   --deepScrapeSampleStep <n> Scrape every Nth business (1 = all, 5 = QA mode)
   --noDeepScrape             Force --deepScrape false (overrides .env)
 
+  --resume                   Phase 1.7 — resume from .checkpoint.json if it exists
+  --fresh                    Phase 1.7 — ignore/delete checkpoint, start from scratch
+  --checkpointInterval <n>   Write checkpoint every N new records (default: 10)
+  --maxRetries <n>           Retry attempts for transient ops (default: 3)
+  --retryBaseMs <ms>         Base backoff for retries, doubles each time (default: 1000)
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
@@ -212,6 +245,7 @@ Examples:
   npm start -- --query "Cafe" --location "Berlin" --maxResults 50
   npm start -- --query "Plumber" --location "Dhaka, Bangladesh" --headed --verbose
   npm start -- --query "Restaurant" --location "Toronto" --deepScrape true --deepScrapeSampleStep 5
+  npm start -- --query "Restaurant" --location "Toronto" --resume   # continue after a crash
 `;
 
 module.exports = { loadConfig, parseArgs, validate, HELP_TEXT };
