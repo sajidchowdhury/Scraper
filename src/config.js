@@ -6,11 +6,15 @@
  *            `resolveConfig()` so the entry point can catch ConfigError and
  *            exit with a friendly message + code 2.
  *
+ * Phase 1.2: added `run.timeoutMs` (global run timeout, default 5 min) with
+ *            validation, so the entry point can guarantee the process never
+ *            hangs forever.
+ *
  * Precedence (highest → lowest):
  *   1. CLI flags:    --query --location --max-results --output-file
  *   2. Environment:  DEFAULT_QUERY / DEFAULT_LOCATION / DEFAULT_MAX_RESULTS /
  *                    OUTPUT_FILE / HEADLESS / SLOW_MO / VIEWPORT_* / OUTPUT_DIR /
- *                    LOG_LEVEL
+ *                    RUN_TIMEOUT_MS / LOG_LEVEL
  *   3. Built-in defaults (only for non-required fields)
  *
  * Required fields (query, location) have NO built-in default — the operator
@@ -106,6 +110,11 @@ function resolveConfig(argv = process.argv) {
       dir: process.env.OUTPUT_DIR || './data',
       file: outputFile,
     },
+    run: {
+      // Global run timeout in ms. If the run exceeds this, the browser is
+      // force-closed and the process exits with code 3. Default: 5 minutes.
+      timeoutMs: parseInt(process.env.RUN_TIMEOUT_MS || '300000', 10),
+    },
     log: {
       level: process.env.LOG_LEVEL || 'info',
     },
@@ -131,6 +140,12 @@ function resolveConfig(argv = process.argv) {
   }
   if (!Number.isInteger(height) || height <= 0) {
     errors.push(`VIEWPORT_HEIGHT must be a positive integer (got: ${JSON.stringify(process.env.VIEWPORT_HEIGHT)}).`);
+  }
+  // Validate run timeout (must be a positive integer; minimum 5s to avoid
+  // accidental instant-timeout misconfigurations).
+  const { timeoutMs } = config.run;
+  if (!Number.isInteger(timeoutMs) || Number.isNaN(timeoutMs) || timeoutMs < 5000) {
+    errors.push(`RUN_TIMEOUT_MS must be a positive integer >= 5000 ms (got: ${JSON.stringify(process.env.RUN_TIMEOUT_MS)}).`);
   }
 
   if (errors.length > 0) {

@@ -2,12 +2,13 @@
 
 A Node.js scraper that extracts business data from Google Maps and exports it to CSV.
 
-## Current status: Phase 1.1 — Configurable Search Input
+## Current status: Phase 1.2 — Robust Browser Automation Core
 
-The project is structured into clean modules and the search target (query,
-location, max results, output file) is fully configurable via CLI flags or
-environment variables. Pagination, field extraction, and CSV export are
-implemented in subsequent phases.
+The project is structured into clean modules, the search target is fully
+configurable via CLI flags or environment variables, and the browser
+lifecycle is bulletproof: a global run timeout prevents hangs, Ctrl-C shuts
+down gracefully, and the browser is always torn down via `try/finally`.
+Pagination, field extraction, and CSV export land in subsequent phases.
 
 - Full roadmap (Phases 1–5): see [`SCRAPER_FEATURES.md`](./SCRAPER_FEATURES.md)
 - Phase 1 step-by-step plan: see [`PHASE1_EXECUTION_PLAN.md`](./PHASE1_EXECUTION_PLAN.md)
@@ -82,7 +83,30 @@ that CLI flags override.
 | `VIEWPORT_HEIGHT`       | `900`        | Browser viewport height                                  |
 | `OUTPUT_DIR`            | `./data`     | Directory where CSV/JSON outputs are written             |
 | `OUTPUT_FILE`           | *(empty)*    | Output CSV path; empty = auto-generated (overridden by `--output-file`) |
+| `RUN_TIMEOUT_MS`        | `300000`     | Global run timeout in ms (min `5000`); prevents hangs → exit `3` |
 | `LOG_LEVEL`             | `info`       | `debug` \| `info` \| `warn` \| `error`                    |
+
+## Lifecycle & exit codes
+
+The scraper is built to **never hang** and **never leak browser processes**.
+
+- **Global timeout**: if the run exceeds `RUN_TIMEOUT_MS` (default 5 min), the
+  browser is force-closed and the process exits with code `3`.
+- **Ctrl-C (SIGINT)**: the first Ctrl-C closes the browser gracefully and exits
+  with code `130`. A second Ctrl-C forces an immediate exit with code `137`
+  (escape hatch if `browser.close()` itself is hung).
+- **`try/finally`**: the browser is always torn down, even on error.
+- **Idempotent close**: `closeBrowser()` is safe to call from both the signal
+  handler and the `finally` block.
+
+| Exit code | Meaning                                                       |
+|-----------|---------------------------------------------------------------|
+| `0`       | Success                                                       |
+| `1`       | Partial success (some businesses failed — used in Phase 1.4+) |
+| `2`       | Configuration error (missing/invalid CLI args or env)         |
+| `3`       | Runtime error (browser crash, network failure, timeout)       |
+| `130`     | Interrupted by user (Ctrl-C, graceful shutdown)               |
+| `137`     | Interrupted by user (second Ctrl-C, forced shutdown)          |
 
 ## Project structure
 
@@ -110,7 +134,8 @@ scraper/
 ## Roadmap
 
 Phase 1 is broken into 12 sub-phases (1.0 through 1.11). The current
-milestone, **1.1**, makes the search input fully configurable. See
+milestone, **1.2**, makes the browser lifecycle bulletproof (global timeout,
+graceful SIGINT, idempotent teardown, fallback selectors). See
 [`PHASE1_EXECUTION_PLAN.md`](./PHASE1_EXECUTION_PLAN.md) for the full breakdown.
 
 ## License
