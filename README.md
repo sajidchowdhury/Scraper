@@ -9,7 +9,8 @@ Google Maps business scraper — **Phase 1**: search → paginate → extract �
 
 - **[CHANGELOG.md](CHANGELOG.md)** — release history for the Phase 1 milestone (`v1.0.0-phase1`).
 - **[SELECTORS.md](SELECTORS.md)** — where the primary/fallback CSS selectors live, and how to update them when Google changes the DOM.
-- **[PHASE1_EXECUTION_PLAN.md](PHASE1_EXECUTION_PLAN.md)** — granular per-sub-phase spec, acceptance criteria, and status.
+- **[PHASE1_EXECUTION_PLAN.md](PHASE1_EXECUTION_PLAN.md)** — granular per-sub-phase spec, acceptance criteria, and status (Phase 1 complete).
+- **[PHASE2_EXECUTION_PLAN.md](PHASE2_EXECUTION_PLAN.md)** — granular per-sub-phase spec for Phase 2 (robustness & scale: proxies, stealth, concurrency, PostgreSQL, CAPTCHA solving). 13 sub-phases.
 - **[SCRAPER_FEATURES.md](SCRAPER_FEATURES.md)** — master roadmap (Phases 2–5: proxies, auto-CAPTCHA, concurrency, …).
 
 ## Quick start
@@ -689,15 +690,23 @@ single-machine, CSV-exporting** scraper that's robust against transient
 failures and polite to Google. The master roadmap in
 **[`SCRAPER_FEATURES.md`](SCRAPER_FEATURES.md)** covers Phases 2–5:
 
-- **Phase 2 — Anti-Block Hardening:** proxy pool, auto-CAPTCHA solver,
-  residential-IP rotation, fingerprint randomization.
-- **Phase 3 — Scale:** multi-worker concurrency, queue-based scheduling,
-  distributed checkpoints (SQLite/Postgres instead of `.checkpoint.json`).
-- **Phase 4 — Data Quality & Analytics:** delta detection, schema
-  validation, deduplication across runs, a small analytics dashboard.
-- **Phase 5 — Polish:** ESM migration, web UI, plugin system, packaging as
-  a CLI (`npx gmaps-scraper`), Docker image.
+- **Phase 2 — Robustness & Scale:** rotating proxies, browser fingerprint
+  randomization, stealth patches, CAPTCHA auto-solving, multi-worker
+  concurrency, job queue (BullMQ/Redis), PostgreSQL persistence with change
+  tracking, self-healing selectors, and incremental scraping. Target: survive
+  a 10,000+ listing overnight run unattended. See
+  **[`PHASE2_EXECUTION_PLAN.md`](PHASE2_EXECUTION_PLAN.md)** for the granular
+  13-sub-phase spec.
+- **Phase 3 — Data Quality & Enrichment:** phone/email normalization &
+  validation, email discovery, deduplication, lead scoring, grid-based
+  geo-coverage.
+- **Phase 4 — Client Delivery & Monetization:** web dashboard, REST API,
+  Stripe billing, CRM integrations, subscription tiers.
+- **Phase 5 — Enterprise & World-Class:** distributed workers, Grafana
+  monitoring, LLM-powered extraction, multi-source federation (Yelp, OSM,
+  LinkedIn), real-time delta feeds, white-label.
 
 See `PHASE1_EXECUTION_PLAN.md` for the granular Phase 1 sub-phase spec and
-acceptance criteria, and `CHANGELOG.md` for what shipped in this release.
+acceptance criteria, `PHASE2_EXECUTION_PLAN.md` for Phase 2, and
+`CHANGELOG.md` for what shipped in this release.
 
