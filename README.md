@@ -1,8 +1,9 @@
 # gmaps-scraper
 
-Google Maps business scraper — **Phase 1**: search → paginate → extract → (deep scrape) → export.
+Google Maps business scraper — **Phase 1**: search → paginate → extract → (deep scrape) → CSV export.
 
-> Implements sub-phases 1.0 through 1.5 of `PHASE1_EXECUTION_PLAN.md`.
+> Implements sub-phases 1.0 through 1.6 of `PHASE1_EXECUTION_PLAN.md`. The Phase 1
+> deliverable — "a script that exports CSVs of business data" — is complete.
 
 ## Quick start
 
@@ -21,8 +22,10 @@ npm start -- --query "Cafe" --location "Berlin" --deepScrape true --maxResults 2
 npm start -- --query "Cafe" --location "Berlin" --deepScrape true --deepScrapeSampleStep 5
 ```
 
-Output JSON is written to `data/{query}_{location}_{timestamp}.json` and includes
-a run summary plus the full extracted business list.
+Output is written to `data/{query}_{location}_{timestamp}.*`:
+- `.csv` — UTF-8-with-BOM, Excel-safe, 25-column stable schema
+- `.json` — full nested data (arrays/objects preserved)
+- `.summary.json` — run metadata (query, location, totals, extraction rates, timing, output paths)
 
 ## CLI
 
@@ -56,14 +59,16 @@ scraper/
 │   ├── browser.js   (Playwright launch/teardown, withBrowser helper)
 │   ├── search.js    (Maps navigation + search submit)
 │   ├── scroll.js    (Phase 1.3 — infinite-scroll pagination w/ stall detection)
-│   ├── extract.js   (Phase 1.4 — core field extraction, 15-field schema)
+│   ├── extract.js   (Phase 1.4 — core field extraction, 17-field schema)
 │   ├── detail.js    (Phase 1.5 — detail-page deep scrape, 8 detail fields)
+│   ├── export.js    (Phase 1.6 — CSV + JSON + summary export, RFC 4180 + BOM)
 │   ├── config.js    (env + CLI config loader, validation)
 │   └── logger.js    (dual-sink logger: console + JSON-lines file)
 ├── tests/
 │   ├── extract.test.js   (Phase 1.4 unit tests — parsers, normalization, rates)
-│   └── detail.test.js    (Phase 1.5 unit tests — parsers, DI failure isolation, e2e)
-├── data/            (output JSON, gitignored)
+│   ├── detail.test.js    (Phase 1.5 unit tests — parsers, DI failure isolation, e2e)
+│   └── export.test.js    (Phase 1.6 unit tests — RFC 4180, BOM, multi-value, e2e)
+├── data/            (output CSV/JSON, gitignored)
 ├── logs/            (run logs, gitignored)
 ├── .env.example
 └── package.json
@@ -143,6 +148,61 @@ Each detail-scraped business gets these **8 additional fields**:
 - **Stable output schema** — when `--deepScrape false` (default), every record
   is stamped with empty detail fields so the JSON/CSV shape is identical
   whether or not detail scraping ran (Phase 1.6 CSV column order won't shift).
+
+## Phase 1.6 — CSV / JSON Export Engine
+
+Every run writes **three files** sharing a common base name
+(`data/{query}_{location}_{timestamp}.*`):
+
+| File | Purpose |
+|---|---|
+| `.csv` | UTF-8-with-BOM, RFC 4180 escaping, 25-column stable schema. Opens cleanly in Excel/Sheets/Numbers. |
+| `.json` | Full nested data (businesses + summary). Arrays/objects preserved (unlike CSV, which flattens). |
+| `.summary.json` | Run metadata only: query, location, totals, per-field extraction rates, deep-scrape stats, timing, output file paths, column order. |
+
+### CSV column order (25 columns)
+
+The 17 canonical list-view fields (Phase 1.4) followed by the 8 detail fields
+(Phase 1.5), in a fixed order so downstream pipelines don't break when fields
+are added:
+
+```
+Name, Rating, Reviews Count, Price Level, Category, Address, Phone, Website,
+Maps URL, Place ID, Plus Code, Open Now, Business Status, Sponsored,
+Scraped At, Query, Location, Full Hours, Popular Times, Top Reviews, Photos,
+Reservation URL, Menu URL, Social Profiles, Detail Scraped
+```
+
+### RFC 4180 escaping
+
+- Field with **comma** → wrapped in double quotes: `"Smith, Jones & Co."`
+- Field with **double-quote** → doubled and wrapped: `"say ""hi"""`
+- Field with **newline** → wrapped in double quotes
+- **UTF-8 with BOM** (`\uFEFF`) so Excel opens non-Latin text (Bengali, Arabic,
+  emoji) without garbling — e.g. `Café Mününchen ☕`, `ঢাকা Restaurant`
+- **CRLF line endings** (RFC 4180 standard)
+
+### Multi-value field serialization
+
+Nested detail fields are flattened to single CSV cells with documented delimiters:
+
+| Field | Format | Example |
+|---|---|---|
+| `photos` | URLs joined with `\|` | `https://a.jpg\|https://b.jpg\|https://c.jpg` |
+| `social_profiles` | `platform:url` joined with `\|` | `instagram:https://ig.com/x\|facebook:https://fb.com/y` |
+| `full_hours` | `day: hours` joined with `; ` | `Monday: 9-5; Tuesday: 9-5; Wednesday: Closed` |
+| `top_reviews` | JSON string (too structured for delimited) | `[{"author":"Jane","rating":5,...}]` |
+| `popular_times` | JSON string (too structured for delimited) | `[{"day":"Monday","busy":[...]}]` |
+
+The JSON sidecar preserves the full nested structure (arrays of objects) for
+clients that need it; the CSV is for spreadsheet consumers.
+
+### Hand-rolled (no csv-writer dependency)
+
+The CSV writer is hand-rolled (~120 lines) to match the project's no-deps
+philosophy (see `src/config.js`, `src/logger.js`) and to give full control over
+BOM, nested-field serialization, and encoding. It's fully unit-tested against
+the spec's exact acceptance criteria.
 
 ## Testing
 

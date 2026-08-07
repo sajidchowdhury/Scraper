@@ -1,12 +1,13 @@
 'use strict';
 
 /**
- * src/index.js — CLI entry point (Phases 1.0 → 1.5)
+ * src/index.js — CLI entry point (Phases 1.0 → 1.6)
  *
  * Pipeline:
  *   loadConfig → launchBrowser → performSearch → scrollFeedToBottom
  *              → extractBusinesses → [deepScrapeAll if cfg.deepScrape]
- *              → logExtractionRates → write JSON → closeBrowser
+ *              → logExtractionRates → exportResults (CSV + JSON + summary)
+ *              → closeBrowser
  *
  * Exit codes (Phase 1.10 prep):
  *   0 = success
@@ -14,7 +15,6 @@
  *   3 = runtime error
  */
 
-const fs = require('fs');
 const path = require('path');
 
 const { loadConfig, HELP_TEXT } = require('./config');
@@ -24,21 +24,7 @@ const { performSearch } = require('./search');
 const { scrollFeedToBottomOnPage } = require('./scroll');
 const { extractBusinesses, logExtractionRates, CANONICAL_FIELDS } = require('./extract');
 const { deepScrapeAll, DETAIL_FIELDS, EMPTY_DETAIL } = require('./detail');
-
-function sanitizeName(s) {
-  return String(s || 'run').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 40);
-}
-
-function stamp() {
-  const d = new Date();
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
-}
-
-function autoOutputPath(cfg, ext = 'json') {
-  const base = `${sanitizeName(cfg.query)}_${sanitizeName(cfg.location)}_${stamp()}`;
-  return path.join(cfg.outputDir, `${base}.${ext}`);
-}
+const { exportResults } = require('./export');
 
 async function main() {
   const cfg = loadConfig(process.argv.slice(2));
@@ -162,51 +148,57 @@ async function main() {
 
   const durationMs = Date.now() - startedAt;
 
-  // Write JSON output (Phase 1.6 will add CSV; JSON is enough for Phase 1.4 verification)
-  const outFile = cfg.outputFile
-    ? cfg.outputFile.replace(/\.\w+$/, '') + '.json'
-    : autoOutputPath(cfg, 'json');
+  // Phase 1.6 — export CSV + JSON sidecar + run summary.
+  // Build the summary object (shared across all three files).
+  const summary = {
+    query: cfg.query,
+    location: cfg.location,
+    total: result.businesses.length,
+    sponsored: result.businesses.filter((b) => b.is_sponsored).length,
+    permanentlyClosed: result.businesses.filter((b) => b.business_status === 'permanently_closed').length,
+    temporarilyClosed: result.businesses.filter((b) => b.business_status === 'temporarily_closed').length,
+    extractionRates: result.extractionRates,
+    scroll: result.scrollResult,
+    deepScrape: result.detailStats
+      ? {
+          enabled: true,
+          attempted: result.detailStats.attempted,
+          succeeded: result.detailStats.succeeded,
+          failed: result.detailStats.failed,
+          successRate: result.detailStats.successRate,
+          avgMsPerBusiness: result.detailStats.avgMs,
+          minMs: result.detailStats.minMs,
+          maxMs: result.detailStats.maxMs,
+          errors: result.detailStats.errors,
+        }
+      : { enabled: false },
+    startedAt: new Date(startedAt).toISOString(),
+    durationMs,
+    fields: [...CANONICAL_FIELDS, ...DETAIL_FIELDS],
+  };
 
+  let outPaths = null;
   if (!cfg.dryRun) {
-    fs.mkdirSync(path.dirname(path.resolve(outFile)), { recursive: true });
-    const summary = {
-      query: cfg.query,
-      location: cfg.location,
-      total: result.businesses.length,
-      sponsored: result.businesses.filter((b) => b.is_sponsored).length,
-      permanentlyClosed: result.businesses.filter((b) => b.business_status === 'permanently_closed').length,
-      temporarilyClosed: result.businesses.filter((b) => b.business_status === 'temporarily_closed').length,
-      extractionRates: result.extractionRates,
-      scroll: result.scrollResult,
-      deepScrape: result.detailStats
-        ? {
-            enabled: true,
-            attempted: result.detailStats.attempted,
-            succeeded: result.detailStats.succeeded,
-            failed: result.detailStats.failed,
-            successRate: result.detailStats.successRate,
-            avgMsPerBusiness: result.detailStats.avgMs,
-            minMs: result.detailStats.minMs,
-            maxMs: result.detailStats.maxMs,
-            errors: result.detailStats.errors,
-          }
-        : { enabled: false },
-      startedAt: new Date(startedAt).toISOString(),
-      durationMs,
-      outputFile: outFile,
-      fields: [...CANONICAL_FIELDS, ...DETAIL_FIELDS],
-    };
-    const payload = { summary, businesses: result.businesses };
-    fs.writeFileSync(outFile, JSON.stringify(payload, null, 2));
-    logger.info('JSON written', { path: path.resolve(outFile), rows: result.businesses.length });
+    outPaths = await exportResults({
+      businesses: result.businesses,
+      summary,
+      outputFile: cfg.outputFile,
+      outputDir: cfg.outputDir,
+      logger,
+    });
   } else {
-    logger.info('Dry run — skipping file output', { wouldWrite: outFile });
+    logger.info('Dry run — skipping file output', {
+      wouldWrite: cfg.outputFile || path.join(cfg.outputDir, 'dryrun'),
+    });
   }
 
   // Clean summary
   const detailLine = result.detailStats
     ? `Detail:   ${result.detailStats.succeeded}/${result.detailStats.attempted} scraped (${result.detailStats.successRate}% success, avg ${result.detailStats.avgMs}ms/business)`
     : 'Detail:   disabled (--deepScrape false)';
+  const outputLines = outPaths
+    ? [`CSV:      ${outPaths.csvPath}`, `JSON:     ${outPaths.jsonPath}`, `Summary:  ${outPaths.summaryPath}`]
+    : ['Output:   (dry run, no file written)'];
   const banner = [
     '========================================',
     'Run complete',
@@ -214,7 +206,7 @@ async function main() {
     `Results:  ${result.businesses.length} extracted (${result.scrollResult.finalCount} loaded, reason=${result.scrollResult.reason})`,
     `Duration: ${(durationMs / 1000).toFixed(1)}s`,
     detailLine,
-    cfg.dryRun ? 'Output:   (dry run, no file written)' : `JSON:     ${path.resolve(outFile)}`,
+    ...outputLines,
     '========================================',
   ].join('\n');
   // eslint-disable-next-line no-console
