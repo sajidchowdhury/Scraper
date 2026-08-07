@@ -1,0 +1,53 @@
+<!doctype html>
+<!--
+  tests/fixtures/recaptcha-v2.html — Phase 2.6 CAPTCHA token-injection fixture.
+
+  A minimal, representative reCAPTCHA v2 page used by tests/captcha.test.js to
+  verify that injectTokenIntoDom() populates the hidden textarea and that
+  triggerCallbackInDom() fires the registered callback. The structure mirrors
+  what Google's reCAPTCHA API injects on a real challenge page:
+
+    - a `.g-recaptcha` widget div with a data-sitekey + data-callback
+    - the hidden `<textarea name="g-recaptcha-response">` Google reads on submit
+    - the `___grecaptcha_cfg.clients` object Google populates with the callback
+    - a host <form> (the fallback submit target)
+
+  Tests parse this fixture into a mock DOM (tests/helpers/mock-dom.js) and run
+  the pure injector functions against it — no real browser required.
+-->
+<html>
+  <head>
+    <title>reCAPTCHA fixture</title>
+  </head>
+  <body>
+    <div class="g-recaptcha" data-sitekey="6Lc_aAAAAAAAAAAAAAAAAAAAAAAA" data-callback="onCaptchaSuccess"></div>
+    <textarea name="g-recaptcha-response" style="display:none" readonly></textarea>
+    <form action="/submit" method="post">
+      <input type="hidden" name="q" value="Restaurant" />
+      <button type="submit">Submit</button>
+    </form>
+    <script>
+      // Mirrors Google's runtime shape: window.___grecaptcha_cfg.clients[<id>]
+      // holds the widget config incl. the success callback. The injector walks
+      // this tree to find a callable function whose key matches /callback/.
+      window.___grecaptcha_cfg = {
+        clients: {
+          '100000': {
+            widget: {
+              callback: function (token) {
+                // Google calls this with the solver's token on success.
+                window.__captchaCallbackCalled = true;
+                window.__captchaCallbackToken = token;
+              },
+            },
+          },
+        },
+      };
+      // The data-callback global (fallback when ___grecaptcha_cfg is missing).
+      function onCaptchaSuccess(token) {
+        window.__dataCallbackCalled = true;
+        window.__dataCallbackToken = token;
+      }
+    </script>
+  </body>
+</html>

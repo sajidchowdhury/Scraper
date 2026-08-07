@@ -117,6 +117,15 @@ function buildStartupBanner(cfg, opts = {}) {
         ? `on (${STEALTH_PATCHES.length} patches${cfg.stealth.debug ? ' +debug' : ''})`
         : 'disabled (Phase 1/2.4 behavior)',
     ],
+    // Phase 2.6 — CAPTCHA solver summary. Shows provider + budget when a solver
+    // is configured, or "none (pause+alert)" when provider is 'none' / unset
+    // (Phase 1.8 behavior preserved). --noCaptchaSolve forces 'none'.
+    [
+      'CAPTCHA',
+      cfg.captcha && cfg.captcha.provider && cfg.captcha.provider !== 'none'
+        ? `${cfg.captcha.provider} (budget $${cfg.captcha.budget.toFixed(2)}${cfg.captcha.fallbackProvider ? ` +fallback ${cfg.captcha.fallbackProvider}` : ''})`
+        : 'none (pause+alert)',
+    ],
   ];
 
   const width = rows.reduce((m, [k]) => Math.max(m, k.length), 0);
