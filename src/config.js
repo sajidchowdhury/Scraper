@@ -109,6 +109,16 @@ function parseArgs(argv) {
     else if (a === '--captchaBudget') out.captchaBudget = argv[++i];
     else if (a === '--captchaFallbackProvider') out.captchaFallbackProvider = argv[++i];
     else if (a === '--noCaptchaSolve') out.noCaptchaSolve = true;
+    // Phase 2.7 — session & cookie rotation. NOTE: --sessionLength is already
+    // taken by Phase 2.3 (proxy sticky rotation), so we use --sessionMaxRequests
+    // for the browser-context rotation trigger to avoid a flag collision.
+    else if (a === '--sessionMaxRequests') out.sessionMaxRequests = argv[++i];
+    else if (a === '--sessionMaxAgeMs') out.sessionMaxAgeMs = argv[++i];
+    else if (a === '--warmup') out.warmup = argv[++i];
+    else if (a === '--warmupDurationMs') out.warmupDurationMs = argv[++i];
+    else if (a === '--noWarmup') out.noWarmup = true;
+    else if (a === '--accountWarmup') out.accountWarmup = argv[++i];
+    else if (a === '--accountsFile') out.accountsFile = argv[++i];
   }
   return out;
 }
@@ -341,6 +351,37 @@ function validate(cfg) {
       `captchaFallbackProvider=${cfg.captcha.fallbackProvider} also requires --captchaApiKey <key>.`,
     );
   }
+  // Phase 2.7 — session rotation validation.
+  if (cfg.session.maxRequests < 1 || cfg.session.maxRequests > 100000) {
+    errors.push(
+      `sessionMaxRequests must be between 1 and 100000 (got ${cfg.session.maxRequests}). Use --sessionMaxRequests <n>.`,
+    );
+  }
+  if (cfg.session.maxAgeMs < 1000 || cfg.session.maxAgeMs > 24 * 60 * 60 * 1000) {
+    errors.push(
+      `sessionMaxAgeMs must be between 1000 and 86400000 (got ${cfg.session.maxAgeMs}). Use --sessionMaxAgeMs <ms>.`,
+    );
+  }
+  if (cfg.session.warmupDurationMs < 0 || cfg.session.warmupDurationMs > 300000) {
+    errors.push(
+      `warmupDurationMs must be between 0 and 300000 (got ${cfg.session.warmupDurationMs}). Use --warmupDurationMs <ms>.`,
+    );
+  }
+  // accountWarmup requires an accounts file. We check existence here (fail-fast)
+  // so the operator knows before any browser launches. A missing file is a
+  // config error, not a runtime one.
+  if (cfg.session.accountWarmup) {
+    if (!cfg.session.accountsFile) {
+      errors.push(
+        'accountWarmup=on requires --accountsFile <path> (a JSON array of {email, password}). ' +
+          'Set ACCOUNTS_FILE in .env or pass --accountsFile. The file MUST be gitignored + chmod 600.',
+      );
+    } else if (!fs.existsSync(cfg.session.accountsFile)) {
+      errors.push(
+        `--accountsFile not found: ${cfg.session.accountsFile} (set ACCOUNTS_FILE in .env or pass --accountsFile <path>)`,
+      );
+    }
+  }
   return errors;
 }
 
@@ -531,6 +572,40 @@ function loadConfig(argv = process.argv.slice(2)) {
       resolved: null,
     },
 
+    // Phase 2.7 — session & cookie rotation.
+    //   --sessionMaxRequests N   — rotate the browser context every N Maps
+    //                              requests (default 50). NOTE: this is distinct
+    //                              from Phase 2.3's --sessionLength (proxy sticky
+    //                              rotation). The two coexist: proxies rotate per
+    //                              request, contexts rotate per N requests.
+    //   --sessionMaxAgeMs <ms>   — rotate the context after this many ms,
+    //                              regardless of request count (default 600000 = 10min).
+    //                              Whichever trigger fires first wins.
+    //   --warmup on|off          — visit benign pages (google.com, etc.) before
+    //                              the first Maps request in each new context
+    //                              (default: on). Defeats "zero-history session
+    //                              hitting Maps" heuristics.
+    //   --noWarmup               — alias for --warmup off (Phase 1 behavior).
+    //   --warmupDurationMs <ms>  — total warmup time budget (default 10000).
+    //   --accountWarmup on|off   — opt-in Google account login per session
+    //                              (default: off — account-burn risk). Requires
+    //                              --accountsFile.
+    //   --accountsFile <path>    — JSON array of {email, password}. MUST be
+    //                              gitignored + chmod 600. Credentials are never
+    //                              logged (email redacted to prefix***@domain).
+    session: {
+      maxRequests: toIntOrNull(cli.sessionMaxRequests ?? process.env.SESSION_MAX_REQUESTS) ?? 50,
+      maxAgeMs: toIntOrNull(cli.sessionMaxAgeMs ?? process.env.SESSION_MAX_AGE_MS) ?? 600_000,
+      warmup: cli.noWarmup || process.env.WARMUP === 'off'
+        ? false
+        : (cli.warmup || process.env.WARMUP || 'on') === 'on',
+      warmupDurationMs: toIntOrNull(cli.warmupDurationMs ?? process.env.WARMUP_DURATION_MS) ?? 10_000,
+      accountWarmup: (cli.accountWarmup || process.env.ACCOUNT_WARMUP || 'off') === 'on',
+      accountsFile: cli.accountsFile || process.env.ACCOUNTS_FILE || null,
+      // Resolved at runtime in index.js into { manager }.
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -628,6 +703,25 @@ Optional:
   --noCaptchaSolve           Phase 2.6 — force pause-and-alert (overrides
                              --captchaProvider). Preserves Phase 1.8 behavior.
 
+  --sessionMaxRequests <n>   Phase 2.7 — rotate the browser context every N Maps
+                             requests (default: 50). Each new context gets fresh
+                             cookies + (optionally) a warmup visit. NOTE: distinct
+                             from Phase 2.3's --sessionLength (proxy sticky rotation).
+  --sessionMaxAgeMs <ms>     Phase 2.7 — rotate the context after this many ms,
+                             regardless of request count (default: 600000 = 10min).
+                             Whichever trigger (count OR age) fires first wins.
+  --warmup on|off            Phase 2.7 — visit benign pages (google.com, etc.)
+                             before the first Maps request in each new context
+                             (default: on). Defeats zero-history-session detection.
+  --noWarmup                 Phase 2.7 — alias for --warmup off (Phase 1 behavior).
+  --warmupDurationMs <ms>    Phase 2.7 — total warmup time budget (default: 10000).
+  --accountWarmup on|off     Phase 2.7 — opt-in Google account login per session
+                             (default: off — account-burn risk). Requires --accountsFile.
+                             Logged-in sessions get more data + fewer CAPTCHAs.
+  --accountsFile <path>      Phase 2.7 — JSON array of {email, password}. MUST be
+                             gitignored + chmod 600. Credentials are never logged
+                             (email redacted to prefix***@domain).
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
@@ -667,6 +761,12 @@ Examples:
   npm start -- --query "Cafe" --location "Berlin" \
     --captchaProvider 2captcha --captchaApiKey $KEY --captchaBudget 5.00
   npm start -- --query "Cafe" --location "Berlin" --noCaptchaSolve   # force pause-and-alert
+
+  # Phase 2.7 — session & cookie rotation (default: rotate every 50 req / 10 min + warmup)
+  npm start -- --query "Cafe" --location "Berlin"               # default session rotation + warmup
+  npm start -- --query "Cafe" --location "Berlin" --sessionMaxRequests 10   # rotate every 10 requests
+  npm start -- --query "Cafe" --location "Berlin" --noWarmup    # skip warmup (Phase 1 behavior)
+  npm start -- --query "Cafe" --location "Berlin" --accountWarmup on --accountsFile ./accounts.json
 
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun

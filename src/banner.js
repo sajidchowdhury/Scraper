@@ -126,6 +126,14 @@ function buildStartupBanner(cfg, opts = {}) {
         ? `${cfg.captcha.provider} (budget $${cfg.captcha.budget.toFixed(2)}${cfg.captcha.fallbackProvider ? ` +fallback ${cfg.captcha.fallbackProvider}` : ''})`
         : 'none (pause+alert)',
     ],
+    // Phase 2.7 — session rotation summary. Shows the rotation triggers + warmup
+    // state. Each new context gets fresh cookies (Playwright isolation).
+    [
+      'Session',
+      cfg.session
+        ? `${cfg.session.maxRequests} req / ${Math.round(cfg.session.maxAgeMs / 1000)}s${cfg.session.warmup ? ` +warmup (${cfg.session.warmupDurationMs}ms)` : ' (no warmup)'}${cfg.session.accountWarmup ? ' +account' : ''}`
+        : 'disabled',
+    ],
   ];
 
   const width = rows.reduce((m, [k]) => Math.max(m, k.length), 0);

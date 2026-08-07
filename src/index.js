@@ -93,6 +93,19 @@ const {
   createCostLogger,
   handleCaptcha,
 } = require('./captcha');
+// Phase 2.7 — session & cookie rotation. The session manager wraps context
+// creation so contexts are rotated every N requests / M ms (fresh cookies each
+// time). warmupContext visits benign pages before the first Maps request in
+// each new context. accountWarmup is opt-in (off by default — account-burn risk).
+const {
+  createSessionManager,
+  warmupContext,
+  accountWarmup,
+  loadAccounts,
+  pickAccount,
+  redactEmail,
+  createRealContextFactory,
+} = require('./session');
 // Phase 2.1 — PostgreSQL persistence (lazy-loaded; only used when
 // cfg.output includes 'db').
 const { createPool, persistRunResults, closePool } = require('./db');
@@ -390,6 +403,71 @@ async function main() {
     costLogger: captchaCostLogger,
   };
 
+  // Phase 2.7 — resolve the session manager. The manager wraps context creation
+  // so contexts (cookies + storage) are rotated every cfg.session.maxRequests
+  // requests OR cfg.session.maxAgeMs ms — whichever comes first. Each new
+  // context is optionally warmed up (visits google.com etc. before Maps).
+  //
+  // The manager uses a real createContext factory (createRealContextFactory)
+  // that calls browser.newContext(opts) + applies the Phase 2.4 fingerprint +
+  // Phase 2.5 stealth patches. The factory is constructed here (needs cfg +
+  // logger + stealth config); the manager calls it on each rotation.
+  //
+  // accountWarmup is opt-in (default off). When on, each new context logs into
+  // a Google account (from the gitignored accounts file) before the scrape.
+  // Credentials are never logged (email redacted to prefix***@domain).
+  const sessionCreateContext = createRealContextFactory({
+    cfg,
+    logger,
+    stealth: cfg.stealth.resolved || { enabled: false, debug: false },
+  });
+  // The warmup function bound to the run's config. Returns { visited, waitedMs }.
+  // Passed to the manager as warmupFn so it runs on EVERY new context (including
+  // mid-scrape rotations), not just the initial one.
+  const sessionWarmupFn = cfg.session.warmup
+    ? async (page, ctx) => warmupContext(page, {
+        logger: ctx.logger || logger,
+        durationMs: cfg.session.warmupDurationMs,
+        sleepFn: ctx.sleepFn,
+      })
+    : null;
+  let sessionAccounts = null;
+  let sessionUsedToday = new Set();
+  if (cfg.session.accountWarmup) {
+    try {
+      sessionAccounts = loadAccounts({ filePath: cfg.session.accountsFile, logger });
+      logger.phase('session').info('Phase 2.7 — account warmup enabled', {
+        accounts: sessionAccounts.length,
+        hint: 'Use burner/dedicated scraping accounts only — never primary accounts',
+      });
+    } catch (err) {
+      logger.phase('session').error('Phase 2.7 — account warmup: accounts file load failed', {
+        error: err.message,
+        hint: 'Disable with --accountWarmup off or fix the accounts file',
+      });
+      // Fail fast — a missing/malformed accounts file is a config error the
+      // operator should fix before running. validate() catches most cases, but
+      // a runtime parse failure (file changed after config) surfaces here.
+      process.exit(2);
+    }
+  }
+  const sessionManager = createSessionManager({
+    maxRequests: cfg.session.maxRequests,
+    maxAgeMs: cfg.session.maxAgeMs,
+    warmup: cfg.session.warmup,
+    warmupFn: sessionWarmupFn,
+    createContext: sessionCreateContext,
+    logger: logger.phase('session'),
+  });
+  cfg.session.resolved = { manager: sessionManager, accounts: sessionAccounts, usedToday: sessionUsedToday };
+  logger.phase('session').info('Phase 2.7 — session rotation enabled', {
+    maxRequests: cfg.session.maxRequests,
+    maxAgeMs: cfg.session.maxAgeMs,
+    warmup: cfg.session.warmup,
+    warmupDurationMs: cfg.session.warmupDurationMs,
+    accountWarmup: cfg.session.accountWarmup,
+  });
+
   // Phase 1.10 — startup banner. Prints the resolved config and waits 1s so
   // the operator can eyeball it and Ctrl-C if it looks wrong. Skipped (no
   // delay) when --yes is set, for scripted / CI runs.
@@ -446,7 +524,54 @@ async function main() {
     try {
       result = await withBrowser(
         cfg,
-        async ({ page }) => {
+        async ({ page, browser }) => {
+          // Phase 2.7 — warm up the initial context before the first Maps
+          // request. A zero-history session hitting Maps directly is a strong
+          // bot signal; warmup visits google.com (etc.) first so the cookie
+          // jar looks like a real user. Skipped when --warmup off.
+          if (cfg.session.warmup) {
+            try {
+              const w = await warmupContext(page, {
+                logger: logger.phase('session'),
+                durationMs: cfg.session.warmupDurationMs,
+              });
+              logger.phase('session').info('Initial session warmup complete', {
+                visited: w.visited,
+                waitedMs: w.waitedMs,
+                searched: w.searched,
+              });
+            } catch (err) {
+              logger.phase('session').warn('Initial warmup failed (non-fatal — continuing)', {
+                error: err.message,
+              });
+            }
+          }
+          // Phase 2.7 — optional account warmup (opt-in). Logs into a Google
+          // account in the initial context so the session is authenticated.
+          // Logged-in sessions get more data + fewer CAPTCHAs. Each account is
+          // used for max 1 session per day (tracked in sessionUsedToday).
+          if (cfg.session.accountWarmup && sessionAccounts) {
+            const acct = pickAccount(sessionAccounts, { usedToday: sessionUsedToday, logger });
+            if (acct) {
+              const r = await accountWarmup(page, {
+                email: acct.email,
+                password: acct.password,
+                logger: logger.phase('session'),
+              });
+              if (r.loggedIn) {
+                sessionUsedToday.add(acct.email);
+                logger.phase('session').info('Account warmup succeeded', { email: redactEmail(acct.email) });
+              } else {
+                logger.phase('session').warn('Account warmup failed — continuing unauthenticated', {
+                  email: redactEmail(acct.email),
+                  error: r.error,
+                });
+              }
+            } else {
+              logger.phase('session').warn('Account warmup: all accounts already used today — continuing unauthenticated');
+            }
+          }
+
           // We always re-search + re-scroll on resume — a live browser session
           // can't be restored, only the extracted data can.
           await performSearch(page, cfg, logger, cfg.retry, cfg.rateLimiter);
@@ -593,6 +718,35 @@ async function main() {
               }
             : null,
           captchaWaitMs: cfg.antiblock.captchaWaitMs,
+          // Phase 2.7 — session rotation hook. Called after each business; when
+          // the session manager triggers a rotation (maxRequests or maxAge), the
+          // hook closes the old context, creates + warms up a new one, re-navigates
+          // to the Maps search (so the feed reloads), and returns the new page.
+          // deepScrapeAll swaps its page reference to the new page.
+          sessionCheck: async () => {
+            const r = await sessionManager.tickRequest({
+              browser,
+              proxy: acquiredProxy,
+              fingerprint: cfg.fingerprint.resolved,
+              label: 'deep-scrape',
+            });
+            if (!r.rotated) return { rotated: false };
+            // A rotation happened — re-navigate the new page to the Maps search
+            // so the feed is loaded for the next business's detail-panel click.
+            // The businesses are in memory; the feed reloads in a few seconds.
+            try {
+              logger.phase('session').info('Session rotated — re-navigating new page to Maps search', {
+                reason: r.reason,
+                sessionInfo: r.sessionInfo,
+              });
+              await performSearch(r.page, cfg, logger, cfg.retry, cfg.rateLimiter);
+            } catch (err) {
+              logger.phase('session').warn('Session rotation: re-search failed (non-fatal — deep-scrape will retry)', {
+                error: err.message,
+              });
+            }
+            return { rotated: true, page: r.page, reason: r.reason };
+          },
         });
         const detailDuration = Date.now() - detailStart;
         logger.info('Deep-scrape phase complete', {
@@ -651,6 +805,8 @@ async function main() {
               costLogPath: cfg.captcha.resolved.costLogger.filePath,
             }
           : { provider: 'none', costLog: { count: 0, totalCost: 0, avgMs: 0 } },
+        // Phase 2.7 — session rotation stats for this run.
+        session: sessionManager ? sessionManager.stats() : { enabled: false },
       };
     },
     {
@@ -766,6 +922,8 @@ async function main() {
     proxy: proxyPool ? proxyPool.stats() : { enabled: false },
     // Phase 2.6 — CAPTCHA solver stats for this run (provider/spend/cost log).
     captcha: result.captcha,
+    // Phase 2.7 — session rotation stats (sessionsCreated, rotations, avgRequests).
+    session: result.session,
   };
 
   // Phase 2.1 — output dispatch. cfg.output is a normalized array of targets
@@ -915,6 +1073,17 @@ async function main() {
       );
     }
   }
+  // Phase 2.7 — session rotation stats line. Shows how many sessions were
+  // created, how many rotations happened, and the avg requests per session.
+  const sessionLines = [];
+  if (result.session && result.session.sessionsCreated !== undefined) {
+    const ss = result.session;
+    const avgReq = ss.avgRequestsPerSession || 0;
+    const avgAge = ss.avgAgeMs > 0 ? `${(ss.avgAgeMs / 1000).toFixed(1)}s` : '0s';
+    sessionLines.push(
+      `Session:  ${ss.sessionsCreated} created, ${ss.rotations} rotations (avg ${avgReq} req/session, avg age ${avgAge}${ss.warmup ? ', +warmup' : ''})`,
+    );
+  }
   // Phase 1.9 — include the log file path in the banner so the operator knows
   // where the full JSON-lines record of this run lives.
   const logFile = logger.getLogFile ? logger.getLogFile() : null;
@@ -931,6 +1100,7 @@ async function main() {
     ...outputLines,
     ...proxyLines,
     ...captchaLines,
+    ...sessionLines,
     ...(logLine ? [logLine] : []),
     '========================================',
   ].join('\n');

@@ -10,9 +10,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 2.6 complete. 7 of 13 sub-phases shipped.
+> **Last updated:** Phase 2.7 complete. 8 of 13 sub-phases shipped.
 >
-> **Overall:** 7 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
+> **Overall:** 8 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -23,7 +23,7 @@
 | 2.4 — Browser Fingerprint Randomization | ✅ DONE | 96 tests | `src/fingerprint.js`, `src/browser.js` (fingerprint-aware launch), `src/config.js` (--fingerprintProfile/--fixedFingerprint/--noFingerprint), `src/banner.js` (fingerprint row), `src/index.js` (per-run generation + logging) | coherent UA+platform+viewport+timezone+locale+WebGL+canvas noise+hw concurrency+device memory+geolocation; init-script injection; 1000× coherence stress test |
 | 2.5 — Stealth Hardening | ✅ DONE | 83 tests | `src/stealth-patches.js`, `src/browser.js` (playwright-extra + stealth plugin + custom patches), `src/config.js` (--stealth/--noStealth/--stealthDebug), `src/banner.js` (stealth row), `src/index.js` (resolve + apply), `scripts/verify-stealth.js` (dev-only) | 10 bot-detection patches (webdriver, chrome.runtime, plugins, permissions, outerWidth/Height, Notification.permission, vendor, maxTouchPoints); coexists with fingerprint (yields to WebGL+languages overrides); launch args (--disable-blink-features=AutomationControlled); stub-page eval tests |
 | 2.6 — CAPTCHA Auto-Solving | ✅ DONE | 90 tests | `src/captcha/solver.js`, `src/captcha/cost-log.js`, `src/captcha/injector.js`, `src/captcha/orchestrator.js`, `src/captcha/index.js`, `src/antiblock.js` (detectCaptchaType + extractSitekey + CAPTCHA_TYPES), `src/config.js` (--captchaProvider/--captchaApiKey/--captchaBudget/--noCaptchaSolve), `src/banner.js` (CAPTCHA row), `src/index.js` (resolve solver + budget guard + cost logger; wire handleCaptcha into deep-scrape hook; end-of-run CAPTCHA cost line), `tests/fixtures/recaptcha-v2.html`, `tests/helpers/mock-dom.js` | 4 providers (2captcha REST, anticaptcha JSON-RPC, capsolver JSON-RPC, mock) via injectable httpClient (no real API calls in tests); BudgetGuard spend cap; cost-log JSONL + summary; pure DOM token-injection tested against reCAPTCHA v2 fixture; orchestrator fallback chain (solve→retry→fallback provider→pause-and-alert); provider 'none' preserves Phase 1.8 behavior exactly |
-| 2.7 — Session & Cookie Rotation | ⬜ NOT STARTED | — | — | Fresh context every N requests, warmup hooks |
+| 2.7 — Session & Cookie Rotation | ✅ DONE | 59 tests | `src/session/manager.js`, `src/session/warmup.js`, `src/session/account-warmup.js`, `src/session/context-factory.js`, `src/session/index.js`, `src/detail.js` (sessionCheck hook + page swap), `src/config.js` (--sessionMaxRequests/--sessionMaxAgeMs/--warmup/--warmupDurationMs/--accountWarmup/--accountsFile), `src/banner.js` (Session row), `src/index.js` (construct manager, warmup before search, tickRequest in deep-scrape, rotate + re-navigate, end-of-run stats) | createSessionManager with injectable createContext/clock/sleep; rotation by request count OR age (whichever first); warmupContext visits google.com + random second site + benign search; accountWarmup opt-in (off by default, credentials never logged, email redacted); cookie isolation (each context fresh jar); createRealContextFactory bridges to browser.newContext + fingerprint + stealth; mid-deep-scrape rotation via sessionCheck hook + re-navigate to Maps search |
 | 2.8 — Worker Pool & Concurrency | ⬜ NOT STARTED | — | — | N parallel browsers, per-worker proxy+fingerprint, graceful degradation |
 | 2.9 — Job Queue & Orchestration | ⬜ NOT STARTED | — | — | BullMQ/Redis or in-memory queue, async jobs, priorities |
 | 2.10 — Memory Management & Long-Run Stability | ⬜ NOT STARTED | — | — | Context restart, leak mitigation, health probes |
@@ -583,7 +583,7 @@ An unattended CAPTCHA-solving layer with budget controls and graceful fallback. 
 
 ## Phase 2.7 — Session & Cookie Rotation
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE**
 
 ### Goal
 Start a fresh browser context (new cookies, new localStorage, new session) every N requests or every M minutes. Optionally support "warmup" — a new context first visits a benign Google property (Search, News) for 10-20 seconds before hitting Maps, to look like a real user warming up a session.
@@ -592,60 +592,68 @@ Start a fresh browser context (new cookies, new localStorage, new session) every
 Google tracks session cookies across requests. A session that scrapes 500 Maps pages in 10 minutes is suspicious. Rotating sessions every ~50 requests makes the traffic pattern look like many distinct users. Warmup defeats "zero-history session hitting Maps" heuristics.
 
 ### Task checklist
-- [ ] **Session manager.** `src/session.js`:
-  - `createSessionManager({ maxRequests, maxAgeMs, warmup, logger })` — returns a manager.
-  - `manager.getContext({ proxy, fingerprint })` — returns a browser context, creating a new one if the current one is exhausted (by request count or age).
+- [x] **Session manager.** `src/session/manager.js`:
+  - `createSessionManager({ maxRequests, maxAgeMs, warmup, warmupFn, createContext, clock, sleepFn, logger })` — returns a manager.
+  - `manager.getContext({ browser, proxy, fingerprint })` — returns { context, page, isNew, sessionInfo }, creating a new one if none exists.
+  - `manager.tickRequest({ browser, proxy, fingerprint, label })` — increments request counter; auto-rotates when count OR age threshold hit. Returns { rotated, reason, page, sessionInfo }.
+  - `manager.shouldRotate()` — pure check returning { rotate, reason, requestCount, ageMs }.
+  - `manager.rotate({ browser, proxy, fingerprint, reason })` — force rotation; closes old context + creates new one (with warmup).
   - `manager.release()` — closes the current context, clears cookies/storage.
-  - `manager.stats()` — returns `{ sessionsCreated, avgRequestsPerSession, avgAgeMs }`.
-- [ ] **Rotation triggers.**
-  - Request count: `--sessionLength 50` (new context every 50 Maps requests).
+  - `manager.stats()` — returns { sessionsCreated, rotations, totalRequests, avgRequestsPerSession, avgAgeMs, current, maxRequests, maxAgeMs, warmup }.
+- [x] **Rotation triggers.**
+  - Request count: `--sessionMaxRequests 50` (new context every 50 Maps requests).
   - Age: `--sessionMaxAgeMs 600000` (new context every 10 minutes, regardless of request count).
-  - Whichever comes first.
-  - On rotation: close context, log `Session rotated (requests=50, age=8.3min)`, create new context with the same proxy+fingerprint OR a new proxy+fingerprint (configurable).
-- [ ] **Warmup routine.** `src/session/warmup.js`:
-  - `warmupContext(page, { logger })` — visits 1-2 of:
-    - `https://www.google.com` (search homepage).
-    - `https://news.google.com` (Google News).
-    - A random top-100 website (from a bundled list).
-  - Waits 5-15 seconds (randomized).
-  - Optionally performs a benign search ("weather", "news today").
-  - Log: `Session warmup complete (visited google.com, waited 8.2s)`.
-  - Configurable: `--warmup on|off` (default: on), `--warmupDurationMs` (default: 10000).
-- [ ] **Cookie isolation.** Each new context starts with zero cookies. The session manager never shares cookies between contexts. (Playwright contexts are isolated by default — verify, don't break this.)
-- [ ] **Google account warmup (optional, advanced).** `src/session/account-warmup.js`:
-  - Accepts a list of Google account credentials (email + app-password).
-  - Logs in to Google in a new context, establishing an authenticated session.
-  - Logged-in sessions get more data (review text, some private fields) and fewer CAPTCHAs.
-  - **Security:** credentials stored only in `.env` (gitignored); never logged.
-  - `--accountWarmup on|off` (default: off — this is opt-in due to account-burn risk).
-  - Each account used for max 1 session per day (configurable) to avoid all accounts getting flagged together.
-- [ ] **Config flags.**
-  - `--sessionLength N` (requests per session; default: 50)
-  - `--sessionMaxAgeMs` (default: 600000)
+  - Whichever comes first (checked in `shouldRotate()` + `tickRequest()`).
+  - On rotation: close context, log `Session rotated (requests=50, age=8.3min, reason=max-requests)`, create new context with the same proxy+fingerprint.
+  - NOTE: the plan's `--sessionLength` flag was already taken by Phase 2.3 (proxy sticky rotation, default 1). To avoid a flag collision, Phase 2.7 uses `--sessionMaxRequests` for the browser-context rotation trigger. The two coexist: `--sessionLength` = proxy sticky rotation, `--sessionMaxRequests` = context rotation.
+- [x] **Warmup routine.** `src/session/warmup.js`:
+  - `warmupContext(page, { logger, durationMs, sleepFn, rng, sites, searches, search })` — visits 1-2 of:
+    - `https://www.google.com` (search homepage, always first).
+    - A random second site from {news.google.com, youtube.com, en.wikipedia.org, bing.com}.
+  - Waits a randomized 2-5s between visits (capped by `durationMs`).
+  - Optionally performs a benign search ("weather today", "news today", "time now", "what time is it") on the Google homepage.
+  - Log: `Session warmup complete (visited google.com, waited 8.2s, searched=true)`.
+  - Configurable: `--warmup on|off` (default: on), `--warmupDurationMs` (default: 10000), `--noWarmup` alias.
+- [x] **Cookie isolation.** Each new context starts with zero cookies (Playwright contexts are isolated by default). The session manager never shares cookies between contexts. Verified via dedicated tests: context A's cookie jar is a different object from context B's, and a cookie set in A is undefined in B.
+- [x] **Google account warmup (optional, advanced).** `src/session/account-warmup.js`:
+  - `loadAccounts({ filePath, logger })` — loads a JSON array of {email, password} from a gitignored file. Validates entries + warns if world-readable (chmod 600).
+  - `accountWarmup(page, { email, password, logger, sleepFn, rng })` — logs into Google in the given page's context. Returns { loggedIn, email, error? }.
+  - `pickAccount(accounts, { usedToday })` — picks a random available account, skipping any in the used-today set (max 1 session per account per day).
+  - `redactEmail(email)` — masks the local-part ("user@gmail.com" → "use***@gmail.com"). Passwords are NEVER logged.
+  - `--accountWarmup on|off` (default: off — opt-in due to account-burn risk). Requires `--accountsFile`.
+- [x] **Config flags.**
+  - `--sessionMaxRequests N` (requests per browser context; default: 50) — NOTE: distinct from Phase 2.3's `--sessionLength`.
+  - `--sessionMaxAgeMs <ms>` (default: 600000)
   - `--warmup on|off` (default: on)
-  - `--warmupDurationMs` (default: 10000)
+  - `--noWarmup` (alias for `--warmup off`)
+  - `--warmupDurationMs <ms>` (default: 10000)
   - `--accountWarmup on|off` (default: off)
-  - `--accountsFile <path>` (JSON array of `{email, password}`; gitignored)
-- [ ] **Unit tests.** `tests/session.test.js`:
+  - `--accountsFile <path>` (JSON array of `{email, password}`; gitignored + chmod 600)
+  - Validation: maxRequests 1-100000; maxAgeMs 1000-86400000; warmupDurationMs 0-300000; accountWarmup=on requires accountsFile (existence checked).
+- [x] **Unit tests.** `tests/session.test.js` (59 tests / 129 assertions):
   - Session manager creates a new context when request count exceeds `maxRequests`.
   - Session manager creates a new context when age exceeds `maxAgeMs`.
   - Warmup visits the expected URLs (with a stub page that records navigations).
-  - Account warmup is opt-in and off by default.
-  - DI: manager accepts a mock `createContext` function.
+  - Account warmup is opt-in and off by default (loadAccounts, pickAccount, redactEmail, accountWarmup stub-page login, password-never-logged).
+  - DI: manager accepts a mock `createContext` function + injectable clock/sleep.
+  - Cookie isolation: context A's cookies are not visible in context B (fresh jar per context).
+  - `tickRequest` auto-rotates + returns the new page; `rotate()` force-rotates; `release()` closes; `stats()` aggregates.
+  - `warmupContext`: visits google.com first + random second site, randomized wait, benign search, goto-failure non-fatal, durationMs cap.
+  - `createRealContextFactory`: calls browser.newContext + applies fingerprint + falls back to Phase 1 defaults.
 
 ### Acceptance criteria
-- With `--sessionLength 10`, every 10th request triggers a new context (visible in logs).
-- Session age is tracked and triggers rotation independently of request count.
-- Warmup visits a benign page before Maps when enabled.
-- `--warmup off` skips warmup (Phase 1 behavior).
-- Account warmup is off by default; enabling it requires an accounts file.
-- Cookie isolation is verified: context A's cookies are not visible in context B.
+- With `--sessionMaxRequests 10`, every 10th request triggers a new context (visible in logs). ✅ (`tickRequest` auto-rotates when count >= maxRequests; logs "Session rotated (reason=max-requests, requests=10, age=...)" — verified via dedicated test with mock createContext)
+- Session age is tracked and triggers rotation independently of request count. ✅ (`shouldRotate` checks age >= maxAgeMs independent of count; dedicated test with a stepping clock)
+- Warmup visits a benign page before Maps when enabled. ✅ (wired in index.js: `warmupContext` runs before `performSearch`; warmup visits google.com first)
+- `--warmup off` skips warmup (Phase 1 behavior). ✅ (`--noWarmup` / `WARMUP=off` sets `cfg.session.warmup=false`; warmup block is skipped; dedicated test)
+- Account warmup is off by default; enabling it requires an accounts file. ✅ (default `off`; `validate()` pushes an error when `accountWarmup=on` without `accountsFile`; existence checked at config + runtime)
+- Cookie isolation is verified: context A's cookies are not visible in context B. ✅ (dedicated test: each mock context gets a fresh cookie jar object; a cookie set in A is undefined in B)
 
 ### Dependencies
 Phase 2.3 (proxies), Phase 2.4 (fingerprints) — sessions combine proxy + fingerprint + cookies.
 
 ### Deliverable
-A session-rotation layer that distributes traffic across many distinct sessions, each warmed up to look human.
+A session-rotation layer that distributes traffic across many distinct sessions, each warmed up to look human. **Shipped:** `src/session/manager.js` (createSessionManager with injectable createContext/clock/sleep; getContext/tickRequest/shouldRotate/rotate/release/stats; rotation by request count OR age, whichever first; warmupFn runs on every new context incl. rotations; SessionError for invalid config), `src/session/warmup.js` (warmupContext: visits google.com + random second site, randomized 2-5s waits capped by durationMs, optional benign search with humanType, goto-failure non-fatal; DEFAULT_WARMUP_SITES + DEFAULT_WARMUP_SEARCHES), `src/session/account-warmup.js` (loadAccounts: JSON array validation + world-readable warning; accountWarmup: stub-page Google login, email redaction, password never logged; pickAccount: used-today skipping; AccountWarmupError), `src/session/context-factory.js` (createRealContextFactory: bridges manager's createContext to browser.newContext + fingerprint + stealth + setDefaultTimeout + newPage), `src/session/index.js` (barrel), `src/detail.js` (sessionCheck hook: after each business, if rotated swap the page reference; non-fatal on hook throw), `src/config.js` (--sessionMaxRequests/--sessionMaxAgeMs/--warmup/--noWarmup/--warmupDurationMs/--accountWarmup/--accountsFile + SESSION_*/WARMUP*/ACCOUNT_* env vars + validation + HELP_TEXT + examples; NOTE: --sessionMaxRequests used instead of plan's --sessionLength to avoid collision with Phase 2.3), `src/banner.js` (Session row: maxRequests/maxAgeMs + warmup state + account flag), `src/index.js` (construct session manager with real createContext factory + warmupFn; run warmup before performSearch; optional account warmup before search; wire sessionCheck hook into deepScrapeAll — on rotation, close old context + create new (with warmup) + re-navigate to Maps search so feed reloads; end-of-run Session stats line in banner + summary object), `tests/session.test.js` (59 tests / 129 assertions). 949 tests / 7105 assertions passing total.
 
 ---
 
