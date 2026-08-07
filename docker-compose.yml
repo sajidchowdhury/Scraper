@@ -1,0 +1,54 @@
+# docker-compose.yml — Phase 2 infrastructure
+#
+# One-command local dev infrastructure for Phase 2:
+#   docker compose up -d        # start PostgreSQL + Redis in background
+#   docker compose ps           # check status
+#   docker compose logs -f      # tail logs
+#   docker compose down         # stop + remove containers
+#   docker compose down -v      # also delete data volumes (destructive)
+#
+# Connection strings (matches .env.example):
+#   DATABASE_URL=postgresql://gmaps:gmaps@localhost:5432/gmaps_scraper
+#   REDIS_URL=redis://localhost:6379
+#
+# Data is persisted in named volumes (gmaps_pg, gmaps_redis) so it survives
+# container restarts. Use `docker compose down -v` to wipe completely.
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: gmaps-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gmaps
+      POSTGRES_PASSWORD: gmaps
+      POSTGRES_DB: gmaps_scraper
+    ports:
+      - "5432:5432"
+    volumes:
+      - gmaps_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gmaps -d gmaps_scraper"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: gmaps-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - gmaps_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  gmaps_pg:
+    driver: local
+  gmaps_redis:
+    driver: local

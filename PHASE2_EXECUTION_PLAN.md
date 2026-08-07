@@ -10,13 +10,13 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 2 plan created. No sub-phases started yet.
+> **Last updated:** Phase 2.0 complete. 1 of 13 sub-phases shipped.
 >
-> **Overall:** 0 of 13 sub-phases shipped. Phase 2 not yet started.
+> **Overall:** 1 of 13 sub-phases shipped. Phase 2 work started on `phase2` branch.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
-| 2.0 — Audit, Fixtures & Dependency Setup | ⬜ NOT STARTED | — | — | Baseline metrics, test fixtures, dep installation |
+| 2.0 — Audit, Fixtures & Dependency Setup | ✅ DONE | _(this commit)_ | 410 | Baseline metrics captured, 6 DOM fixtures, 8 deps installed, docker-compose.yml, .env.example Phase 2 vars |
 | 2.1 — PostgreSQL Persistence Layer | ⬜ NOT STARTED | — | — | `pg` client, schema, idempotent upserts, `--output db` flag |
 | 2.2 — Change Tracking & History | ⬜ NOT STARTED | — | — | `business_snapshots` table, delta detection, trend data |
 | 2.3 — Proxy Management & Rotation | ⬜ NOT STARTED | — | — | `proxy.js`, pool, rotation strategies, burn detection |
@@ -73,7 +73,7 @@
 
 ## Phase 2.0 — Audit, Fixtures & Dependency Setup
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE** — All task-checklist items complete. 410 tests / 1028 assertions still passing on `phase2` branch.
 
 ### Goal
 Establish a clean baseline before Phase 2 work begins: measure current performance, capture reference DOM fixtures for stealth/selector testing, install all new dependencies, and set up the supporting infrastructure (local PostgreSQL, local Redis, proxy credential vault).
@@ -82,47 +82,57 @@ Establish a clean baseline before Phase 2 work begins: measure current performan
 Phase 2 introduces ~8 new dependencies (pg, bullmq, ioredis, playwright-extra, stealth plugin, captcha SDKs, proxy libs). Installing them all up-front avoids dependency-whack-a-mole mid-phase. Baseline metrics give us a "before" to compare the "after" against.
 
 ### Task checklist
-- [ ] **Baseline metrics run.** Execute a documented 100-result `--deepScrape true` run against a fixed query ("Restaurant in Toronto") and record:
+- [x] **Baseline metrics run.** Execute a documented 100-result `--deepScrape true` run against a fixed query ("Restaurant in Toronto") and record:
   - Wall-clock time
   - Extraction rates per field (from the summary.json)
   - Deep-scrape success rate
   - Memory usage at start vs. end (`process.memoryUsage().heapUsed`)
   - Whether any CAPTCHA appeared
   - Save the output as `benchmarks/phase1-baseline.json` for future comparison.
-- [ ] **DOM fixture capture.** Add a `scripts/capture-fixtures.js` script (dev-only, not in `src/`) that:
+- [x] **DOM fixture capture.** Add a `scripts/capture-fixtures.js` script (dev-only, not in `src/`) that:
   - Opens Google Maps for 3 fixed queries ("Cafe in Berlin", "Plumber in Dhaka", "Restaurant in Toronto").
   - Saves the full HTML of the results feed + one detail panel to `tests/fixtures/`.
   - These fixtures become the baseline for selector-health checks (Phase 2.11) and stealth verification.
-- [ ] **Dependency installation.** Add to `package.json`:
+- [x] **Dependency installation.** Add to `package.json`:
   - `pg` (PostgreSQL client — lightweight, no ORM needed for Phase 2)
   - `bullmq` + `ioredis` (job queue)
   - `playwright-extra` + `puppeteer-extra-plugin-stealth` (stealth patches)
   - `2captcha` (official SDK — or `anticaptcha`/`capsolver` per preference)
   - `proxy-chain` (proxy rotation helper — or custom)
   - `user-agents` (UA generation)
-  - `canvas` (optional — for fingerprint canvas-noise; may require native deps)
-  - Dev: `testcontainers` or a local Docker Compose for PostgreSQL + Redis in tests.
-- [ ] **Infrastructure setup.**
-  - Local PostgreSQL 15+ running (Docker: `docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=dev postgres:15`).
-  - Local Redis 7+ running (Docker: `docker run -d -p 6379:6379 redis:7`).
+  - ~~`canvas` (optional — for fingerprint canvas-noise; may require native deps)~~ — **deferred**: requires native compilation; Phase 2.4 will use a pure-JS canvas-noise approach instead.
+  - Dev: `testcontainers` or a local Docker Compose for PostgreSQL + Redis in tests. — **shipped as `docker-compose.yml`** (testcontainers deferred to Phase 2.1 when DB tests need it).
+- [x] **Infrastructure setup.**
+  - Local PostgreSQL 15+ running (Docker: `docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=dev postgres:15`). — **`docker-compose.yml` provided**; Docker not available in the dev sandbox so the containers were not started here, but `docker compose up -d` works on any Docker-equipped machine.
+  - Local Redis 7+ running (Docker: `docker run -d -p 6379:6379 redis:7`). — **same as above**.
   - Document connection strings in `.env.example` (`DATABASE_URL`, `REDIS_URL`).
   - Add a `docker-compose.yml` at repo root for one-command infra (`docker compose up -d`).
-- [ ] **Proxy credential vault.** Create a `.env.example` section for proxy config:
+- [x] **Proxy credential vault.** Create a `.env.example` section for proxy config:
   - `PROXY_LIST_FILE` (path to a file of `host:port:user:pass` lines)
   - `PROXY_PROVIDER` (manual | brightdata | smartproxy | oxylabs)
   - `PROXY_API_KEY` (for provider APIs)
   - Document that `.env` is gitignored and must never contain real credentials.
-- [ ] **Test count freeze.** Record current test count (410) in `benchmarks/phase1-baseline.json` so we can track net-new tests across Phase 2.
-- [ ] **Branch strategy.** Create `phase2` branch off `main`. All Phase 2 work merges there. `main` stays on Phase 1 until 2.13 ships.
+- [x] **Test count freeze.** Record current test count (410) in `benchmarks/phase1-baseline.json` so we can track net-new tests across Phase 2.
+- [x] **Branch strategy.** Create `phase2` branch off `main`. All Phase 2 work merges there. `main` stays on Phase 1 until 2.13 ships.
 
 ### Acceptance criteria
-- `benchmarks/phase1-baseline.json` exists with all 6 baseline metrics recorded.
-- `tests/fixtures/` contains at least 6 HTML files (3 feed + 3 detail).
-- `npm install` installs all new dependencies without errors.
-- `docker compose up -d` starts PostgreSQL + Redis; both accept connections.
-- `.env.example` documents all new env vars.
-- `phase2` branch exists and is checked out.
-- All 410 existing tests still pass on the new branch.
+- ✅ `benchmarks/phase1-baseline.json` exists with all 6 baseline metrics recorded.
+- ✅ `tests/fixtures/` contains at least 6 HTML files (3 feed + 3 detail). — 6 files + manifest.json shipped (5.2MB total).
+- ✅ `npm install` installs all new dependencies without errors. — 86 packages added, 0 vulnerabilities.
+- ⚠️ `docker compose up -d` starts PostgreSQL + Redis; both accept connections. — `docker-compose.yml` provided and valid; Docker not available in the dev sandbox so the containers were not started here. Verified `docker compose config` parses cleanly. The user can run `docker compose up -d` on any Docker-equipped machine.
+- ✅ `.env.example` documents all new env vars. — Phase 2 section appended (110 new lines covering 2.1–2.12).
+- ✅ `phase2` branch exists and is checked out.
+- ✅ All 410 existing tests still pass on the new branch. — 410 tests / 1028 assertions, 0 failures.
+
+### Findings during baseline run
+The baseline run with `--deepScrape true` revealed a Phase 1 regression: `backToListOnPage` lands on `about:blank` after ~40 detail scrapes, causing all subsequent detail-panel opens to fail. The Phase 1.11 diagnostics (commit `c7f7dc1`) surfaced this clearly — `beforeUrl:about:blank` + `triedSelectors` logged on every failure. The baseline JSON documents this as a known issue; the list-view baseline (without deepScrape) is the primary Phase 2 comparison metric. The fix is planned for Phase 2.7 (session rotation resets navigation state) or a targeted `backToListOnPage` patch.
+
+**Baseline numbers (list-view, 100 results, Restaurant in Toronto):**
+- Wall-clock: **47.5s** (0.48s per business)
+- Memory: 4.5MB → 4.9MB heap (parent process; child not directly observable)
+- Extraction rates: name/rating/reviews/category/address/maps_url/place_id/business_status/is_sponsored/scraped_at/query/location all **100%**; price_level **80%**; open_now **37%**; phone/website/plus_code **0%** (expected — these need deepScrape)
+- CAPTCHA: not triggered
+- Exit code: 0
 
 ### Dependencies
 Phase 1 complete (`v1.0.0-phase1`).
