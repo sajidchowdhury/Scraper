@@ -10,9 +10,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 2.4 complete. 5 of 13 sub-phases shipped.
+> **Last updated:** Phase 2.5 complete. 6 of 13 sub-phases shipped.
 >
-> **Overall:** 5 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
+> **Overall:** 6 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -21,7 +21,7 @@
 | 2.2 — Change Tracking & History | ✅ DONE | _(this commit)_ | 551 (+76) | `business_snapshots` + `field_changes` tables, `src/db/deltas.js` (computeChanges, numericDelta), snapshot-on-update, `changes_detected` on scrape_runs, `npm run db:history` CLI, change-breakdown banner |
 | 2.3 — Proxy Management & Rotation | ✅ DONE | 52 tests | `src/proxy.js`, `src/proxy/burn-detector.js` | pool, 3 rotation strategies, burn detection, health check |
 | 2.4 — Browser Fingerprint Randomization | ✅ DONE | 96 tests | `src/fingerprint.js`, `src/browser.js` (fingerprint-aware launch), `src/config.js` (--fingerprintProfile/--fixedFingerprint/--noFingerprint), `src/banner.js` (fingerprint row), `src/index.js` (per-run generation + logging) | coherent UA+platform+viewport+timezone+locale+WebGL+canvas noise+hw concurrency+device memory+geolocation; init-script injection; 1000× coherence stress test |
-| 2.5 — Stealth Hardening | ⬜ NOT STARTED | — | — | `playwright-extra` + stealth, `navigator.webdriver`, headless evasion |
+| 2.5 — Stealth Hardening | ✅ DONE | 83 tests | `src/stealth-patches.js`, `src/browser.js` (playwright-extra + stealth plugin + custom patches), `src/config.js` (--stealth/--noStealth/--stealthDebug), `src/banner.js` (stealth row), `src/index.js` (resolve + apply), `scripts/verify-stealth.js` (dev-only) | 10 bot-detection patches (webdriver, chrome.runtime, plugins, permissions, outerWidth/Height, Notification.permission, vendor, maxTouchPoints); coexists with fingerprint (yields to WebGL+languages overrides); launch args (--disable-blink-features=AutomationControlled); stub-page eval tests |
 | 2.6 — CAPTCHA Auto-Solving | ⬜ NOT STARTED | — | — | 2Captcha/Anti-Captcha/CapSolver integration, fallback chain |
 | 2.7 — Session & Cookie Rotation | ⬜ NOT STARTED | — | — | Fresh context every N requests, warmup hooks |
 | 2.8 — Worker Pool & Concurrency | ⬜ NOT STARTED | — | — | N parallel browsers, per-worker proxy+fingerprint, graceful degradation |
@@ -450,7 +450,7 @@ A fingerprint randomization layer that makes each browser session look like a di
 
 ## Phase 2.5 — Stealth Hardening
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE** — `src/stealth-patches.js` ships 10 bot-detection patches (navigator.webdriver, chrome.runtime, plugins, permissions.query, outerWidth/Height, Notification.permission, vendor, maxTouchPoints, languages + WebGL fallbacks) coexisting with the Phase 2.4 fingerprint. `src/browser.js` dynamically selects playwright-extra+stealth plugin vs vanilla playwright based on `--stealth on|off`. 66 module tests + 17 config tests, all 10 acceptance predicates verified via stub-page eval.
 
 ### Goal
 Patch the remaining "bot tells" that fingerprint randomization doesn't cover: `navigator.webdriver`, headless-mode indicators, missing browser APIs, permissions quirks, and `chrome.runtime` absence. Use `playwright-extra` + `puppeteer-extra-plugin-stealth` as the foundation, with custom patches for Maps-specific detection.
@@ -459,12 +459,12 @@ Patch the remaining "bot tells" that fingerprint randomization doesn't cover: `n
 Even with a randomized fingerprint, vanilla Playwright/Chromium has ~30 known bot signals (`navigator.webdriver === true`, missing `chrome.runtime`, `Notification.permission` inconsistencies, etc.). Google's detection checks these. Stealth patches eliminate the signals.
 
 ### Task checklist
-- [ ] **Stealth plugin integration.** Replace `playwright` with `playwright-extra` in `src/browser.js`:
+- [x] **Stealth plugin integration.** Replace `playwright` with `playwright-extra` in `src/browser.js`:
   - `const { chromium } = require('playwright-extra');`
   - `const stealth = require('puppeteer-extra-plugin-stealth')();`
   - `chromium.use(stealth);`
   - Verify all existing tests still pass (stealth should be transparent to the DI stubs).
-- [ ] **Custom stealth patches.** `src/stealth-patches.js` — Maps-specific overrides applied via `context.addInitScript`:
+- [x] **Custom stealth patches.** `src/stealth-patches.js` — Maps-specific overrides applied via `context.addInitScript`:
   - `navigator.webdriver = undefined` (belt-and-suspenders; stealth handles this but verify).
   - `window.chrome = { runtime: {} }` (Chrome indicator that headless Chromium lacks).
   - `navigator.permissions.query` — return `prompt` for `notifications` instead of `denied` (headless gives `denied`, which is a tell).
@@ -472,20 +472,20 @@ Even with a randomized fingerprint, vanilla Playwright/Chromium has ~30 known bo
   - `navigator.languages` — return the fingerprint's language array (not just `['en-US']`).
   - `WebGLRenderingContext.getParameter` for `UNMASKED_VENDOR_WEBGL` / `UNMASKED_RENDERER_WEBGL` — return fingerprint values.
   - `window.outerWidth / outerHeight` — set to > 0 (headless reports 0).
-- [ ] **Headless detection evasion.**
+- [x] **Headless detection evasion.**
   - Add `--disable-blink-features=AutomationControlled` to launch args.
   - Add `--excludeSwitches=enable-automation` (removes the "Chrome is being controlled by automated software" banner).
   - Consider `headless: 'new'` (Playwright's new headless mode, less detectable) vs `headless: true` (old). Test both against a detection page (e.g., `bot.sannysoft.com`).
-- [ ] **Verification script.** `scripts/verify-stealth.js` (dev-only):
+- [x] **Verification script.** `scripts/verify-stealth.js` (dev-only):
   - Launches a browser with stealth patches.
   - Navigates to `https://bot.sannysoft.com` (or similar detection page).
   - Screenshots the results + extracts the "detection score."
   - Saves to `benchmarks/stealth-score.json`.
   - Run before and after Phase 2.5 to verify improvement.
-- [ ] **Config flags.**
+- [x] **Config flags.**
   - `--stealth on|off` (default: on)
   - `--stealthDebug` (logs every patch applied + the resulting navigator properties)
-- [ ] **Unit tests.** `tests/stealth.test.js`:
+- [x] **Unit tests.** `tests/stealth.test.js`:
   - Verify `stealth-patches.js` exports the expected init script string.
   - Verify the init script, when evaluated in a JSDOM environment (or stub page), sets `navigator.webdriver` to undefined.
   - Verify `window.chrome.runtime` exists after patch.
@@ -504,7 +504,7 @@ Even with a randomized fingerprint, vanilla Playwright/Chromium has ~30 known bo
 Phase 2.0 (playwright-extra installed), Phase 2.4 (fingerprint — stealth + fingerprint are complementary).
 
 ### Deliverable
-A stealth layer that eliminates known bot-detection signals, reducing block rate on long runs.
+A stealth layer that eliminates known bot-detection signals, reducing block rate on long runs. **Shipped:** `src/stealth-patches.js` (10 patches: webdriver→undefined, chrome.runtime stub with OnInstalledReason/PlatformOs/connect/sendMessage, permissions.query→prompt for notifications, 5 fake PDF plugins, languages fallback, WebGL vendor/renderer fallback that YIELDS to fingerprint's override, outerWidth/Height→viewport, Notification.permission→default, vendor→Google Inc., maxTouchPoints→0; STEALTH_LAUNCH_ARGS with --disable-blink-features=AutomationControlled + 5 more args; buildStealthInitScript({debug}) IIFE string; applyStealthPatches(context,{debug,logger})), `src/browser.js` (resolveChromiumLauncher dynamically picks playwright-extra+stealth vs vanilla playwright; stealth launch args merged; applyStealthPatches injected AFTER fingerprint; “Browser launched” log records stealth state), `src/config.js` (--stealth on|off default on, --noStealth alias, --stealthDebug, STEALTH/STEALTH_DEBUG env vars, validation), `src/banner.js` (Stealth row), `src/index.js` (resolve cfg.stealth.resolved={enabled,debug} + logging), `scripts/verify-stealth.js` (dev-only: launches browser → bot.sannysoft.com → screenshots + scores → benchmarks/stealth-score.json), `tests/stealth.test.js` (66 tests / 238 assertions: 10 patches verified via stub-page eval, idempotency, coexistence with fingerprint yielding, debug mode, applyStealthPatches integration), `tests/config.test.js` (+17 tests for stealth flag parsing + validation + HELP_TEXT). 800 tests / 6754 assertions passing.
 
 ---
 

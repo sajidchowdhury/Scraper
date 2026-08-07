@@ -96,6 +96,12 @@ function parseArgs(argv) {
     else if (a === '--fingerprintProfile') out.fingerprintProfile = argv[++i];
     else if (a === '--fixedFingerprint') out.fixedFingerprint = argv[++i];
     else if (a === '--noFingerprint') out.noFingerprint = true;
+    // Phase 2.5 — stealth hardening (playwright-extra + stealth plugin +
+    // custom init-script patches for navigator.webdriver, chrome.runtime,
+    // plugins.length, permissions.query, outerWidth/Height, etc.)
+    else if (a === '--stealth') out.stealth = argv[++i];
+    else if (a === '--noStealth') out.noStealth = true;
+    else if (a === '--stealthDebug') out.stealthDebug = true;
   }
   return out;
 }
@@ -254,6 +260,13 @@ function validate(cfg) {
       }
     }
   }
+  // Phase 2.5 — stealth validation. --stealth must be 'on' or 'off' (case-insensitive).
+  // --noStealth is an alias for --stealth off. --stealthDebug implies --stealth on.
+  if (cfg.stealth.profile !== 'on' && cfg.stealth.profile !== 'off') {
+    errors.push(
+      `stealth must be one of on, off (got "${cfg.stealth.profile}"). Use --stealth on|off or --noStealth.`,
+    );
+  }
   return errors;
 }
 
@@ -404,6 +417,22 @@ function loadConfig(argv = process.argv.slice(2)) {
       resolved: null,
     },
 
+    // Phase 2.5 — Stealth hardening (playwright-extra + stealth plugin + custom
+    // init-script patches for navigator.webdriver, chrome.runtime, plugins.length,
+    // permissions.query, outerWidth/Height, Notification.permission, etc.).
+    //   --noStealth / STEALTH=off       → profile 'off' (Phase 1/2.4 behavior preserved)
+    //   --stealth on / STEALTH=on       → playwright-extra + stealth plugin + custom patches (DEFAULT)
+    //   --stealthDebug                  → init script emits console.warn per patch applied
+    // Stealth is ON by default in Phase 2.5 — it complements (not replaces) the fingerprint.
+    stealth: {
+      profile: cli.noStealth || process.env.STEALTH === 'off'
+        ? 'off'
+        : (cli.stealth || process.env.STEALTH || 'on'),
+      debug: !!cli.stealthDebug || process.env.STEALTH_DEBUG === 'true',
+      // Resolved at runtime in index.js into { enabled, debug } for launchBrowser().
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -477,6 +506,15 @@ Optional:
                              userAgent, platform, locale, timezone, viewport, etc.
   --noFingerprint            Phase 2.4 — disable randomization (Phase 1 behavior)
 
+  --stealth on|off           Phase 2.5 — stealth hardening (default: on)
+                             Patches navigator.webdriver, chrome.runtime,
+                             plugins.length, permissions.query, outerWidth/Height
+                             via playwright-extra + stealth plugin + custom
+                             init script. Complements (not replaces) fingerprint.
+  --noStealth                Phase 2.5 — alias for --stealth off
+  --stealthDebug             Phase 2.5 — log every patch applied + resulting
+                             navigator properties (for debugging detection)
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
@@ -504,6 +542,11 @@ Examples:
   npm start -- --query "Cafe" --location "Berlin" --noFingerprint   # Phase 1 behavior
   npm start -- --query "Cafe" --location "Berlin" --fingerprintProfile fixed \
     --fixedFingerprint '{"userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131","platform":"Win32","locale":"en-US","timezone":"America/New_York","languages":["en-US","en"],"viewport":{"width":1920,"height":1080},"screen":{"width":1920,"height":1080},"webglVendor":"Intel Inc.","webglRenderer":"Intel(R) UHD Graphics 630","canvasNoiseSeed":42,"hardwareConcurrency":8,"deviceMemory":8,"geolocation":{"latitude":40.7128,"longitude":-74.006}}'
+
+  # Phase 2.5 — stealth hardening (on by default)
+  npm start -- --query "Cafe" --location "Berlin"               # stealth on (default)
+  npm start -- --query "Cafe" --location "Berlin" --noStealth   # disable stealth (Phase 1/2.4 behavior)
+  npm start -- --query "Cafe" --location "Berlin" --stealthDebug   # log every patch applied
 
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun

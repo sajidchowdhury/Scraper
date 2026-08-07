@@ -272,6 +272,35 @@ async function main() {
   // Store on cfg so downstream code (banner, future worker pool) can read it.
   cfg.fingerprint.resolved = fingerprint;
 
+  // Phase 2.5 — resolve the stealth config. Stealth is ON by default in
+  // Phase 2.5; --noStealth / STEALTH=off disables it. --stealthDebug turns on
+  // per-patch console.warn output from the init script (for debugging which
+  // patches applied + the resulting navigator properties).
+  //
+  // Stealth complements (not replaces) the fingerprint:
+  //   fingerprint → WHO the browser claims to be (UA, platform, WebGL vendor, ...)
+  //   stealth     → WHETHER the browser looks automated (webdriver, chrome.runtime,
+  //                 plugins.length, permissions.query, outerWidth/Height, ...)
+  // A real Chrome user has BOTH a coherent identity AND no automation signals.
+  const stealthConfig = {
+    enabled: cfg.stealth.profile === 'on',
+    debug: cfg.stealth.debug,
+  };
+  cfg.stealth.resolved = stealthConfig;
+  if (stealthConfig.enabled) {
+    logger.info('Phase 2.5 — stealth hardening enabled', {
+      profile: cfg.stealth.profile,
+      debug: stealthConfig.debug,
+      hint: stealthConfig.debug
+        ? 'Init script will emit console.warn per patch — visible in browser console'
+        : 'Use --stealthDebug to see which patches applied',
+    });
+  } else {
+    logger.info('Phase 2.5 — stealth hardening disabled (Phase 1/2.4 behavior)', {
+      reason: '--noStealth flag or STEALTH=off',
+    });
+  }
+
   // Phase 1.10 — startup banner. Prints the resolved config and waits 1s so
   // the operator can eyeball it and Ctrl-C if it looks wrong. Skipped (no
   // delay) when --yes is set, for scripted / CI runs.
@@ -486,6 +515,9 @@ async function main() {
       // Phase 2.4 — pass the per-run fingerprint through to launchBrowser.
       // null when --noFingerprint / profile 'off' → Phase 1 context defaults.
       fingerprint: cfg.fingerprint.resolved,
+      // Phase 2.5 — pass the stealth config through to launchBrowser.
+      // { enabled: false } when --noStealth → vanilla playwright, no patches.
+      stealth: cfg.stealth.resolved,
       onBlocked: ({ status, url, count }) => {
         logger.warn('Google returned a block-status response', { status, url, count });
         // Phase 2.3 — a 429/503 from Google while using a proxy is a strong

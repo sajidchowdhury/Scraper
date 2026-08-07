@@ -44,20 +44,97 @@
  *     pickUserAgent() + cfg.viewport + 'en-US' + 'America/Toronto'.
  *   - The "Browser launched" log line records the fingerprint summary so the
  *     JSON log can be cross-referenced with block events.
+ *
+ * Phase 2.5 changes:
+ *   - launchBrowser now accepts opts.stealth = { enabled, debug }. When
+ *     enabled, the browser is launched via playwright-extra with the
+ *     puppeteer-extra-plugin-stealth plugin applied, AND the custom
+ *     src/stealth-patches.js init script is injected (covering the bot
+ *     signals the plugin misses: chrome.runtime, plugins.length,
+ *     permissions.query, outerWidth/Height, Notification.permission,
+ *     navigator.vendor, maxTouchPoints). The stealth patches run AFTER the
+ *     fingerprint init script and yield to its overrides.
+ *   - When stealth is disabled (--stealth off), the browser is launched via
+ *     vanilla 'playwright' (Phase 1/2.4 behavior preserved exactly). This
+ *     keeps the stealth layer fully opt-in and A/B-testable.
+ *   - Stealth launch args (--disable-blink-features=AutomationControlled,
+ *     --disable-infobars, --no-first-run, --disable-dev-shm-usage) are
+ *     merged into chromium.launch({ args }) when stealth is on. These are
+ *     the single most effective anti-detection measure — without
+ *     --disable-blink-features=AutomationControlled, Chromium sets
+ *     navigator.webdriver = true at the Blink level, which is the #1 bot
+ *     signal Google checks.
+ *   - The "Browser launched" log line records the stealth state (on/off,
+ *     debug on/off, patch count) so the JSON log can be cross-referenced
+ *     with block events.
  */
 
-const { chromium } = require('playwright');
+// Phase 2.5 — choose the chromium launcher dynamically. When stealth is
+// enabled, we use playwright-extra (which supports .use(plugin)) with the
+// puppeteer-extra-plugin-stealth plugin. When stealth is disabled, we use
+// vanilla playwright to preserve Phase 1/2.4 behavior exactly.
+//
+// We require BOTH lazily inside launchBrowser() so a broken playwright-extra
+// install never affects --stealth off runs, and so the stealth module is
+// testable in isolation (tests can stub both launchers).
+const vanillaPlaywright = require('playwright');
 const { pickUserAgent, attachBlockWatcher } = require('./antiblock');
 const {
   buildContextOptions,
   applyFingerprintToContext,
   summarizeFingerprint,
 } = require('./fingerprint');
+const {
+  applyStealthPatches,
+  buildStealthLaunchArgs,
+  STEALTH_PATCHES,
+} = require('./stealth-patches');
+
+/**
+ * Resolve the chromium launcher + stealth plugin state based on opts.
+ * Returns { chromium, stealthPluginApplied }.
+ *
+ * - stealth enabled  → playwright-extra chromium with stealth plugin use()d
+ * - stealth disabled → vanilla playwright chromium (no plugin)
+ *
+ * The stealth plugin is applied ONCE per process (playwright-extra's .use()
+ * is idempotent). We guard against double-use() with a module-level flag.
+ */
+let _stealthPluginApplied = false;
+function resolveChromiumLauncher(stealthEnabled) {
+  if (!stealthEnabled) {
+    return { chromium: vanillaPlaywright.chromium, stealthPluginApplied: false };
+  }
+  try {
+    const { chromium: extraChromium } = require('playwright-extra');
+    const stealth = require('puppeteer-extra-plugin-stealth');
+    if (!_stealthPluginApplied) {
+      extraChromium.use(stealth());
+      _stealthPluginApplied = true;
+    }
+    return { chromium: extraChromium, stealthPluginApplied: true };
+  } catch (err) {
+    // playwright-extra or stealth plugin not installed — fall back to vanilla.
+    // This is a non-fatal degradation: the custom stealth-patches.js init
+    // script still runs (covering chrome.runtime, plugins, permissions,
+    // etc.), but the plugin-level patches (CDP-level webdriver removal,
+    // runtime.enable evasion) are skipped.
+    return { chromium: vanillaPlaywright.chromium, stealthPluginApplied: false, pluginError: err.message };
+  }
+}
 
 async function launchBrowser(cfg, opts = {}) {
   const rawLogger = opts.logger || null;
   // Phase 1.9 — bind every launch-related line to the 'browser' phase.
   const log = rawLogger && rawLogger.phase ? rawLogger.phase('browser') : rawLogger;
+
+  // Phase 2.5 — resolve the chromium launcher + stealth plugin state.
+  // stealth.enabled defaults to true (Phase 2.5 turns stealth ON by default).
+  // --stealth off disables both the plugin AND the custom patches.
+  const stealthOpts = opts.stealth || { enabled: false, debug: false };
+  const stealthEnabled = !!stealthOpts.enabled;
+  const stealthDebug = !!stealthOpts.debug;
+  const { chromium, stealthPluginApplied, pluginError } = resolveChromiumLauncher(stealthEnabled);
 
   // Phase 2.3 — build the Playwright launch options. If a proxy descriptor is
   // supplied (from the proxy pool), pass it through. Playwright expects:
@@ -77,6 +154,13 @@ async function launchBrowser(cfg, opts = {}) {
       ...(opts.proxy.username ? { username: opts.proxy.username } : {}),
       ...(opts.proxy.password ? { password: opts.proxy.password } : {}),
     };
+  }
+  // Phase 2.5 — merge stealth launch args when stealth is enabled.
+  // --disable-blink-features=AutomationControlled is the single most
+  // important arg: it suppresses navigator.webdriver at the Blink level,
+  // which is far more robust than patching it in-page after the fact.
+  if (stealthEnabled) {
+    launchOpts.args = buildStealthLaunchArgs(cfg);
   }
 
   const browser = await chromium.launch(launchOpts);
@@ -109,6 +193,20 @@ async function launchBrowser(cfg, opts = {}) {
     await applyFingerprintToContext(context, opts.fingerprint, { logger: rawLogger });
   }
 
+  // Phase 2.5 — inject the custom stealth patches. Runs AFTER the fingerprint
+  // script so it can detect (and yield to) the fingerprint's overrides for
+  // navigator.languages + WebGL getParameter. The stealth patches cover the
+  // bot-detection surfaces the fingerprint script never touches: webdriver,
+  // chrome.runtime, plugins.length, permissions.query, outerWidth/Height,
+  // Notification.permission, navigator.vendor, maxTouchPoints.
+  //
+  // Only injected when stealth is enabled (--stealth on, the default). With
+  // --stealth off, this entire block is skipped, preserving Phase 1/2.4
+  // behavior exactly.
+  if (stealthEnabled) {
+    await applyStealthPatches(context, { debug: stealthDebug, logger: rawLogger });
+  }
+
   context.setDefaultTimeout(cfg.navTimeoutMs || 60000);
 
   const page = await context.newPage();
@@ -119,6 +217,9 @@ async function launchBrowser(cfg, opts = {}) {
   // cross-referenced with the proxy burn log (data/proxy_burn_log.jsonl).
   // Phase 2.4 — also record the fingerprint summary so block events can be
   // correlated with the exact fingerprint that triggered them.
+  // Phase 2.5 — also record the stealth state (on/off, plugin applied, patch
+  // count, debug on/off) so block events can be correlated with the stealth
+  // config that was active.
   if (log) {
     const fp = opts.fingerprint;
     const launched = {
@@ -141,6 +242,21 @@ async function launchBrowser(cfg, opts = {}) {
         deviceMemory: fp.deviceMemory,
       };
     }
+    if (stealthEnabled) {
+      launched.stealth = {
+        enabled: true,
+        pluginApplied: stealthPluginApplied,
+        pluginError: pluginError || null,
+        patchCount: STEALTH_PATCHES.length,
+        debug: stealthDebug,
+        launchArgs: buildStealthLaunchArgs(cfg),
+      };
+    } else {
+      launched.stealth = { enabled: false };
+    }
+    const stealthTag = stealthEnabled
+      ? ` [stealth: ${stealthPluginApplied ? 'plugin+' : ''}${STEALTH_PATCHES.length} patches${stealthDebug ? ' debug' : ''}${pluginError ? ' PLUGIN-FAIL' : ''}]`
+      : ' [stealth: off]';
     if (opts.proxy && opts.proxy.server) {
       launched.proxy = {
         id: opts.proxy.id || null,
@@ -152,13 +268,15 @@ async function launchBrowser(cfg, opts = {}) {
       log.info(
         `Browser launched via proxy ${opts.proxy.id || opts.proxy.server}` +
           (opts.proxy.provider ? ` (provider: ${opts.proxy.provider})` : '') +
-          (fingerprintSummary ? ` [fp: ${fingerprintSummary}]` : ''),
+          (fingerprintSummary ? ` [fp: ${fingerprintSummary}]` : '') +
+          stealthTag,
         launched,
       );
     } else {
       log.info(
         'Browser launched (direct — no proxy)' +
-          (fingerprintSummary ? ` [fp: ${fingerprintSummary}]` : ''),
+          (fingerprintSummary ? ` [fp: ${fingerprintSummary}]` : '') +
+          stealthTag,
         launched,
       );
     }
@@ -214,11 +332,24 @@ async function closeBrowser(browser) {
  *   const fingerprint = generateFingerprint({ logger });
  *   const result = await withBrowser(cfg, async ({ page }) => { ... },
  *                                    { fingerprint, logger });
+ *
+ * Phase 2.5: pass { stealth: { enabled, debug } } in the third arg to enable
+ * the stealth layer (playwright-extra + stealth plugin + custom init-script
+ * patches). When omitted or { enabled: false }, vanilla playwright is used
+ * (Phase 1/2.4 behavior preserved). --stealth off in the CLI sets enabled:false.
+ *   const result = await withBrowser(cfg, async ({ page }) => { ... },
+ *                                    { fingerprint, stealth: { enabled: true }, logger });
  */
 async function withBrowser(cfg, fn, opts = {}) {
   const { browser, page } = await launchBrowser(cfg, opts);
   try {
-    return await fn({ browser, page, proxy: opts.proxy || null, fingerprint: opts.fingerprint || null });
+    return await fn({
+      browser,
+      page,
+      proxy: opts.proxy || null,
+      fingerprint: opts.fingerprint || null,
+      stealth: opts.stealth || null,
+    });
   } finally {
     if (typeof page._antiblockDetach === 'function') {
       try {

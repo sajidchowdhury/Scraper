@@ -29,6 +29,9 @@ function cleanEnv() {
   delete process.env.NO_FINGERPRINT;
   delete process.env.FINGERPRINT_PROFILE;
   delete process.env.FIXED_FINGERPRINT;
+  // Phase 2.5 — stealth env vars
+  delete process.env.STEALTH;
+  delete process.env.STEALTH_DEBUG;
 }
 
 describe('Phase 1.7 — CLI flag parsing', () => {
@@ -334,5 +337,123 @@ describe('Phase 2.4 — HELP_TEXT', () => {
   test('includes Phase 2.4 examples', () => {
     expect(HELP_TEXT).toContain('Phase 2.4 — fingerprint randomization');
     expect(HELP_TEXT).toContain('--noFingerprint   # Phase 1 behavior');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2.5 — stealth config flags
+// ---------------------------------------------------------------------------
+
+describe('Phase 2.5 — stealth CLI flag parsing', () => {
+  beforeEach(() => cleanEnv());
+
+  test('default: stealth.profile = "on" (on by default in Phase 2.5)', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin']);
+    expect(cfg.stealth.profile).toBe('on');
+    expect(cfg.stealth.debug).toBe(false);
+    expect(cfg.stealth.resolved).toBeNull(); // resolved later in index.js
+  });
+
+  test('--noStealth sets profile to "off"', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin', '--noStealth']);
+    expect(cfg.stealth.profile).toBe('off');
+  });
+
+  test('--stealth off sets profile to "off"', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin', '--stealth', 'off']);
+    expect(cfg.stealth.profile).toBe('off');
+  });
+
+  test('--stealth on sets profile explicitly', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin', '--stealth', 'on']);
+    expect(cfg.stealth.profile).toBe('on');
+  });
+
+  test('--stealthDebug sets debug flag', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin', '--stealthDebug']);
+    expect(cfg.stealth.debug).toBe(true);
+  });
+
+  test('STEALTH=off env sets profile to "off"', () => {
+    process.env.STEALTH = 'off';
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin']);
+    expect(cfg.stealth.profile).toBe('off');
+  });
+
+  test('STEALTH=on env is honored', () => {
+    process.env.STEALTH = 'on';
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin']);
+    expect(cfg.stealth.profile).toBe('on');
+  });
+
+  test('STEALTH_DEBUG=true env sets debug flag', () => {
+    process.env.STEALTH_DEBUG = 'true';
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin']);
+    expect(cfg.stealth.debug).toBe(true);
+  });
+
+  test('--noStealth overrides --stealth on', () => {
+    const cfg = loadConfig([
+      '--query', 'Cafe', '--location', 'Berlin',
+      '--stealth', 'on', '--noStealth',
+    ]);
+    expect(cfg.stealth.profile).toBe('off');
+  });
+});
+
+describe('Phase 2.5 — stealth validation', () => {
+  beforeEach(() => cleanEnv());
+
+  test('invalid stealth value → error', () => {
+    const cfg = loadConfig([
+      '--query', 'Cafe', '--location', 'Berlin',
+      '--stealth', 'bogus',
+    ]);
+    expect(cfg.errors).toContainEqual(
+      expect.stringContaining('stealth must be one of on, off'),
+    );
+  });
+
+  test('profile on → no stealth errors', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin']);
+    const stealthErrors = cfg.errors.filter((e) => e.toLowerCase().includes('stealth'));
+    expect(stealthErrors).toEqual([]);
+  });
+
+  test('profile off → no stealth errors', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin', '--noStealth']);
+    const stealthErrors = cfg.errors.filter((e) => e.toLowerCase().includes('stealth'));
+    expect(stealthErrors).toEqual([]);
+  });
+
+  test('--stealthDebug alone (without --stealth) → no errors', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin', '--stealthDebug']);
+    const stealthErrors = cfg.errors.filter((e) => e.toLowerCase().includes('stealth'));
+    expect(stealthErrors).toEqual([]);
+    expect(cfg.stealth.debug).toBe(true);
+  });
+});
+
+describe('Phase 2.5 — HELP_TEXT', () => {
+  beforeEach(() => cleanEnv());
+
+  test('includes --stealth', () => {
+    expect(HELP_TEXT).toContain('--stealth on|off');
+    expect(HELP_TEXT).toContain('stealth hardening');
+  });
+
+  test('includes --noStealth', () => {
+    expect(HELP_TEXT).toContain('--noStealth');
+    expect(HELP_TEXT).toContain('alias for --stealth off');
+  });
+
+  test('includes --stealthDebug', () => {
+    expect(HELP_TEXT).toContain('--stealthDebug');
+    expect(HELP_TEXT).toContain('log every patch applied');
+  });
+
+  test('includes Phase 2.5 examples', () => {
+    expect(HELP_TEXT).toContain('Phase 2.5 — stealth hardening');
+    expect(HELP_TEXT).toContain('--noStealth   # disable stealth');
   });
 });
