@@ -1276,6 +1276,37 @@ Optional:
   --version                  Print version and exit
   --help, -h                 Show this help
 
+Phase 2 flags by category (quick reference):
+  Proxy:        --proxyStrategy --sessionLength --proxyCooldownMs --proxyListFile
+                --proxyHealthCheck --noProxy --workerProxyStrategy
+  Stealth:      --fingerprintProfile --fixedFingerprint --noFingerprint
+                --stealth --noStealth --stealthDebug
+  Concurrency:  --workers --workerCrashLimit --workerCooldownMs
+                --workerLoadBalancer --workerDetailBatchSize --workerTaskRetries
+  Queue:        --queue --redisUrl --queuePriority --queueAttempts --queueConcurrency
+  DB:           --output db | csv,json,db | all
+  Cache:        --incremental --listFreshnessDays --detailCacheTtlDays
+                --detailRefreshOnReviewDelta --noDetailCache --swrr
+  CAPTCHA:      --captchaProvider --captchaApiKey --captchaBudget
+                --captchaFallbackProvider --noCaptchaSolve
+  Health:       --contextRestartEvery --maxHeapMb --maxRssMb --endless
+                --healthCheckIntervalMs --healthPort --healthHost --noHealthServer
+                --skipHealthCheck --autoDiscover --selectorDebugDump --maxSelectorAge
+  Session:      --sessionMaxRequests --sessionMaxAgeMs --warmup --noWarmup
+                --warmupDurationMs --accountWarmup --accountsFile
+
+Phase 2 Quick Start — the definitive 10,000-listing overnight run:
+  # 1. Start infrastructure (one-time): docker compose up -d + npm run db:migrate
+  # 2. Populate .env: DATABASE_URL, REDIS_URL, CAPTCHA_API_KEY, PROXY_LIST_FILE
+  # 3. Submit the 52-query batch to the queue:
+  npm run batch -- --file queries-10k.csv --queue on
+  # 4. Run the 5-worker pool overnight (the canonical Phase 2 command):
+  npm start -- --workers 5 --queue on --incremental --deepScrape true \\
+    --captchaProvider 2captcha --proxyStrategy random --sessionLength 50 --endless
+  # 5. Monitor: npm run queue:status   (live, refreshes 2s)
+  # 6. Review: benchmarks/phase2-10k-run.json   (populated by scripts/run-10k.sh)
+  # Or run the whole flow with: ./scripts/run-10k.sh
+
 Examples:
   # Real runs — write CSV + JSON + summary to ./data/
   npm start -- --query "Cafe" --location "Berlin" --maxResults 50

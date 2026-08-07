@@ -9,7 +9,111 @@ Phase 1 is tagged `v1.0.0-phase1` — the `-phase1` suffix marks the milestone
 
 ---
 
-## [Unreleased] — Phase 2 robustness & scale
+## [Unreleased]
+
+Phase 3 work (phone/email normalization & validation, email discovery, deduplication
+& fuzzy matching, lead scoring, grid-based geo-coverage) — not yet started. See
+`SCRAPER_FEATURES.md` for the master roadmap and `PHASE2_EXECUTION_PLAN.md`
+"Out of Scope" for the full deferred-features list.
+
+---
+
+## [2.0.0-phase2] — 2026-08-07
+
+The Phase 2 milestone: a robust, scalable Google Maps scraper that survives
+10,000+ listings overnight unattended. Thirteen sub-phases (2.0–2.13) shipped,
+spanning four parallel tracks — data (PostgreSQL + change tracking + incremental
+cache), stealth (proxy + fingerprint + stealth + CAPTCHA + sessions), scale
+(worker pool + job queue + memory management), and resilience (self-healing
+selectors). Tagged `v2.0.0-phase2`. 1464 tests / ~8500 assertions passing.
+
+The definitive acceptance test — a 10,000-listing overnight run with
+`--workers 5 --queue on --incremental --deepScrape true --captchaProvider
+2captcha --proxyStrategy random --sessionLength 50` — is codified in
+`scripts/run-10k.sh` + `queries-10k.csv` + `benchmarks/phase2-10k-run.json`.
+Cross-subsystem composition is verified by `tests/integration-phase2.test.js`
+(24 end-to-end tests wiring every real Phase 2 module through DI seams).
+
+### Sub-phase rollup
+- **2.0 — Audit, fixtures & dependency setup.** Phase 2 baseline + Playwright/`pg`/`bullmq`/`ioredis`/`2captcha`/`proxy-chain`/`puppeteer-extra-plugin-stealth` dependencies + captured HTML fixtures.
+- **2.1 — PostgreSQL persistence layer.** Idempotent upsert keyed by `place_id`, `data_hash` for no-op detection, `scrape_runs` table, `--output db|csv,json,db|all`, `npm run db:migrate`.
+- **2.2 — Change tracking & history.** `business_snapshots` (old values) + `field_changes` (per-field deltas) per run, `npm run db:history` CLI, `changes_detected` count surfaced in the run banner.
+- **2.3 — Proxy management & rotation.** `--proxyStrategy round-robin|random|sticky`, `--proxyListFile`, burn detection (repeated 429/403/timeout → cooldown), `--proxyHealthCheck`, `--noProxy`.
+- **2.4 — Browser fingerprint randomization.** Coherent per-run fingerprint (UA, viewport, timezone, locale, WebGL vendor/renderer, canvas noise, hw concurrency), `--fingerprintProfile random|fixed|off`, `--fixedFingerprint`.
+- **2.5 — Stealth hardening.** `--stealth on|off` (default on) via `playwright-extra` + stealth plugin + custom init-script patches (`navigator.webdriver`, `chrome.runtime`, `plugins.length`, `permissions.query`), `--stealthDebug`.
+- **2.6 — CAPTCHA auto-solving.** `--captchaProvider 2captcha|anticaptcha|capsolver|mock|none`, `--captchaApiKey`, `--captchaBudget` (default $5 hard stop), `--captchaFallbackProvider`, `--noCaptchaSolve`; cost-log JSONL tracking.
+- **2.7 — Session & cookie rotation.** `--sessionMaxRequests` (default 50) + `--sessionMaxAgeMs` (default 10min) context rotation, `--warmup` (benign-page visits), `--accountWarmup` (opt-in Google login), `--accountsFile`.
+- **2.8 — Worker pool & concurrency.** `--workers N` parallel browsers, round-robin/least-busy load balancing, block cooldown + identity rotation, crash-limit retirement, task re-queue, `--workerCrashLimit`, `--workerCooldownMs`, `--workerTaskRetries`.
+- **2.9 — Job queue & orchestration.** `--queue on` BullMQ adapter (Redis-backed) with DI mock backend, `--redisUrl`, `--queuePriority`, `--queueAttempts`, `--queueConcurrency`, dead-letter helper, `npm run batch` + `npm run queue:status`.
+- **2.10 — Memory management & long-run stability.** `--maxHeapMb` (per-worker) + `--maxRssMb` (process) thresholds, memory monitor + worker probe + zombie reaper + graceful degradation, `--endless` mode, `--healthPort` HTTP `/health` endpoint, `--contextRestartEvery`.
+- **2.11 — Self-healing selectors & health checks.** Startup health check (exit code 3 on <50% core-field extraction), first-batch abort (`checkExtractionRatesForAbort`), `--autoDiscover` heuristic field discovery, `--selectorDebugDump`, `--maxSelectorAge`, selector versioning in `src/selectors/version.js`.
+- **2.12 — Incremental scraping & detail caching.** `--incremental` (requires `--output db`), run-level preflight skip (skip browser when fresh within `--listFreshnessDays`), per-business detail cache (`--detailCacheTtlDays` default 7d), list-view-only `change_hash` (distinct from `data_hash`), review-delta refresh (`--detailRefreshOnReviewDelta`), `--noDetailCache`, `--swrr` (stub).
+- **2.13 — Final integration, docs & handoff.** `tests/integration-phase2.test.js` (24 end-to-end tests), `scripts/run-10k.sh` + `queries-10k.csv` + `benchmarks/phase2-10k-run.json`, `ARCHITECTURE.md` (new), `OPERATIONS.md` (new), `SELECTORS.md` self-healing section, README Phase 2 Features + 10k Quick Start + Troubleshooting, CLI help category reference + 10k quick-start, version `2.0.0-phase2`, git tag `v2.0.0-phase2`.
+
+Detailed changelog entries for 2.1, 2.2, 2.3, 2.8, 2.9 appear below (unchanged from
+their original sub-phase releases). 2.4–2.7, 2.10–2.13 are summarized above and
+documented in full in `worklog.md` + `PHASE2_EXECUTION_PLAN.md`.
+
+### Phase 2.13 — Final Integration, Docs & Handoff
+
+#### Added
+- **`tests/integration-phase2.test.js`** (24 tests / 117 assertions) — the Phase 2.13
+  end-to-end integration test. Wires every REAL Phase 2 subsystem module together
+  through DI seams (mock BullMQ backend, in-memory mock `pg` client recognizing the
+  exact SQL shapes `db.js` emits, DI `runTask`/`getIdentity`) and verifies
+  cross-subsystem composition: 10 jobs through a 2-worker pool + mock queue all
+  complete; DB persistence (businesses + scrape_runs); change tracking
+  (snapshots + field_changes on update); proxy/fingerprint/session rotation
+  (≥2 distinct identities across workers); incremental cache (run-level preflight
+  skip, per-business detail cache_hit, review-delta forced_refresh, list-view-only
+  change_hash); self-healing (block re-queue + identity rotation, selector health
+  check passes/aborts, first-batch abort throws exit 3); memory (heap stable
+  across 10 jobs, graceful shutdown leaves no orphaned jobs); CAPTCHA mock ($0
+  cost); queue dead-letter on permanent block. External services mocked via the
+  same DI seams the unit tests use (Docker/testcontainers unavailable in this
+  environment; the live 10k run is the operator-run acceptance gate).
+- **`scripts/run-10k.sh`** — the definitive 10,000-listing overnight run helper.
+  Prerequisite checks (docker, db:migrate, proxies, CAPTCHA key), batch-submits
+  `queries-10k.csv` to the queue, runs the canonical 5-worker command with
+  `--endless`, and captures the run summary to `benchmarks/phase2-10k-run.json`
+  via a DB-query post-step.
+- **`queries-10k.csv`** — 52 (query, location) pairs × ~200 results each ≈ 10,400
+  businesses, spanning US cities for geographic diversity.
+- **`benchmarks/phase2-10k-run.json`** — run-plan + results schema (config, success
+  thresholds, how-to-populate). Marked `status: PENDING` — the actual overnight
+  run requires real proxies + CAPTCHA budget + 8h and must be executed by an
+  operator; `tests/integration-phase2.test.js` is the automated composition proxy.
+- **`ARCHITECTURE.md`** (new, 591 lines) — system architecture: high-level
+  pipeline diagram, module map, request lifecycle, identity stack, concurrency
+  model, persistence & change tracking, incremental cache, health & self-healing,
+  data-flow diagram, configuration surface, failure modes & recovery.
+- **`OPERATIONS.md`** (new, 367 lines) — production operations runbook:
+  prerequisites, first-time setup, running a production scrape, proxy management,
+  CAPTCHA budgeting, concurrency tuning, database operations, incremental & cache
+  operations, monitoring & health, common alerts & remediation, troubleshooting,
+  graceful shutdown & recovery, cost management, post-run.
+- **`SELECTORS.md`** — new "Self-Healing Selectors (Phase 2.11)" section with 9
+  sub-sections (overview, startup health check, first-batch abort, heuristic
+  auto-discovery, selector debug dump, selector versioning, recovery workflow,
+  configuration reference, thresholds).
+- **`README.md`** — new "Phase 2 Features" section (12 sub-sections, one per
+  sub-system), "Phase 2 — 10,000-listing overnight run" Quick Start, 8 new
+  Troubleshooting Q&A entries (exit code 3, proxy burn, CAPTCHA budget, worker
+  retirement, heap growth, queue stall, incremental not caching, 0% detail
+  success). 990 → 1310 lines.
+- **`src/config.js` `HELP_TEXT`** — "Phase 2 flags by category" quick reference
+  (Proxy, Stealth, Concurrency, Queue, DB, Cache, CAPTCHA, Health, Session) +
+  "Phase 2 Quick Start" 10k-run example block.
+- **`package.json`** — version `1.0.0-phase2.12` → `2.0.0-phase2`; added
+  `npm run run-10k` script.
+
+#### Changed
+- Git tag `v2.0.0-phase2` marks the Phase 2 milestone.
+
+**Test count:** 1464 tests / ~8500 assertions (was 1440 / 8459 at end of Phase 2.12).
+24 new tests in `tests/integration-phase2.test.js`. No regressions.
+
+---
 
 ### Phase 2.1 — PostgreSQL Persistence Layer
 

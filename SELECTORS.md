@@ -265,60 +265,89 @@ HTML fixture cards that match the live Maps DOM. When you add a new
 selector, add a fixture card that exercises it — this catches regressions
 when Google changes the DOM again.
 
-## Self-healing selectors (Phase 2.11)
+## Self-Healing Selectors (Phase 2.11)
 
-Phase 2.11 adds a self-healing layer on top of the fallback-chain pattern:
-when all selectors for a field miss, the scraper falls back to pattern-based
-discovery, and when extraction rates drop below a threshold, it aborts early
-+ dumps the DOM for the operator to craft a fix. This section documents the
-four layers of defense and how to use them.
+### Overview
 
-### Layer 1 — Selector versioning (`src/selectors/version.js`)
+Google reshuffles the Google Maps DOM every few weeks — classes are renamed,
+containers are wrapped, and `aria-label` text drifts. Phase 2.11 adds a
+self-healing layer on top of the fallback-chain pattern documented above so a
+DOM change no longer means a silent 0% extraction run that wastes time and
+proxy budget before a human notices.
 
-Every selector set (list-view, detail-panel, search-feed, scroll-markers)
-has a `version` and `lastVerifiedDate` in `src/selectors/version.js`. On
-startup the scraper logs the active version:
+The subsystem lives under `src/selectors/` (barrel export:
+`src/selectors/index.js`) and has four active defensive layers plus one
+passive layer:
 
-```
-[selectors] Selectors list v3 (last verified 2026-08-07, 12 days ago)
-[selectors] Selectors detail v2 (last verified 2026-08-07, 12 days ago)
-```
+1. **Startup health check** (`src/selectors/health-check.js`) — loads a
+   known-good HTML fixture, runs `extractBusinesses`, and aborts the run
+   (exit code 3) if the core fields (name, rating, reviews_count, address)
+   extract below 50%. Catches a stale selector set *before* the real scrape.
+2. **First-batch abort** (`checkExtractionRatesForAbort` in `src/extract.js`) —
+   after the first `DEFAULT_MIN_SAMPLE_SIZE` (10) businesses of a real scrape,
+   re-checks the core rates and throws a `SelectorFailureError` (exit code 3)
+   if they've dropped. Catches a DOM change the startup check missed.
+3. **Heuristic auto-discovery** (`src/selectors/auto-discover.js`) — when all
+   candidate selectors for a discoverable field (phone, website, rating,
+   reviews_count) miss on a card, scans the card DOM for a pattern match and
+   fills in the field. Logs the suggested selector so an operator can promote
+   it to `src/extract.js`.
+4. **Selector debug dumps** (`src/selectors/debug-dump.js`) — when a field's
+   extraction rate drops below 80%, writes the first 500 chars of each card's
+   innerHTML to `data/selector-debug/{field}_{timestamp}.html`. Gives the
+   developer a DOM sample to craft a new selector without re-running.
 
-If a set is older than `--maxSelectorAge` (default: 30 days), a warning is
-logged:
+A fifth, passive layer — **selector versioning**
+(`src/selectors/version.js`) — tracks a `version` + `lastVerifiedDate` per
+selector set and warns at startup when a set is older than `--maxSelectorAge`
+(default 30 days).
 
-```
-[selectors] WARN: Selectors last verified 45 days ago (list v3) — consider
-re-running the fixture test (bun test tests/selectors-fixture.test.js) and
-bumping the version in src/selectors/version.js if the DOM changed.
-```
+The pure health-evaluation helpers (`evaluateHealth`,
+`checkExtractionRatesForAbort`, `buildSelectorFailureError`, `CORE_FIELDS`,
+`SECONDARY_FIELDS`, `CORE_THRESHOLD_PCT`, `SECONDARY_THRESHOLD_PCT`,
+`DEFAULT_MIN_SAMPLE_SIZE`, `SELECTOR_FAILURE_EXIT_CODE`) live in
+`src/extract.js` to avoid a circular require with
+`src/selectors/health-check.js`; the page-bound `healthCheck` wrapper lives in
+`src/selectors/health-check.js` and re-exports them for convenience.
 
-**When you re-verify selectors against a new fixture**, bump the version
-number and update `lastVerifiedDate` to today's date in
-`src/selectors/version.js`. This is the single source of truth that the
-staleness warning reads from.
+### Startup Health Check
 
-### Layer 2 — Startup health check (`src/selectors/health-check.js`)
+Before the main scrape, `src/index.js` opens a browser, loads the HTML fixture
+(default `tests/fixtures/Cafe_Berlin_feed.html`, captured in Phase 2.0), and
+calls `healthCheck(page, { logger })` from `src/selectors/health-check.js`.
+The wrapper runs `extractBusinesses` against the fixture, optionally runs a
+single auto-discover pass to fill in fields discovery would have caught in a
+real run, then evaluates the extraction rates via `evaluateHealth` (the pure
+helper in `src/extract.js`).
 
-Before the main scrape, the scraper loads a known-good HTML fixture
-(default: `tests/fixtures/Cafe_Berlin_feed.html`), runs `extractBusinesses`,
-and checks the extraction rates:
-
-- **Core fields** (name, rating, reviews_count, address) must extract at
-  ≥ 50%. If any is below, the run is **aborted** with exit code 3 and a
-  clear error message.
-- **Secondary fields** (phone, website, plus_code, etc.) below 30% log a
-  warning but the run continues.
+- **Core fields** (`name`, `rating`, `reviews_count`, `address` — see
+  `CORE_FIELDS` in `src/extract.js`) must each extract at ≥ `CORE_THRESHOLD_PCT`
+  (50%). If any is below, the run is **aborted** with exit code
+  `SELECTOR_FAILURE_EXIT_CODE` (3) and a clear error message.
+- **Secondary fields** (phone, website, plus_code, etc. — see
+  `SECONDARY_FIELDS` in `src/extract.js`) below `SECONDARY_THRESHOLD_PCT` (30%)
+  log a warning but the run continues.
 
 The check takes ~15s (browser launch + fixture load + extraction). Skip it
-with `--skipHealthCheck` for emergency runs.
+with `--skipHealthCheck` (or `SKIP_HEALTH_CHECK=true` / `HEALTH_CHECK=off`) for
+emergency runs.
+
+```bash
+# normal run (health check runs first, ~15s)
+npm start -- --query "Cafe" --location "Berlin"
+
+# emergency run — bypass the health check
+npm start -- --query "Cafe" --location "Berlin" --skipHealthCheck
+```
+
+On pass:
 
 ```
 [selectors] Running extraction-rate health check
 [selectors] Health check passed (total=14, coreRates={name:100%, rating:93%, ...})
 ```
 
-On failure:
+On failure (run aborts, exit code 3):
 
 ```
 [selectors] ERROR: Health check FAILED — aborting run
@@ -332,14 +361,18 @@ On failure:
         to bypass for an emergency run.
 ```
 
-### Layer 3 — First-batch abort (in `src/extract.js`)
+### First-Batch Abort
 
-After the first 10 businesses of a real scrape, `extractBusinesses` checks
-the extraction rates. If any core field is below 50%, it throws a
-`SELECTOR_FAILURE` error with `exitCode=3`. This catches a DOM change that
-the startup check missed (e.g. the fixture was stale but the live page moved
-further). The error is caught in `src/index.js`, which exits with code 3
-and logs the failing fields + a hint to run `scripts/capture-fixtures.js`.
+The startup check only proves the selectors work against the captured fixture;
+the live DOM may have moved on. The runtime check
+(`checkExtractionRatesForAbort` in `src/extract.js`, invoked from inside
+`extractBusinesses` once the first `DEFAULT_MIN_SAMPLE_SIZE` businesses are
+extracted) re-runs `evaluateHealth` against the live extraction rates. If any
+core field is below 50%, it throws a `SelectorFailureError`
+(`code='SELECTOR_FAILURE'`, `exitCode=3`) built by
+`buildSelectorFailureError`. The error propagates to `src/index.js`, which
+logs the failing fields + a hint and exits with code 3. This prevents burning
+a full run (and proxy budget) on a broken DOM that the fixture didn't catch.
 
 ```
 [extract] WARN: Secondary fields below threshold (continuing)
@@ -347,7 +380,7 @@ and logs the failing fields + a hint to run `scripts/capture-fixtures.js`.
   secondaryRates: {phone:25%, website:20%, ...}
 ```
 
-On critical failure (propagates to `src/index.js`):
+On critical failure (propagates to `src/index.js` → exit code 3):
 
 ```
 ERROR: Run aborted — selector failure (extraction rates critically low)
@@ -360,22 +393,35 @@ ERROR: Run aborted — selector failure (extraction rates critically low)
         bypass for an emergency run.
 ```
 
-### Layer 4 — Heuristic auto-discovery (`src/selectors/auto-discover.js`)
+### Heuristic Auto-Discovery
 
-When all selectors for a discoverable field miss on a card, the scraper
-falls back to pattern-based discovery. Discoverable fields:
+When all candidate selectors for a discoverable field miss on a card, the
+scraper falls back to pattern-based discovery in
+`src/selectors/auto-discover.js`. Discovery is **a fallback, not a primary
+strategy** — it's slow (one pass per missing field per card) and produces a
+less-reliable value than a known selector. The intent is to keep extraction
+alive (non-null fields) until a human crafts a new selector.
 
-| Field | Pattern |
+Discoverable fields (the `DISCOVERABLE_FIELDS` array — `name`, `address`,
+`category`, `plus_code`, `open_hours`, `business_status` are intentionally NOT
+discoverable because their text shape is too generic and would produce too
+many false positives):
+
+| Field | Discovery patterns (tried in order) |
 |---|---|
-| `phone` | element with `aria-label*="phone"` + phone regex, OR `a[href^="tel:"]`, OR `[data-item-id*="phone"]`, OR any element whose text matches `^[+]?[\d\s\-()]{7,}$` |
-| `website` | `<a href^="http">` whose host is NOT `google.com` / `maps.google.*` |
-| `rating` | element with `aria-label` containing "rated" or "stars", OR `[role="img"]` with aria-label matching a number |
-| `reviews_count` | element whose text matches `^\(\d[\d,]*\)$` or `^\d[\d,]*\s+reviews?$` |
+| `phone` | element with `aria-label*="phone"` whose text matches `^[+]?[\d\s\-()]{7,}$`; OR `a[href^="tel:"]`; OR `[data-item-id*="phone"]`; OR any element whose text matches the phone regex AND has a `+`, parens, or ≥10 digits (guards against matching review counts / zip codes) |
+| `website` | `<a href^="http">` whose host is NOT `google.com` / `maps.google.*` / `googlemaps.com` (skips `mailto:` / `tel:` / `javascript:`) |
+| `rating` | element with `aria-label` containing `rated` or `stars`; OR `[role="img"]` whose `aria-label` matches a number |
+| `reviews_count` | element whose text matches `^\(\d[\d,]*\)$` (the `(1,234)` form) OR `^\d[\d,]*\s+reviews?$` |
 
-Discovery is a **fallback, not a primary strategy** — it's slow (one pass per
-missing field per card) and produces a less reliable value. The intent is to
-keep extraction alive (non-null fields) when Google changes the DOM, until a
-human can craft a new selector. Every successful discovery is logged so the
+The pure helpers — `buildDiscoveryRequests` (returns
+`[{ cardIndex, fields }]` for cards with missing discoverable fields) and
+`applyDiscoveryResults` (fills in missing fields with optional raw→canonical
+normalizers) — are exported for unit testing. The page-bound entry point
+`discoverMissingFields` runs the inlined `DISCOVERY_SCRIPT` via
+`new Function()` inside one `page.evaluate` round-trip for the whole batch
+(keeps card indexes stable with the extraction loop by re-finding cards via
+`a[href*="/maps/place/"]`). Every successful discovery is logged so the
 operator can copy the suggested selector:
 
 ```
@@ -384,15 +430,18 @@ operator can copy the suggested selector:
   cardIndex: 5, field: phone, value: +49 123 4567890
 ```
 
-Disable with `--autoDiscover off` (discovery is on by default).
+Disable with `--autoDiscover off` (or `AUTO_DISCOVER=off`). Discovery is on by
+default; discovery failures are non-fatal (logged at `warn`).
 
-### Layer 5 — Selector debug dumps (`src/selectors/debug-dump.js`)
+### Selector Debug Dump
 
-When a field's extraction rate drops below 80% (the dump threshold), the
-scraper writes the first 500 chars of each card's innerHTML to
-`data/selector-debug/{field}_{timestamp}.html`. This gives the developer a
-sample of the actual DOM that's failing the selector, so they can craft a
-new selector without re-running the scrape.
+When a field's extraction rate drops below the dump threshold
+(`DEFAULT_DUMP_THRESHOLD_PCT` = 80, in `src/selectors/debug-dump.js`), the
+scraper writes the first 500 chars of each card's `innerHTML` to
+`data/selector-debug/{field}_{timestamp}.html` (timestamp is an ISO date with
+`:`/`.` replaced by `-` for filesystem safety). This gives the developer a
+sample of the actual DOM that's failing the selector, so they can craft a new
+selector without re-running the scrape.
 
 ```
 [extract] WARN: Selector debug dump written for low-rate field: phone
@@ -402,51 +451,93 @@ new selector without re-running the scrape.
         src/extract.js SELECTORS.phone
 ```
 
-Disable with `--selectorDebugDump off` (dumps are on by default). Override
-the directory with `--selectorDebugDir <path>`.
+The dump file format (built by `buildDumpContent`) is an HTML comment header
+(field name, generation timestamp, extraction rate, card count) followed by
+one `<!-- --- Card N --- -->`-delimited block per card containing the first
+500 chars of that card's `innerHTML`. Pure helpers — `shouldDumpForField`
+(respects the `enabled` flag + threshold), `buildDumpPath` (sanitizes field
+name + ISO timestamp), `buildDumpContent` — are exported for unit testing.
+The side-effectful entry point is `dumpSelectorDebug` (`mkdirSync` recursive +
+`writeFileSync`). The card snippets are fetched via `getCardSnippets` in
+`src/extract.js` (a `page.evaluate` that re-finds cards by
+`a[href*="/maps/place/"]` to keep indexes stable with the extraction loop).
 
-### Fixture-based regression test (`tests/selectors-fixture.test.js`)
+Disable with `--selectorDebugDump off` (or `SELECTOR_DEBUG_DUMP=off`). Override
+the dump directory with `--selectorDebugDir <path>` (or `SELECTOR_DEBUG_DIR`).
+Dumps are on by default.
 
-Run `bun test tests/selectors-fixture.test.js` to verify the selectors
-against the captured HTML fixtures. The test loads each fixture in
-`tests/fixtures/*_feed.html`, runs `extractBusinesses`, and asserts:
+### Selector Versioning
 
-- Core fields extract at ≥ 70% (catches selector breakage; allows for
-  legitimate nulls on real fixtures).
-- Secondary fields extract at ≥ 15% (catches total breakage; allows for
-  sparse fields like phone/website that are often detail-panel-only).
+`src/selectors/version.js` exports the `SELECTOR_VERSIONS` registry — one
+entry per selector set (`list`, `detail`, `search`, `scroll`), each with a
+`version` integer, a `lastVerifiedDate` (ISO `YYYY-MM-DD`), the `source`
+file, a description, and the list of `fields` it covers. At startup
+`src/index.js` calls
+`logSelectorVersion(logger, { maxAgeDays: cfg.selectors.maxSelectorAge })`,
+which logs one INFO line per set:
 
-When this test fails, it means Google changed the DOM and a selector needs
-updating. The failure message includes the field name, rate, and a hint to
-run `scripts/capture-fixtures.js` + inspect `data/selector-debug/`.
+```
+[selectors] Selectors list v3 (last verified 2026-08-07, 12 days ago)
+[selectors] Selectors detail v2 (last verified 2026-08-07, 12 days ago)
+[selectors] Selectors search v1 (last verified 2026-08-07, 12 days ago)
+[selectors] Selectors scroll v1 (last verified 2026-08-07, 12 days ago)
+```
 
-### Config flags summary
+If a set is older than `--maxSelectorAge` (default 30 days), a warning is
+logged:
 
-| Flag | Default | Description |
-|---|---|---|
-| `--skipHealthCheck` | off | Skip the startup extraction-rate health check (emergency runs) |
-| `--autoDiscover on\|off` | on | Heuristic field auto-discovery when selectors fail |
-| `--selectorDebugDump on\|off` | on | Write DOM snippets for low-rate fields to `data/selector-debug/` |
-| `--maxSelectorAge <days>` | 30 | Warn when selector sets are older than this |
-| `--selectorDebugDir <path>` | `./data/selector-debug` | Override the debug-dump directory |
+```
+[selectors] WARN: Selectors last verified 45 days ago (list v3) — consider
+re-running the fixture test (bun test tests/selectors-fixture.test.js) and
+bumping the version in src/selectors/version.js if the DOM changed.
+```
 
-### How to update selectors when the DOM changes
+Pure helpers — `parseDate` (with rollover rejection so `2026-02-31` returns
+null), `getSelectorAgeDays`, `isSelectorSetStale`, `getSelectorStatus` — are
+exported for unit testing. **When you re-verify selectors against a new
+fixture**, bump the matching `version` integer AND update `lastVerifiedDate`
+to today's date in `src/selectors/version.js`. This is the single source of
+truth that the startup log and the staleness warning read from.
 
-1. **Run the fixture test** to identify which fields broke:
-   ```bash
-   bun test tests/selectors-fixture.test.js
-   ```
+```js
+// src/selectors/version.js — bump after re-verifying against a fixture
+list: {
+  version: 4,                          // ← bump
+  lastVerifiedDate: '2026-09-15',      // ← today's date (UTC, ISO 8601)
+  source: 'src/extract.js',
+  // ...
+},
+```
+
+### Recovery Workflow
+
+When a scrape crashes with exit code 3 (selector failure), follow this
+workflow:
+
+1. **Confirm it's a selector failure.** Check the exit code (`echo $?`) —
+   code 3 means `SELECTOR_FAILURE_EXIT_CODE` from `src/extract.js`, thrown
+   either by the startup `healthCheck` or by `checkExtractionRatesForAbort`
+   during the first batch. The error message includes `failingCore` and
+   `coreRates`.
 
 2. **Inspect the debug dumps** for the broken field:
    ```bash
    ls data/selector-debug/
    # phone_2026-08-07T12-00-00-000Z.html  rating_2026-08-07T12-00-00-000Z.html
    ```
-   The dump contains the first 500 chars of each card's innerHTML — enough
-   to identify the new DOM structure.
+   Each dump has an HTML comment header (field, timestamp, rate, card count)
+   followed by the first 500 chars of each card's `innerHTML` — enough to
+   identify the new DOM structure.
 
-3. **Add the new selector** at the TOP of the field's array in
-   `src/extract.js` (keep the old ones as fallbacks):
+3. **Re-run the health check against a fresh fixture** to confirm the failure
+   reproduces and to refresh the captured DOM:
+   ```bash
+   npm run capture-fixtures -- --query "Cafe" --location "Berlin"
+   bun test tests/selectors-fixture.test.js
+   ```
+
+4. **Update the selector** at the TOP of the field's array in `src/extract.js`
+   (keep the old ones as fallbacks — Google sometimes reverts DOM changes):
    ```js
    rating: [
      'YOUR_NEW_SELECTOR_HERE',                                // ← add here
@@ -456,21 +547,52 @@ run `scripts/capture-fixtures.js` + inspect `data/selector-debug/`.
    ],
    ```
 
-4. **Bump the version + lastVerifiedDate** in `src/selectors/version.js`:
-   ```js
-   list: {
-     version: 4,                                    // ← bump
-     lastVerifiedDate: '2026-09-15',                // ← today's date
-     // ...
-   },
-   ```
+5. **Bump the `version` + `lastVerifiedDate`** in
+   `src/selectors/version.js` for the set you updated (see the snippet in
+   [Selector Versioning](#selector-versioning) above).
 
-5. **Re-run the fixture test** to confirm the fix:
+6. **Re-run with `--skipHealthCheck` only as a temporary measure** if you
+   need to ship an emergency run before the fix is ready:
    ```bash
-   bun test tests/selectors-fixture.test.js
+   npm start -- --query "Cafe" --location "Berlin" --skipHealthCheck
    ```
+   This bypasses the startup check; the first-batch abort
+   (`checkExtractionRatesForAbort`) is still active, so a genuinely broken
+   DOM will still exit 3.
 
-6. **Re-capture fixtures** if the DOM has changed significantly:
-   ```bash
-   npm run capture-fixtures -- --query "Cafe" --location "Berlin"
-   ```
+### Configuration Reference
+
+All Phase 2.11 flags are parsed in `src/config.js` and exposed under
+`cfg.selectors` (`skipHealthCheck`, `autoDiscover`, `selectorDebugDump`,
+`maxSelectorAge`, `debugDumpDir`, `healthCheckFixture`, `resolved`).
+Validation: `autoDiscover` / `selectorDebugDump` must be boolean;
+`maxSelectorAge` must be 1–365 days.
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--skipHealthCheck` | `SKIP_HEALTH_CHECK=true` (or `HEALTH_CHECK=off`) | off | Skip the startup extraction-rate health check (emergency runs) |
+| `--autoDiscover on\|off` | `AUTO_DISCOVER` | on | Heuristic field auto-discovery when selectors fail |
+| `--selectorDebugDump on\|off` | `SELECTOR_DEBUG_DUMP` | on | Write DOM snippets for low-rate fields to `data/selector-debug/` |
+| `--maxSelectorAge <days>` | `MAX_SELECTOR_AGE` | 30 | Warn when selector sets are older than this |
+| `--selectorDebugDir <path>` | `SELECTOR_DEBUG_DIR` | `./data/selector-debug` | Override the debug-dump directory |
+| — | `HEALTH_CHECK_FIXTURE` | `tests/fixtures/Cafe_Berlin_feed.html` | Path to the HTML fixture used by the startup health check |
+
+### Thresholds
+
+All thresholds are constants. The health-check constants live in
+`src/extract.js` (re-exported through `src/selectors/health-check.js` and the
+barrel `src/selectors/index.js`); the dump threshold lives in
+`src/selectors/debug-dump.js`.
+
+| Constant | Value | Where | Meaning |
+|---|---|---|---|
+| `CORE_THRESHOLD_PCT` | 50 | `src/extract.js` | Core fields must extract at ≥ this %, or the run aborts with exit code 3 |
+| `SECONDARY_THRESHOLD_PCT` | 30 | `src/extract.js` | Secondary fields below this % log a warning but the run continues |
+| `DEFAULT_MIN_SAMPLE_SIZE` | 10 | `src/extract.js` | Both `evaluateHealth` and `checkExtractionRatesForAbort` skip the abort check when `total < minSampleSize` (avoids noise on tiny samples) |
+| `SELECTOR_FAILURE_EXIT_CODE` | 3 | `src/extract.js` | Exit code for selector-failure aborts (startup check + first-batch abort) |
+| `DEFAULT_DUMP_THRESHOLD_PCT` | 80 | `src/selectors/debug-dump.js` | A field's rate below this % triggers a debug dump of the card DOM |
+
+The `CORE_FIELDS` array is `['name', 'rating', 'reviews_count', 'address']`
+(the "money fields" the run is useless without). `SECONDARY_FIELDS` is
+`['price_level', 'category', 'phone', 'website', 'plus_code', 'open_now',
+'business_status', 'is_sponsored']`. Both are defined in `src/extract.js`.

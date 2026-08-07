@@ -1,0 +1,62 @@
+# Phase 2.13 — definitive 10,000-listing overnight run query set.
+# 52 (query, location) pairs x ~200 expected results each ~= 10,400 businesses.
+# Generated to span multiple countries/cities so proxy rotation + session
+# rotation exercise realistic geographic diversity. maxResults=200 caps each
+# query so the total lands near 10k. deepScrape=true (Phase 1.5 detail panels).
+# priority=5 (normal) — all jobs equal priority; the queue processes FIFO.
+#
+# Usage:
+#   ./scripts/run-10k.sh                         # uses this file by default
+#   npm run batch -- --file queries-10k.csv --queue on
+query,location,maxResults,deepScrape,priority
+Restaurant,Toronto,200,true,5
+Cafe,Berlin,200,true,5
+Plumber,New York,200,true,5
+Dentist,London,200,true,5
+Pharmacy,Paris,200,true,5
+Salon,Tokyo,200,true,5
+Gym,Sydney,200,true,5
+Bakery,Chicago,200,true,5
+Florist,Madrid,200,true,5
+Bookstore,Seattle,200,true,5
+Lawyer,Los Angeles,200,true,5
+Doctor,Houston,200,true,5
+Electrician,Miami,200,true,5
+Plumber,Dallas,200,true,5
+Restaurant,San Francisco,200,true,5
+Cafe,Boston,200,true,5
+Dentist,Denver,200,true,5
+Pharmacy,Atlanta,200,true,5
+Salon,Seattle,200,true,5
+Gym,Portland,200,true,5
+Bakery,Austin,200,true,5
+Florist,Nashville,200,true,5
+Bookstore,Minneapolis,200,true,5
+Lawyer,Phoenix,200,true,5
+Doctor,San Diego,200,true,5
+Electrician,Philadelphia,200,true,5
+Plumber,Washington,200,true,5
+Restaurant,Baltimore,200,true,5
+Cafe,Detroit,200,true,5
+Dentist,Milwaukee,200,true,5
+Pharmacy,Kansas City,200,true,5
+Salon,Las Vegas,200,true,5
+Gym,Charlotte,200,true,5
+Bakery,Columbus,200,true,5
+Florist,Indianapolis,200,true,5
+Bookstore,San Jose,200,true,5
+Lawyer,Austin,200,true,5
+Doctor,Jacksonville,200,true,5
+Electrician,Columbus,200,true,5
+Plumber,Fort Worth,200,true,5
+Restaurant,Charlotte,200,true,5
+Cafe,San Francisco,200,true,5
+Dentist,Seattle,200,true,5
+Pharmacy,Denver,200,true,5
+Salon,Boston,200,true,5
+Cafe,Philadelphia,200,true,5
+Bakery,Nashville,200,true,5
+Florist,Miami,200,true,5
+Bookstore,Atlanta,200,true,5
+Lawyer,Houston,200,true,5
+Doctor,Phoenix,200,true,5

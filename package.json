@@ -1,7 +1,7 @@
 {
   "name": "gmaps-scraper",
-  "version": "1.0.0-phase2.12",
-  "description": "Google Maps business scraper — Phase 2 (PostgreSQL persistence, change tracking, proxy/stealth, scale, memory-stable long runs, self-healing selectors, incremental scraping). Phase 1 tagged v1.0.0-phase1.",
+  "version": "2.0.0-phase2",
+  "description": "Google Maps business scraper — Phase 2 (PostgreSQL persistence, change tracking, proxy/stealth, CAPTCHA solving, worker pool, job queue, memory-stable long runs, self-healing selectors, incremental scraping). Phase 2 milestone tagged v2.0.0-phase2.",
   "engines": {
     "node": ">=20"
   },
@@ -16,7 +16,8 @@
     "db:migrate": "node src/db/migrate.js",
     "db:history": "node src/db/history.js",
     "batch": "node scripts/batch.js",
-    "queue:status": "node scripts/queue-status.js"
+    "queue:status": "node scripts/queue-status.js",
+    "run-10k": "bash scripts/run-10k.sh"
   },
   "dependencies": {
     "2captcha": "^3.0.5-2",
