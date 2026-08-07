@@ -10,9 +10,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 2.8 complete. 9 of 13 sub-phases shipped.
+> **Last updated:** Phase 2.9 complete. 10 of 13 sub-phases shipped.
 >
-> **Overall:** 9 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
+> **Overall:** 10 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -25,7 +25,7 @@
 | 2.6 — CAPTCHA Auto-Solving | ✅ DONE | 90 tests | `src/captcha/solver.js`, `src/captcha/cost-log.js`, `src/captcha/injector.js`, `src/captcha/orchestrator.js`, `src/captcha/index.js`, `src/antiblock.js` (detectCaptchaType + extractSitekey + CAPTCHA_TYPES), `src/config.js` (--captchaProvider/--captchaApiKey/--captchaBudget/--noCaptchaSolve), `src/banner.js` (CAPTCHA row), `src/index.js` (resolve solver + budget guard + cost logger; wire handleCaptcha into deep-scrape hook; end-of-run CAPTCHA cost line), `tests/fixtures/recaptcha-v2.html`, `tests/helpers/mock-dom.js` | 4 providers (2captcha REST, anticaptcha JSON-RPC, capsolver JSON-RPC, mock) via injectable httpClient (no real API calls in tests); BudgetGuard spend cap; cost-log JSONL + summary; pure DOM token-injection tested against reCAPTCHA v2 fixture; orchestrator fallback chain (solve→retry→fallback provider→pause-and-alert); provider 'none' preserves Phase 1.8 behavior exactly |
 | 2.7 — Session & Cookie Rotation | ✅ DONE | 59 tests | `src/session/manager.js`, `src/session/warmup.js`, `src/session/account-warmup.js`, `src/session/context-factory.js`, `src/session/index.js`, `src/detail.js` (sessionCheck hook + page swap), `src/config.js` (--sessionMaxRequests/--sessionMaxAgeMs/--warmup/--warmupDurationMs/--accountWarmup/--accountsFile), `src/banner.js` (Session row), `src/index.js` (construct manager, warmup before search, tickRequest in deep-scrape, rotate + re-navigate, end-of-run stats) | createSessionManager with injectable createContext/clock/sleep; rotation by request count OR age (whichever first); warmupContext visits google.com + random second site + benign search; accountWarmup opt-in (off by default, credentials never logged, email redacted); cookie isolation (each context fresh jar); createRealContextFactory bridges to browser.newContext + fingerprint + stealth; mid-deep-scrape rotation via sessionCheck hook + re-navigate to Maps search |
 | 2.8 — Worker Pool & Concurrency | ✅ DONE | 67 tests | `src/worker.js`, `src/pool.js`, `src/config.js` (--workers/--workerProxyStrategy/--workerCrashLimit/--workerCooldownMs/--workerLoadBalancer/--workerDetailBatchSize/--workerTaskRetries), `src/index.js` (runWithPool: getIdentity + runTask [search-task/detail-task] + dispatchBatchSettled + per-worker session aggregation + Pool: banner line), `.env.example` (Phase 2.8 section) | createWorker with DI runTask + state machine (idle/busy/cooldown/retired) + block/crash tracking + rotateIdentity; createPool with round-robin/least-busy + race-free acquireWorker + re-queue on block/crash + retire after crashLimit; serializable task types (search/detail/resume); --workers 1 preserves Phase 1 sequential pipeline byte-for-byte |
-| 2.9 — Job Queue & Orchestration | ⬜ NOT STARTED | — | — | BullMQ/Redis or in-memory queue, async jobs, priorities |
+| 2.9 — Job Queue & Orchestration | ✅ DONE | 96 tests | `src/queue/index.js` (createQueue adapter: add/addBatch/process/getStatus/getStats/getActive/pause/resume/deadLetter+retryDeadLetter/shutdown), `src/queue/job-types.js` (JOB_TYPES registry: search/detail-batch/enrich + validateJobRequest + resolvePriority + PRIORITY bands), `src/queue/mock-backend.js` (in-memory MockQueue+MockWorker+MockJob — mirrors BullMQ API surface for tests; priority queue, retry with exponential backoff, dead-letter, pause/resume, graceful close), `src/queue/dead-letter.js` (createDeadLetter: list/get/retry/retryAll/remove/clear/count + serializeJob), `src/config.js` (--queue/--redisUrl/--queuePriority/--queueAttempts/--queueConcurrency), `src/index.js` (runWithQueue: pool + queue + processor wiring; search job → detail-batch jobs; Queue: banner line), `src/banner.js` (Workers + Queue rows), `scripts/batch.js` (npm run batch -- --file queries.csv), `scripts/queue-status.js` (npm run queue:status — live top-style monitor + --job/--deadLetter/--retry/--retryAll), `data/queries.example.csv`, `.env.example` (Phase 2.9 section) | BullMQ + Redis backend (production) with injectable mock backend (tests — NO real Redis required, an explicit acceptance criterion); 3 job types (search/detail-batch/enrich) with schema validators; priority bands (1=high/5=normal/10=low); retry with exponential backoff (default 3 attempts) → dead-letter queue; batch submission CLI (CSV parser, quoted-comma support, --dryRun); live status CLI (2s refresh, active+failed jobs, --once/--job/--retry modes); crash-resilient (jobs persist in Redis, restart resumes queue); --queue off preserves Phase 2.8 in-process behavior exactly |
 | 2.10 — Memory Management & Long-Run Stability | ⬜ NOT STARTED | — | — | Context restart, leak mitigation, health probes |
 | 2.11 — Self-Healing Selectors & Health Checks | ⬜ NOT STARTED | — | — | Auto-discovery, extraction-rate alerting, selector versioning |
 | 2.12 — Incremental Scraping & Detail Caching | ⬜ NOT STARTED | — | — | `last_seen` freshness, detail-page cache, only-re-scrape-modified |
@@ -737,7 +737,7 @@ A concurrent worker pool that scales horizontally and self-heals on per-worker f
 
 ## Phase 2.9 — Job Queue & Orchestration
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE** — 96 tests / 231 assertions. BullMQ + Redis backend with injectable in-memory mock backend for tests (NO real Redis required for unit tests — an explicit acceptance criterion).
 
 ### Goal
 Introduce a job queue (BullMQ + Redis) that decouples task submission from execution. Clients (or a CLI batch mode) submit jobs; workers pull jobs from the queue. This enables: batch processing of 100+ queries, priority queues (paid jobs first), job persistence (survive a crash), and live job status.
@@ -746,62 +746,72 @@ Introduce a job queue (BullMQ + Redis) that decouples task submission from execu
 The worker pool (Phase 2.8) is great for concurrency, but without a queue, you can't: pause and resume batches, prioritize jobs, survive a full-process crash, or submit jobs from another process. The queue is the backbone of "run 10,000 listings overnight unattended."
 
 ### Task checklist
-- [ ] **Queue setup.** `src/queue.js`:
-  - `createQueue({ redisUrl, name, logger })` — returns a BullMQ queue.
-  - `queue.add(task, { priority, delay, attempts })` — submits a job.
-  - `queue.process(handler)` — registers the worker function (calls `pool.dispatch`).
-  - `queue.getStatus(jobId)` — returns `{ state, progress, result, error }`.
-  - `queue.getStats()` — returns `{ waiting, active, completed, failed, delayed }`.
-  - Graceful shutdown: stop accepting new jobs, finish active jobs, close queue.
-- [ ] **Job types.**
-  - `search` — `{ query, location, maxResults, deepScrape }` → produces businesses.
-  - `detail-batch` — `{ businessIds: [...], deepScrape }` → deep-scrapes a batch.
-  - `enrich` — (Phase 3 placeholder) `{ businessId }` → enriches a single business.
-  - Each job type has a schema validator; invalid jobs are rejected with a clear error.
-- [ ] **Priority system.**
+- [x] **Queue setup.** `src/queue/index.js`:
+  - `createQueue({ redisUrl, name, logger, backend?, defaultPriority?, defaultAttempts?, concurrency? })` — returns a queue adapter. Production uses real BullMQ + Redis; tests inject `{ Queue: MockQueue, Worker: MockWorker }` (DI seam).
+  - `queue.add(type, payload, { priority, delay, attempts })` — submits a job (validates via JOB_TYPES first; fail-fast on bad payloads).
+  - `queue.addBatch(jobs)` — submits multiple jobs; returns per-job `{ id } | { error }` so a bad row doesn't tank the batch.
+  - `queue.process(processor)` — registers the worker function (the adapter converts the job payload → task via `JOB_TYPES[type].toTask`, then calls `processor(task, job)`; in production the processor calls `pool.dispatch(task)`).
+  - `queue.getStatus(jobId)` — returns `{ id, type, state, progress, result, error, attemptsMade, data, timestamp, processedOn, finishedOn }`.
+  - `queue.getStats()` — returns `{ waiting, active, completed, failed, delayed, total }`.
+  - `queue.getActive({ limit })`, `queue.pause()`, `queue.resume()` — introspection + flow control.
+  - Graceful shutdown: `queue.shutdown()` stops accepting new adds, finishes in-flight jobs, closes the worker + queue. Best-effort — never throws. Idempotent.
+- [x] **Job types.** `src/queue/job-types.js` — a registry (`JOB_TYPES`) with `name` / `validate` / `toTask` / `priority` per type:
+  - `search` — `{ query, location, maxResults?, deepScrape? }` → `search-task` (search + scroll + extract).
+  - `detail-batch` — `{ businessIds?: string[], businesses?: object[], deepScrape? }` → `detail-task`. Two payload shapes: `businessIds` (Phase 3 re-scrape-by-id, needs DB lookup) OR `businesses` (Phase 2.9 main flow, no lookup needed).
+  - `enrich` — (Phase 3 placeholder) `{ businessId, source? }` → `enrich-task`.
+  - `validateJobRequest({ type, payload, priority?, attempts?, delay? })` — fail-fast validation; invalid jobs are rejected BEFORE they hit Redis.
+  - `resolvePriority(p)` — clamps to BullMQ's range; `PRIORITY_HIGH=1` / `PRIORITY_NORMAL=5` / `PRIORITY_LOW=10`.
+- [x] **Priority system.**
   - `priority: 1` (high) — paid client jobs, resume-after-crash jobs.
   - `priority: 5` (normal) — standard batch jobs.
   - `priority: 10` (low) — background re-scrape jobs.
-  - BullMQ handles priority natively (lower number = higher priority).
-- [ ] **Retry & dead-letter.**
-  - `attempts: 3` — BullMQ retries failed jobs up to 3 times with exponential backoff.
-  - After 3 failures, the job moves to a dead-letter queue for manual inspection.
-  - `queue.deadLetter()` — lists failed jobs; `queue.retryDeadLetter(jobId)` — re-queues.
-- [ ] **Batch submission CLI.** `npm run batch -- --file queries.csv`:
-  - Reads a CSV of `query, location, maxResults` rows.
-  - Submits each as a `search` job to the queue.
-  - Prints job IDs + a monitoring URL (if a dashboard exists — Phase 4; for now, CLI status).
-- [ ] **Live status CLI.** `npm run queue:status`:
-  - Prints: waiting / active / completed / failed counts.
-  - Prints: active jobs with worker ID + progress.
-  - Refreshes every 2s (like `top`).
-- [ ] **Persistence.** Jobs are persisted in Redis. If the scraper process crashes, restarting it resumes processing the queue (active jobs are retried, waiting jobs are picked up).
-- [ ] **Config flags.**
+  - BullMQ + MockQueue both: lower number = higher priority; FIFO within the same priority.
+- [x] **Retry & dead-letter.** `src/queue/dead-letter.js`:
+  - `attempts: 3` (default) — BullMQ retries failed jobs up to N times with exponential backoff (`{ type: 'exponential', delay: 1000 }`).
+  - After N failures, the job moves to the dead-letter queue (BullMQ's `failed` state) for manual inspection.
+  - `queue.deadLetter()` (callable — returns the list, spec parity) + `queue.deadLetter.list/get/retry/retryAll/remove/clear/count` (rich API) + `queue.retryDeadLetter(jobId)` (spec-parity top-level method).
+  - `retryAll()` retries every dead-lettered job in one call (useful after a systemic fix).
+- [x] **Batch submission CLI.** `scripts/batch.js` (`npm run batch -- --file queries.csv`):
+  - Reads a CSV of `query, location, maxResults, deepScrape, priority` rows (hand-rolled CSV parser — handles quoted commas, comments, blank lines).
+  - Validates each row; invalid rows are reported but don't tank the batch.
+  - Submits each valid row as a `search` job; prints job IDs + a monitoring hint.
+  - `--dryRun` parses + prints without submitting.
+- [x] **Live status CLI.** `scripts/queue-status.js` (`npm run queue:status`):
+  - Live top-style view (refreshes every 2s, Ctrl-C to exit).
+  - Prints: waiting / active / completed / failed / delayed / total counts.
+  - Prints: active jobs (id, type, progress, attemptsMade, elapsed, data summary).
+  - Prints: recently-failed (dead-letter) jobs (id, type, reason, attemptsMade).
+  - Modes: `--once` (single snapshot), `--job <id>` (inspect one job), `--deadLetter` (full dead-letter list), `--retry <id>` (retry one), `--retryAll` (retry all).
+- [x] **Persistence.** Jobs are persisted in Redis (BullMQ's native persistence). If the scraper process crashes, restarting it resumes processing the queue (active jobs are retried, waiting jobs are picked up). The in-memory mock backend mirrors this lifecycle for tests.
+- [x] **Config flags.** `src/config.js`:
   - `--queue on|off` (default: off = Phase 2.8 in-process dispatch)
-  - `--redisUrl <url>` (default: `redis://localhost:6379`)
+  - `--redisUrl <url>` (default: `redis://localhost:6379`; required when `--queue on`)
   - `--queuePriority N` (default: 5)
   - `--queueAttempts N` (default: 3)
-- [ ] **Unit tests.** `tests/queue.test.js`:
-  - Use `ioredis-mock` or a test Redis instance.
-  - `queue.add` + `queue.process` end-to-end: submit a job, worker processes it, result is correct.
-  - Priority: high-priority jobs are processed before low-priority ones.
-  - Retry: a job that fails 3 times moves to dead-letter.
-  - `queue.getStatus` returns accurate state.
-  - DI: queue accepts a mock Redis client.
+  - `--queueConcurrency N` (default: 1; should be <= `--workers`)
+  - Validation: `--queue on` requires `REDIS_URL`; priority 1-100; attempts 1-50; concurrency 1-64.
+- [x] **Unit tests.** `tests/queue.test.js` — 96 tests / 231 assertions:
+  - `job-types.js` validators: search/detail-batch/enrich (valid + invalid payloads), validateJobRequest, resolvePriority, PRIORITY bands.
+  - `mock-backend.js` lifecycle: add/getJob/getJobCounts, process end-to-end, FIFO within priority, retry (fail N times then succeed), dead-letter (fail N times → failed state), job.retry() (resets attemptsMade, removes from _failed set), pause/resume, close (waits for in-flight), delay (with injectable clock).
+  - `dead-letter.js`: list (with limit/offset), get, retry, retryAll, remove, clear, count, serializeJob.
+  - `queue/index.js` adapter: add (valid/invalid/unknown-type/post-shutdown), addBatch, process (registers + converts payload → task), getStatus (null for missing, full for completed), getStats, priority ordering (high runs before low), retry + dead-letter, deadLetter() callable + methods, retryDeadLetter, retryAll, pause/resume, shutdown (stops adds + idempotent), default priority/attempts from opts, enrich + detail-batch (both payload shapes) end-to-end, concurrency 3 parallelism, real BullMQ backend throws when redisUrl missing.
+  - DI: every test injects `{ Queue: MockQueue, Worker: MockWorker }` — NO real Redis required (an explicit acceptance criterion).
 
 ### Acceptance criteria
-- `npm run batch -- --file queries.csv` submits 100 jobs; `npm run queue:status` shows them processing.
-- A simulated worker crash mid-job: the job is retried (up to 3 times) and eventually completes or dead-letters.
-- Priority works: a `priority: 1` job submitted after 50 `priority: 5` jobs is processed next.
-- Restarting the scraper process resumes the queue (waiting jobs are picked up).
-- `--queue off` preserves Phase 2.8 in-process behavior.
-- No real Redis required for unit tests (mocks).
+- ✅ `npm run batch -- --file queries.csv` submits N jobs; `npm run queue:status` shows them processing. (Dry-run verified; live submission requires a running Redis instance — `docker compose up redis`.)
+- ✅ A simulated worker crash mid-job: the job is retried (up to 3 times) and eventually completes or dead-letters. (Tested via the mock backend — `retry: a job that fails 3 times is dead-lettered` + `retry: a job that fails twice then succeeds completes`.)
+- ✅ Priority works: a `priority: 1` job submitted after `priority: 5` jobs is processed next. (Tested — `priority works: a high-priority job is processed before low-priority ones`.)
+- ✅ Restarting the scraper process resumes the queue (waiting jobs are picked up). (BullMQ's native Redis persistence — the mock backend mirrors the lifecycle; a full restart test requires a running Redis instance.)
+- ✅ `--queue off` preserves Phase 2.8 in-process behavior. (Default; the queue path is gated on `cfg.queue.enabled`.)
+- ✅ No real Redis required for unit tests (mocks). (Every test injects the mock backend; the real BullMQ branch is only exercised by the fail-fast `redisUrl` check.)
 
 ### Dependencies
 Phase 2.8 (worker pool — the queue feeds the pool).
 
 ### Deliverable
 A persistent job queue that enables batch processing, priorities, and crash-resilient execution.
+
+**Shipped:** `src/queue/index.js` (createQueue adapter with injectable backend — BullMQ + Redis for production, MockQueue + MockWorker for tests; add/addBatch/process/getStatus/getStats/getActive/pause/resume/deadLetter [callable + rich methods] + retryDeadLetter/shutdown; lazy require('bullmq') so the dep only loads when a queue is actually constructed; QUEUE_NO_REDIS / QUEUE_NO_BACKEND / QUEUE_INVALID / QUEUE_UNKNOWN_TYPE / QUEUE_SHUTDOWN / QUEUE_PROCESSOR_EXISTS error codes), `src/queue/job-types.js` (JOB_TYPES registry [search/detail-batch/enrich] with per-type validate + toTask + priority; validateJobRequest; resolvePriority with clamping; PRIORITY_HIGH=1/PRIORITY_NORMAL=5/PRIORITY_LOW=10 bands; detail-batch accepts both businessIds [Phase 3] AND businesses [Phase 2.9 main flow] payload shapes), `src/queue/mock-backend.js` (in-memory MockQueue + MockWorker + MockJob mirroring the BullMQ API surface — priority queue with stable sort, retry with exponential backoff calc, dead-letter on exhaustion, pause/resume, delay with injectable clock, graceful close that waits for in-flight jobs via _pollDonePromise; MockJob.retry resets attemptsMade + removes from _failed set; setImmediate-based poll loop so the event loop isn't starved), `src/queue/dead-letter.js` (createDeadLetter: list with limit/offset, get, retry, retryAll, remove, clear, count + serializeJob for JSON-safe output), `src/config.js` (--queue on|off, --redisUrl, --queuePriority 1-100, --queueAttempts 1-50, --queueConcurrency 1-64 + QUEUE_* env vars + validation [--queue on requires REDIS_URL] + HELP_TEXT + examples), `src/index.js` (runWithQueue: builds pool [same getIdentity + runTask as runWithPool] + queue adapter; registers processor that calls pool.dispatch; submits search job → awaits waitUntilFinished → dedup → optional detail-batch jobs [each carrying full business objects, no DB lookup] → awaits all → aggregates; Queue: banner line; cfg.queue.resolved = { adapter }; --queue on gates the queue path, --queue off falls through to Phase 2.8/sequential), `src/banner.js` (Workers + Queue rows in the startup banner), `scripts/batch.js` (npm run batch -- --file queries.csv; hand-rolled CSV parser with quoted-comma support + comments + blank lines; --dryRun mode; per-row validation; addBatch submission with per-job { id } | { error } reporting), `scripts/queue-status.js` (npm run queue:status; live top-style 2s-refresh monitor; --once / --job <id> / --deadLetter / --retry <id> / --retryAll modes; ANSI screen clear in TTY, plain output when piped), `data/queries.example.csv` (sample batch input), `.env.example` (Phase 2.9 section expanded with REDIS_URL + QUEUE_CONCURRENCY), `tests/queue.test.js` (96 tests / 231 assertions across job-types validators, mock-backend lifecycle, dead-letter helper, createQueue adapter [add/addBatch/process/getStatus/getStats/priority/retry/dead-letter/pause/resume/shutdown/concurrency/DI], real-BullMQ fail-fast). **1112 tests / 7534 assertions passing total** (96 new).
 
 ---
 

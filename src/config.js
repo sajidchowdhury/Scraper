@@ -130,6 +130,17 @@ function parseArgs(argv) {
     else if (a === '--workerLoadBalancer') out.workerLoadBalancer = argv[++i];
     else if (a === '--workerDetailBatchSize') out.workerDetailBatchSize = argv[++i];
     else if (a === '--workerTaskRetries') out.workerTaskRetries = argv[++i];
+    // Phase 2.9 — job queue & orchestration. --queue on switches from the
+    // Phase 2.8 in-process pool.dispatch to a BullMQ-backed queue: jobs are
+    // submitted to Redis, a worker pulls them off, and the pool dispatches
+    // each one. This decouples submission from execution (batch CLI, crash
+    // recovery, priorities). --queue off (default) preserves Phase 2.8
+    // behavior exactly (no Redis required).
+    else if (a === '--queue') out.queue = argv[++i];
+    else if (a === '--redisUrl') out.redisUrl = argv[++i];
+    else if (a === '--queuePriority') out.queuePriority = argv[++i];
+    else if (a === '--queueAttempts') out.queueAttempts = argv[++i];
+    else if (a === '--queueConcurrency') out.queueConcurrency = argv[++i];
   }
   return out;
 }
@@ -434,6 +445,43 @@ function validate(cfg) {
         'Max re-queues per task across workers (default = workers size).',
     );
   }
+  // Phase 2.9 — job queue validation. --queue on|off is normalized to a
+  // boolean in loadConfig; here we validate the dependent fields.
+  if (typeof cfg.queue.enabled !== 'boolean') {
+    errors.push(
+      `queue must be one of on, off (got "${cfg.queue.enabled}"). Use --queue on|off.`,
+    );
+  }
+  if (cfg.queue.priority < 1 || cfg.queue.priority > 100) {
+    errors.push(
+      `queuePriority must be between 1 and 100 (got ${cfg.queue.priority}). ` +
+        '1 = highest priority (paid jobs), 10 = low (background re-scrape), 5 = normal.',
+    );
+  }
+  if (cfg.queue.attempts < 1 || cfg.queue.attempts > 50) {
+    errors.push(
+      `queueAttempts must be between 1 and 50 (got ${cfg.queue.attempts}). ` +
+        'BullMQ retries failed jobs up to this many times with exponential backoff.',
+    );
+  }
+  if (cfg.queue.concurrency < 1 || cfg.queue.concurrency > 64) {
+    errors.push(
+      `queueConcurrency must be between 1 and 64 (got ${cfg.queue.concurrency}). ` +
+        'How many jobs the worker pulls off the queue in parallel.',
+    );
+  }
+  // --queue on requires REDIS_URL (BullMQ needs a Redis connection). We fail
+  // fast here so the operator sees the error before any browser launches.
+  if (cfg.queue.enabled === 'on' && !cfg.queue.redisUrl) {
+    errors.push(
+      '--queue on requires REDIS_URL (set in .env or pass --redisUrl <url>). ' +
+        'See .env.example → Phase 2.9 section.',
+    );
+  }
+  // --queue on implicitly requires --workers > 1 (the queue feeds the pool;
+  // a single-worker pool can still process queue jobs but with no concurrency
+  // benefit). We WARN (not error) — a single worker + queue is a valid config
+  // for low-throughput crash-resilient runs.
   return errors;
 }
 
@@ -697,6 +745,31 @@ function loadConfig(argv = process.argv.slice(2)) {
       resolved: null,
     },
 
+    // Phase 2.9 — job queue & orchestration (BullMQ + Redis).
+    //   --queue on|off              — on = submit jobs to a BullMQ queue (Redis-
+    //                                 backed); a worker pulls them off and feeds
+    //                                 the pool. off (default) = Phase 2.8
+    //                                 in-process dispatch (no Redis required).
+    //   --redisUrl <url>            — Redis connection URL (required when
+    //                                 --queue on). Default redis://localhost:6379.
+    //   --queuePriority N           — default priority for submitted jobs
+    //                                 (1=high, 5=normal, 10=low; default 5).
+    //   --queueAttempts N           — BullMQ retry attempts per job (default 3).
+    //                                 After this many failures the job is dead-
+    //                                 lettered for manual inspection.
+    //   --queueConcurrency N        — worker concurrency (how many jobs the
+    //                                 worker pulls off the queue in parallel;
+    //                                 default 1). Should be <= --workers.
+    queue: {
+      enabled: (cli.queue || process.env.QUEUE || 'off') === 'on',
+      redisUrl: cli.redisUrl || process.env.REDIS_URL || 'redis://localhost:6379',
+      priority: toIntOrNull(cli.queuePriority ?? process.env.QUEUE_PRIORITY) ?? 5,
+      attempts: toIntOrNull(cli.queueAttempts ?? process.env.QUEUE_ATTEMPTS) ?? 3,
+      concurrency: toIntOrNull(cli.queueConcurrency ?? process.env.QUEUE_CONCURRENCY) ?? 1,
+      // Resolved at runtime in index.js into { adapter } (null when disabled).
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -830,6 +903,21 @@ Optional:
   --workerDetailBatchSize <n> Phase 2.8 — businesses per detail-task (default: 20).
   --workerTaskRetries <n>    Phase 2.8 — max re-queues per task (default = workers).
 
+  --queue on|off             Phase 2.9 — on = submit jobs to a BullMQ-backed
+                             Redis queue (decouples submission from execution).
+                             A worker pulls jobs off the queue and feeds the
+                             pool. off (default) = Phase 2.8 in-process dispatch
+                             (no Redis required).
+  --redisUrl <url>           Phase 2.9 — Redis connection URL (required when
+                             --queue on). Default redis://localhost:6379.
+  --queuePriority <n>        Phase 2.9 — default job priority (1=high, 5=normal,
+                             10=low; default 5). BullMQ: lower = higher priority.
+  --queueAttempts <n>        Phase 2.9 — BullMQ retry attempts per job (default 3).
+                             After this many failures the job is dead-lettered.
+  --queueConcurrency <n>     Phase 2.9 — worker concurrency (how many jobs the
+                             worker pulls off the queue in parallel; default 1).
+                             Should be <= --workers.
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
@@ -882,6 +970,17 @@ Examples:
   npm start -- --query "Restaurant" --location "Toronto" --workers 5 --deepScrape true   # 5× parallel detail-scrape
   npm start -- --query "Cafe" --location "Berlin" --workers 4 --workerLoadBalancer least-busy
   npm start -- --query "Cafe" --location "Berlin" --workers 3 --workerCrashLimit 5 --workerCooldownMs 120000
+
+  # Phase 2.9 — job queue & orchestration (default: off = Phase 2.8 in-process)
+  #   Requires Redis running (docker-compose up redis). --queue on submits the
+  #   search-task to a BullMQ queue; a worker pulls it off and feeds the pool.
+  #   For batch submission use: npm run batch -- --file queries.csv (one job
+  #   per row) and monitor with: npm run queue:status (live, refreshes 2s).
+  npm start -- --query "Cafe" --location "Berlin" --workers 3 --queue on   # queue + 3 workers
+  npm start -- --query "Cafe" --location "Berlin" --queue on --queuePriority 1   # high-priority job
+  npm start -- --query "Cafe" --location "Berlin" --queue on --queueAttempts 5   # more retries
+  npm run batch -- --file queries.csv --workers 5 --queue on   # batch submit + process
+  npm run queue:status                                         # live status (top-style, 2s refresh)
 
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun

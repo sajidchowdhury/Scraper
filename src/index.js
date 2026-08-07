@@ -123,6 +123,11 @@ const {
   validateTask,
 } = require('./worker');
 
+// Phase 2.9 — job queue & orchestration (BullMQ + Redis). Only used when
+// --queue on; with --queue off (the default) the Phase 2.8 in-process pool
+// dispatch runs unchanged (no Redis required).
+const { createQueue } = require('./queue');
+
 async function main() {
   const cfg = loadConfig(process.argv.slice(2));
 
@@ -529,6 +534,25 @@ async function main() {
   } else {
     logger.info('Phase 2.8 — worker pool disabled (size 1 — Phase 1 sequential behavior)', {
       hint: 'Use --workers N to run N parallel browser workers',
+    });
+  }
+
+  // Phase 2.9 — job queue & orchestration. --queue on (default: off) submits
+  // jobs to a BullMQ-backed Redis queue; a worker pulls them off and feeds the
+  // pool. This decouples submission from execution: batch CLI submits 100 jobs
+  // and exits; a separate worker process pulls them off over hours. With
+  // --queue off the Phase 2.8 in-process dispatch runs unchanged (no Redis).
+  if (cfg.queue.enabled) {
+    logger.info('Phase 2.9 — job queue enabled', {
+      redisUrl: cfg.queue.redisUrl,
+      priority: cfg.queue.priority,
+      attempts: cfg.queue.attempts,
+      concurrency: cfg.queue.concurrency,
+      hint: 'Jobs are persisted in Redis — a crash resumes the queue on restart',
+    });
+  } else {
+    logger.info('Phase 2.9 — job queue disabled (Phase 2.8 in-process dispatch)', {
+      hint: 'Use --queue on (requires REDIS_URL) for batch processing + crash resilience',
     });
   }
 
@@ -956,13 +980,524 @@ async function main() {
     return poolResult;
   };
 
+  // Phase 2.9 — runWithQueue: the queue-backed pipeline. Builds the same worker
+  // pool as runWithPool, then layers a BullMQ queue on top: the search-task is
+  // submitted as a job, the worker pulls it off, and pool.dispatch runs it. If
+  // deepScrape is on, the businesses are split into detail-batch jobs (each
+  // carrying the full business objects — no DB lookup needed in the main flow).
+  // Returns the same `result` shape as runWithPool so the downstream export /
+  // summary / banner logic is shared.
+  //
+  // The queue adds: crash-resilience (jobs persist in Redis — a process restart
+  // resumes the queue), priority (paid jobs first), and batch submission (the
+  // CLI can submit 100 jobs and exit; a worker process drains them over hours).
+  // With --queue off (default) runWithPool runs unchanged (no Redis required).
+  const runWithQueue = async () => {
+    // getIdentity — same as runWithPool (copied here to keep the queue path
+    // self-contained; a Phase 2.13 refactor will extract this into a shared
+    // buildPool() helper used by both runWithPool and runWithQueue).
+    const getIdentity = async () => {
+      let proxy = null;
+      if (proxyPool) {
+        proxy = await proxyPool.acquire();
+        if (!proxy) {
+          logger.warn('Worker getIdentity: proxy pool exhausted — worker will run direct', {
+            hint: 'Add more proxies or wait for cooldowns to elapse',
+          });
+        }
+      }
+      let fp = null;
+      if (cfg.fingerprint.profile !== 'off') {
+        fp = generateFingerprint({ logger: logger.phase('fingerprint') });
+      }
+      const workerRateLimiter = new RateLimiter(cfg.antiblock.maxRequestsPerMin, {
+        logger: logger.phase('antiblock'),
+      });
+      const workerSessionCreateContext = createRealContextFactory({
+        cfg,
+        logger,
+        stealth: cfg.stealth.resolved || { enabled: false, debug: false },
+      });
+      const workerWarmupFn = cfg.session.warmup
+        ? async (page, ctx) =>
+            warmupContext(page, {
+              logger: (ctx && ctx.logger) || logger.phase('session'),
+              durationMs: cfg.session.warmupDurationMs,
+              sleepFn: ctx && ctx.sleepFn,
+            })
+        : null;
+      const workerSessionManager = createSessionManager({
+        maxRequests: cfg.session.maxRequests,
+        maxAgeMs: cfg.session.maxAgeMs,
+        warmup: cfg.session.warmup,
+        warmupFn: workerWarmupFn,
+        createContext: workerSessionCreateContext,
+        logger: logger.phase('session'),
+      });
+      return { proxy, fingerprint: fp, sessionManager: workerSessionManager, rateLimiter: workerRateLimiter };
+    };
+
+    // runTask — same as runWithPool. Handles search-task + detail-task. The
+    // queue processor calls pool.dispatch(task) which calls worker.run(task)
+    // which calls this runTask.
+    const runTask = async (worker, task) => {
+      const wcfg = { ...cfg, rateLimiter: worker.rateLimiter };
+      const wlogger = worker.logger || logger;
+      const taskErrs = validateTask(task);
+      if (taskErrs.length > 0) {
+        throw new Error(`invalid task: ${taskErrs.join('; ')}`);
+      }
+      if (task.type === 'search-task') {
+        return withBrowser(
+          wcfg,
+          async ({ page, browser }) => {
+            if (cfg.session.warmup) {
+              try {
+                await warmupContext(page, {
+                  logger: wlogger.phase('session'),
+                  durationMs: cfg.session.warmupDurationMs,
+                });
+              } catch (err) {
+                wlogger.phase('session').warn('Worker warmup failed (non-fatal)', {
+                  workerId: worker.id,
+                  error: err.message,
+                });
+              }
+            }
+            await performSearch(page, wcfg, wlogger, wcfg.retry, wcfg.rateLimiter);
+            const scrollResult = await scrollFeedToBottomOnPage(page, wcfg, wlogger);
+            const { businesses: freshBusinesses, extractionRates, stats: extractStats } =
+              await extractBusinesses(page, {
+                query: task.query || cfg.query,
+                location: task.location || cfg.location,
+                logger: wlogger,
+                retry: wcfg.retry,
+              });
+            return { businesses: freshBusinesses, scrollResult, extractionRates, extractStats };
+          },
+          {
+            logger: wlogger,
+            proxy: worker.proxy,
+            fingerprint: worker.fingerprint,
+            stealth: cfg.stealth.resolved,
+            onBlocked: ({ status, url }) => {
+              wlogger.warn('Worker got a block-status response', {
+                workerId: worker.id,
+                status,
+                url,
+              });
+            },
+          },
+        );
+      }
+      if (task.type === 'detail-task') {
+        const batch = Array.isArray(task.businesses) ? task.businesses : [];
+        return withBrowser(
+          wcfg,
+          async ({ page, browser }) => {
+            if (cfg.session.warmup) {
+              try {
+                await warmupContext(page, {
+                  logger: wlogger.phase('session'),
+                  durationMs: cfg.session.warmupDurationMs,
+                });
+              } catch (err) {
+                wlogger.phase('session').warn('Worker warmup failed (non-fatal)', {
+                  workerId: worker.id,
+                  error: err.message,
+                });
+              }
+            }
+            await performSearch(page, wcfg, wlogger, wcfg.retry, wcfg.rateLimiter);
+            await scrollFeedToBottomOnPage(page, wcfg, wlogger);
+            const detailStats = await deepScrapeAll(page, batch, wcfg, wlogger, {
+              captchaCheck: cfg.antiblock.captchaPause
+                ? async () => {
+                    if (cfg.captcha.resolved && cfg.captcha.resolved.solver) {
+                      const r = await handleCaptcha(page, {
+                        solver: cfg.captcha.resolved.solver,
+                        budgetGuard: cfg.captcha.resolved.budgetGuard,
+                        costLogger: cfg.captcha.resolved.costLogger,
+                        logger: wlogger.phase('captcha'),
+                        captchaWaitMs: 0,
+                      });
+                      if (r.resolved) return { detected: false, indicator: null };
+                      return { detected: true, indicator: r.indicator };
+                    }
+                    return detectCaptcha(page);
+                  }
+                : null,
+              captchaWaitMs: cfg.antiblock.captchaWaitMs,
+            });
+            return { businesses: batch, detailStats };
+          },
+          {
+            logger: wlogger,
+            proxy: worker.proxy,
+            fingerprint: worker.fingerprint,
+            stealth: cfg.stealth.resolved,
+            onBlocked: ({ status, url }) => {
+              wlogger.warn('Worker got a block-status response', {
+                workerId: worker.id,
+                status,
+                url,
+              });
+            },
+          },
+        );
+      }
+      throw new Error(`unknown task type: ${task.type}`);
+    };
+
+    // Build the pool (same as runWithPool).
+    const pool = createWorkerPool({
+      size: cfg.workers.size,
+      cfg,
+      createWorker: (wOpts) => createWorker({ ...wOpts, runTask }),
+      getIdentity,
+      loadBalancer: cfg.workers.loadBalancer,
+      crashLimit: cfg.workers.crashLimit,
+      cooldownMs: cfg.workers.cooldownMs,
+      taskRetries: cfg.workers.taskRetries === null ? cfg.workers.size : cfg.workers.taskRetries,
+      logger,
+    });
+
+    // Build the queue adapter. Production uses real BullMQ + Redis; tests can
+    // inject a mock backend via cfg.queue.resolved.backend (none here — the
+    // main flow always uses the real backend).
+    const queue = createQueue({
+      redisUrl: cfg.queue.redisUrl,
+      name: 'scraper',
+      logger,
+      defaultPriority: cfg.queue.priority,
+      defaultAttempts: cfg.queue.attempts,
+      concurrency: cfg.queue.concurrency,
+    });
+    cfg.queue.resolved = { adapter: queue };
+
+    // Register the queue processor. The adapter converts the job payload →
+    // task (via JOB_TYPES[type].toTask), then calls this processor. The
+    // processor dispatches the task to the pool. For detail-task, the task
+    // may carry `businessIds` (Phase 3 — needs DB lookup, not yet wired) OR
+    // `businesses` (Phase 2.9 main flow — already in memory).
+    queue.process(async (task) => {
+      // detail-task with businessIds only (no businesses) — Phase 3 placeholder.
+      // We can't resolve ids without a DB lookup; throw so the job retries then
+      // dead-letters. The Phase 3 enrich worker will wire the lookup.
+      if (task.type === 'detail-task' && (!task.businesses || task.businesses.length === 0)) {
+        if (task.businessIds && task.businessIds.length > 0) {
+          throw new Error(
+            'detail-batch by businessId requires DB lookup (Phase 3 — not yet implemented). ' +
+              'Submit with { businesses: [...] } instead for the Phase 2.9 main flow.',
+          );
+        }
+        throw new Error('detail-task requires either businessIds or businesses');
+      }
+      return pool.dispatch(task);
+    });
+
+    let queueResult;
+    try {
+      // 1) Submit the search job + await completion. The job's result is the
+      //    pool.dispatch return value: { businesses, scrollResult, extractionRates, extractStats }.
+      const searchJobOpts = {
+        priority: cfg.queue.priority,
+        attempts: cfg.queue.attempts,
+      };
+      logger.info('Phase 2.9 — submitting search job to queue', {
+        queue: queue.name,
+        query: cfg.query,
+        location: cfg.location,
+        priority: searchJobOpts.priority,
+        attempts: searchJobOpts.attempts,
+      });
+      const { id: searchJobId } = await queue.add(
+        'search',
+        {
+          query: cfg.query,
+          location: cfg.location,
+          maxResults: cfg.maxResults,
+          deepScrape: cfg.deepScrape,
+        },
+        searchJobOpts,
+      );
+      // Wait for the search job to finish. The backend job's waitUntilFinished()
+      // resolves with the processor's return value (the pool.dispatch result).
+      const searchJob = queue._backendQueue.getJob(searchJobId);
+      const searchResult = await searchJob.waitUntilFinished();
+      logger.info('Phase 2.9 — search job complete', {
+        jobId: searchJobId,
+        businesses: searchResult.businesses.length,
+      });
+
+      // Dedup against checkpoint (same logic as runWithPool).
+      let newCount = 0;
+      let skipCount = 0;
+      const allBusinesses = existingBusinesses.slice();
+      const seenKeys = new Set(dedupSet);
+      for (const b of searchResult.businesses) {
+        const k = dedupKey(b);
+        if (k && seenKeys.has(k)) {
+          skipCount++;
+        } else {
+          allBusinesses.push(b);
+          if (k) seenKeys.add(k);
+          newCount++;
+        }
+      }
+      logger.info('Queue search + checkpoint dedup complete', {
+        fresh: searchResult.businesses.length,
+        existing: existingBusinesses.length,
+        new: newCount,
+        skipped: skipCount,
+        total: allBusinesses.length,
+      });
+
+      // Stamp EMPTY_DETAIL on new records (stable output schema).
+      for (let i = 0; i < allBusinesses.length; i++) {
+        if (!allBusinesses[i].detail_scraped) {
+          allBusinesses[i] = { ...allBusinesses[i], ...EMPTY_DETAIL };
+        }
+      }
+
+      let detailStats = null;
+      if (cfg.deepScrape) {
+        // 2) Split into detail-batch jobs + submit them. Each job carries the
+        //    FULL business objects (no DB lookup needed). The queue's retry +
+        //    dead-letter semantics apply per batch — a failed batch is retried
+        //    up to cfg.queue.attempts times, then dead-lettered for inspection.
+        const batchSize = cfg.workers.detailBatchSize;
+        const batches = [];
+        for (let i = 0; i < allBusinesses.length; i += batchSize) {
+          const slice = allBusinesses.slice(i, i + batchSize).map((b) => ({ ...b }));
+          batches.push({ startIdx: i, businesses: slice });
+        }
+        logger.info('Phase 2.9 — submitting detail-batch jobs to queue', {
+          total: allBusinesses.length,
+          batches: batches.length,
+          batchSize,
+          attempts: cfg.queue.attempts,
+        });
+        const detailJobs = batches.map((b) => ({
+          type: 'detail-batch',
+          payload: { businesses: b.businesses, deepScrape: true },
+          priority: cfg.queue.priority,
+          attempts: cfg.queue.attempts,
+        }));
+        const submitted = await queue.addBatch(detailJobs);
+
+        // Wait for all detail jobs to finish (in order). Each job's result is
+        // the pool.dispatch return value: { businesses, detailStats }.
+        const detailResults = [];
+        for (let i = 0; i < submitted.length; i++) {
+          const s = submitted[i];
+          if (s.error) {
+            // Submission failed (e.g. invalid payload) — count the batch as failed.
+            const cnt = batches[i].businesses.length;
+            detailResults.push({
+              startIdx: batches[i].startIdx,
+              count: cnt,
+              failed: true,
+              error: s.error,
+              businesses: batches[i].businesses,
+            });
+            continue;
+          }
+          const job = queue._backendQueue.getJob(s.id);
+          try {
+            const res = await job.waitUntilFinished();
+            detailResults.push({
+              startIdx: batches[i].startIdx,
+              count: batches[i].businesses.length,
+              failed: false,
+              businesses: res.businesses,
+              detailStats: res.detailStats,
+            });
+          } catch (err) {
+            // Job exhausted retries + dead-lettered.
+            detailResults.push({
+              startIdx: batches[i].startIdx,
+              count: batches[i].businesses.length,
+              failed: true,
+              error: err.message,
+              businesses: batches[i].businesses,
+            });
+          }
+        }
+
+        // Merge batch results back + aggregate detailStats.
+        let attempted = 0;
+        let succeeded = 0;
+        let failed = 0;
+        const durations = [];
+        const errors = {};
+        for (const r of detailResults) {
+          if (r.failed) {
+            attempted += r.count;
+            failed += r.count;
+            errors[r.error || 'batch failed'] = (errors[r.error || 'batch failed'] || 0) + r.count;
+            logger.error('Detail-batch job failed (dead-lettered)', {
+              startIdx: r.startIdx,
+              count: r.count,
+              error: r.error,
+            });
+            continue;
+          }
+          for (let j = 0; j < r.businesses.length; j++) {
+            allBusinesses[r.startIdx + j] = r.businesses[j];
+          }
+          if (r.detailStats) {
+            attempted += r.detailStats.attempted || 0;
+            succeeded += r.detailStats.succeeded || 0;
+            failed += r.detailStats.failed || 0;
+            if (Array.isArray(r.detailStats.durations)) {
+              durations.push(...r.detailStats.durations);
+            }
+            if (r.detailStats.errors) {
+              for (const [k, v] of Object.entries(r.detailStats.errors)) {
+                errors[k] = (errors[k] || 0) + v;
+              }
+            }
+          }
+        }
+        const avgMs = durations.length > 0 ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : 0;
+        const minMs = durations.length > 0 ? Math.min(...durations) : 0;
+        const maxMs = durations.length > 0 ? Math.max(...durations) : 0;
+        detailStats = {
+          attempted,
+          succeeded,
+          failed,
+          successRate: attempted > 0 ? Math.round((succeeded / attempted) * 100) : 0,
+          avgMs,
+          minMs,
+          maxMs,
+          errors,
+          durations,
+        };
+        // Report any dead-lettered batches so the operator can inspect + retry.
+        const deadLettered = detailResults.filter((r) => r.failed).length;
+        if (deadLettered > 0) {
+          logger.warn('Phase 2.9 — some detail-batch jobs dead-lettered', {
+            deadLettered,
+            total: detailResults.length,
+            hint: 'Use `npm run queue:status` or queue.deadLetter().list() to inspect + retry',
+          });
+        }
+        logger.info('Queue deep-scrape complete', {
+          attempted,
+          succeeded,
+          failed,
+          successRate: detailStats.successRate,
+          batches: batches.length,
+          batchFailures: deadLettered,
+        });
+      }
+
+      // Aggregate per-worker session stats (same as runWithPool).
+      let sessionsCreated = 0;
+      let rotations = 0;
+      let totalRequests = 0;
+      const warmup = cfg.session.warmup;
+      let ageSum = 0;
+      let sessionCount = 0;
+      for (const w of pool.workers) {
+        if (w.sessionManager && typeof w.sessionManager.stats === 'function') {
+          const s = w.sessionManager.stats();
+          sessionsCreated += s.sessionsCreated || 0;
+          rotations += s.rotations || 0;
+          totalRequests += s.totalRequests || 0;
+          if (s.avgAgeMs) {
+            ageSum += s.avgAgeMs;
+            sessionCount++;
+          }
+        }
+      }
+
+      // Queue stats for the end-of-run banner.
+      const queueStats = await queue.getStats();
+
+      queueResult = {
+        businesses: allBusinesses,
+        extractionRates: searchResult.extractionRates,
+        scrollResult: searchResult.scrollResult,
+        detailStats,
+        extractStats: searchResult.extractStats,
+        recovery: {
+          resumed: resume,
+          existingCount: existingBusinesses.length,
+          newCount,
+          skipped: skipCount,
+        },
+        antiblock: {
+          maxRPM: cfg.antiblock.maxRequestsPerMin,
+          rateLimitWaits: 0,
+          humanTyping: cfg.antiblock.humanTyping,
+        },
+        captcha: cfg.captcha.resolved && cfg.captcha.resolved.costLogger
+          ? {
+              provider: cfg.captcha.provider,
+              fallback: cfg.captcha.fallbackProvider || null,
+              budget: cfg.captcha.budget,
+              spent: cfg.captcha.resolved.budgetGuard ? cfg.captcha.resolved.budgetGuard.spent : 0,
+              budgetExceeded: cfg.captcha.resolved.budgetGuard ? cfg.captcha.resolved.budgetGuard.exceeded : false,
+              costLog: cfg.captcha.resolved.costLogger.summary(),
+              costLogPath: cfg.captcha.resolved.costLogger.filePath,
+            }
+          : { provider: 'none', costLog: { count: 0, totalCost: 0, avgMs: 0 } },
+        session: {
+          enabled: true,
+          sessionsCreated,
+          rotations,
+          totalRequests,
+          avgRequestsPerSession: sessionsCreated > 0 ? Math.round(totalRequests / sessionsCreated) : 0,
+          avgAgeMs: sessionCount > 0 ? Math.round(ageSum / sessionCount) : 0,
+          warmup,
+        },
+        pool: pool.stats(),
+        queue: queueStats,
+      };
+    } finally {
+      // Graceful queue shutdown — stop accepting jobs, finish in-flight, close.
+      try {
+        await queue.shutdown();
+      } catch (err) {
+        logger.warn('Queue shutdown error (non-fatal)', { error: err.message });
+      }
+      // Graceful pool shutdown (same as runWithPool).
+      try {
+        await pool.shutdown();
+      } catch (err) {
+        logger.warn('Pool shutdown error (non-fatal)', { error: err.message });
+      }
+      if (proxyPool) {
+        for (const w of pool.workers) {
+          if (w.proxy && w.proxy.id) {
+            try {
+              proxyPool.release(w.proxy.id, { success: !w.isRetired() });
+            } catch {
+              /* best-effort */
+            }
+          }
+        }
+      }
+    }
+    return queueResult;
+  };
+
   const startedAt = Date.now();
   let result;
 
   try {
+    // Phase 2.9 — queue path. --queue on submits the search-task as a BullMQ
+    // job (persisted in Redis, crash-resilient, priority-ordered); a worker
+    // pulls it off and feeds the pool. --queue off (default) skips this path
+    // entirely and falls through to Phase 2.8 / sequential.
+    if (cfg.queue.enabled) {
+      result = await runWithQueue();
+    }
     // Phase 2.8 — multi-worker path. --workers N > 1 runs the pool; --workers 1
     // (default) runs the existing single-browser pipeline unchanged.
-    if (cfg.workers.size > 1) {
+    else if (cfg.workers.size > 1) {
       result = await runWithPool();
     } else {
     // Phase 2.3 — acquire a proxy (if the pool is enabled) before launching
@@ -1564,6 +2099,18 @@ async function main() {
       `Pool:     ${ps.activeSize}/${ps.size} workers, ${ps.totals.tasksCompleted} tasks, ${ps.totals.businessesScraped} businesses, ${ps.requeueCount} re-queues${retired} (${ps.loadBalancer})`,
     );
   }
+  // Phase 2.9 — job queue stats line. Shows waiting/active/completed/failed/
+  // delayed counts. Omitted when --queue off (no queue constructed — Phase 2.8
+  // in-process behavior).
+  const queueLines = [];
+  if (result.queue) {
+    const qs = result.queue;
+    const failedTag = qs.failed > 0 ? `, ${qs.failed} FAILED` : '';
+    const delayedTag = qs.delayed > 0 ? `, ${qs.delayed} delayed` : '';
+    queueLines.push(
+      `Queue:    ${qs.completed} done, ${qs.active} active, ${qs.waiting} waiting${delayedTag}${failedTag} (BullMQ + Redis)`,
+    );
+  }
   const banner = [
     '========================================',
     'Run complete',
@@ -1578,6 +2125,7 @@ async function main() {
     ...captchaLines,
     ...sessionLines,
     ...poolLines,
+    ...queueLines,
     ...(logLine ? [logLine] : []),
     '========================================',
   ].join('\n');
