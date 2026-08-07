@@ -26,6 +26,11 @@
 
 const DEFAULT_DELAY_MS = 1000;
 
+// Phase 2.4 — lazy import to summarize the resolved fingerprint for the banner
+// row. Required lazily (not at module top) to keep banner.js free of any
+// fingerprint module side effects during unit tests of the pure builder.
+const { summarizeFingerprint } = require('./fingerprint');
+
 /**
  * Default sleep — a plain Promise-based delay. Exported so tests can stub it
  * via the `sleep` dependency of `showStartupBanner`.
@@ -89,6 +94,17 @@ function buildStartupBanner(cfg, opts = {}) {
       cfg.proxy && cfg.proxy.enabled
         ? `${cfg.proxy.strategy} (session ${cfg.proxy.sessionLength}, cooldown ${Math.round(cfg.proxy.cooldownMs / 1000)}s)${cfg.proxy.listFile ? ` [${cfg.proxy.listFile}]` : ''}${cfg.proxy.healthCheck ? ' +healthcheck' : ''}`
         : 'disabled (direct)',
+    ],
+    // Phase 2.4 — fingerprint summary. Shows the resolved profile summary when
+    // a fingerprint was generated, the profile mode (random/fixed) when not yet
+    // resolved (e.g. tests), or "disabled" when --noFingerprint / profile 'off'.
+    [
+      'Fingerprint',
+      cfg.fingerprint && cfg.fingerprint.resolved
+        ? `${cfg.fingerprint.profile}: ${summarizeFingerprint(cfg.fingerprint.resolved)}`
+        : cfg.fingerprint && cfg.fingerprint.profile && cfg.fingerprint.profile !== 'off'
+          ? `${cfg.fingerprint.profile} (not yet generated)`
+          : 'disabled (Phase 1 behavior)',
     ],
   ];
 

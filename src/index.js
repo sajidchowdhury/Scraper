@@ -79,6 +79,10 @@ const {
 } = require('./checkpoint');
 const { RateLimiter, detectCaptcha } = require('./antiblock');
 const { showStartupBanner } = require('./banner');
+// Phase 2.4 — browser fingerprint randomization. Loaded eagerly so the
+// fingerprint can be generated + logged before the browser launches (and so
+// --fixedFingerprint coherence failures surface at config time, not at launch).
+const { generateFingerprint, summarizeFingerprint } = require('./fingerprint');
 // Phase 2.1 — PostgreSQL persistence (lazy-loaded; only used when
 // cfg.output includes 'db').
 const { createPool, persistRunResults, closePool } = require('./db');
@@ -205,6 +209,68 @@ async function main() {
       reason: cfg.proxy.enabled === false ? 'no proxy source configured (use --proxyListFile or PROXY_LIST_FILE)' : '--noProxy flag set',
     });
   }
+
+  // Phase 2.4 — generate the per-run fingerprint. Generated ONCE here (before
+  // the browser launches) so the same fingerprint is used for the whole
+  // session. Per-worker persistence (Phase 2.8) will move this into the worker
+  // pool — for now, the single-browser pipeline gets one fingerprint.
+  //
+  // --noFingerprint / fingerprintProfile 'off' → no fingerprint (Phase 1
+  //   behavior: pickUserAgent() + cfg.viewport + 'en-US' + 'America/Toronto').
+  // --fingerprintProfile random  → generateFingerprint() picks a coherent
+  //   profile (UA + platform + viewport + timezone + locale + WebGL + canvas
+  //   noise + hw concurrency + device memory + geolocation).
+  // --fingerprintProfile fixed   → use the profile supplied via
+  //   --fixedFingerprint <json>. Coherence is validated; an incoherent fixed
+  //   profile is rejected (treated as 'off' with a warning) rather than
+  //   shipping a detectable mismatch.
+  let fingerprint = null;
+  if (cfg.fingerprint.profile === 'off') {
+    logger.info('Phase 2.4 — fingerprint randomization disabled (Phase 1 behavior)', {
+      reason: '--noFingerprint flag or NO_FINGERPRINT=true',
+    });
+  } else if (cfg.fingerprint.profile === 'fixed') {
+    let fixed = null;
+    try {
+      fixed = JSON.parse(cfg.fingerprint.fixedJson);
+    } catch (err) {
+      // Should never happen — validate() catches this at config time. But we
+      // defend in depth so a runtime .env change can't crash the run.
+      logger.error('Phase 2.4 — --fixedFingerprint JSON parse failed', { error: err.message });
+    }
+    if (fixed) {
+      fingerprint = generateFingerprint({ fixed, logger });
+      if (!fingerprint) {
+        logger.warn('Phase 2.4 — fixed fingerprint failed coherence check; falling back to Phase 1 behavior', {
+          hint: 'Fix the --fixedFingerprint JSON or rerun with --fingerprintProfile random',
+        });
+      }
+    }
+  } else {
+    // 'random' (the default)
+    fingerprint = generateFingerprint({ logger });
+    if (!fingerprint) {
+      logger.warn('Phase 2.4 — fingerprint generation failed; falling back to Phase 1 behavior', {
+        hint: 'This is unexpected — check that the user-agents library is installed',
+      });
+    }
+  }
+  if (fingerprint) {
+    logger.info('Phase 2.4 — fingerprint generated', {
+      summary: summarizeFingerprint(fingerprint),
+      profile: cfg.fingerprint.profile,
+      userAgent: fingerprint.userAgent,
+      platform: fingerprint.platform,
+      viewport: fingerprint.viewport,
+      timezone: fingerprint.timezone,
+      locale: fingerprint.locale,
+      webglVendor: fingerprint.webglVendor,
+      hardwareConcurrency: fingerprint.hardwareConcurrency,
+      deviceMemory: fingerprint.deviceMemory,
+    });
+  }
+  // Store on cfg so downstream code (banner, future worker pool) can read it.
+  cfg.fingerprint.resolved = fingerprint;
 
   // Phase 1.10 — startup banner. Prints the resolved config and waits 1s so
   // the operator can eyeball it and Ctrl-C if it looks wrong. Skipped (no
@@ -417,6 +483,9 @@ async function main() {
       logger,
       // Phase 2.3 — pass the acquired proxy through to launchBrowser.
       proxy: acquiredProxy,
+      // Phase 2.4 — pass the per-run fingerprint through to launchBrowser.
+      // null when --noFingerprint / profile 'off' → Phase 1 context defaults.
+      fingerprint: cfg.fingerprint.resolved,
       onBlocked: ({ status, url, count }) => {
         logger.warn('Google returned a block-status response', { status, url, count });
         // Phase 2.3 — a 429/503 from Google while using a proxy is a strong

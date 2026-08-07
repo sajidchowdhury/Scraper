@@ -92,6 +92,10 @@ function parseArgs(argv) {
     else if (a === '--noProxy') out.noProxy = true;
     else if (a === '--proxyListFile') out.proxyListFile = argv[++i];
     else if (a === '--proxyHealthCheck') out.proxyHealthCheck = true;
+    // Phase 2.4 — browser fingerprint randomization
+    else if (a === '--fingerprintProfile') out.fingerprintProfile = argv[++i];
+    else if (a === '--fixedFingerprint') out.fixedFingerprint = argv[++i];
+    else if (a === '--noFingerprint') out.noFingerprint = true;
   }
   return out;
 }
@@ -223,6 +227,32 @@ function validate(cfg) {
     errors.push(
       `--proxyListFile not found: ${cfg.proxy.listFile} (set PROXY_LIST_FILE in .env or pass --proxyListFile <path>)`,
     );
+  }
+  // Phase 2.4 — fingerprint validation
+  if (!['random', 'fixed', 'off'].includes(cfg.fingerprint.profile)) {
+    errors.push(
+      `fingerprintProfile must be one of random, fixed, off (got "${cfg.fingerprint.profile}")`,
+    );
+  }
+  // --fixedFingerprint must be valid JSON when fingerprintProfile is 'fixed'.
+  // We parse it here so a malformed string fails fast at config time, not at
+  // the first browser launch. The coherence check itself happens in index.js
+  // (it needs the fingerprint module loaded).
+  if (cfg.fingerprint.profile === 'fixed') {
+    if (!cfg.fingerprint.fixedJson) {
+      errors.push(
+        'fingerprintProfile=fixed requires --fixedFingerprint <json> (a JSON object with userAgent, platform, locale, timezone, ...)',
+      );
+    } else {
+      try {
+        const parsed = JSON.parse(cfg.fingerprint.fixedJson);
+        if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) {
+          errors.push('--fixedFingerprint must be a JSON object, not ' + typeof parsed);
+        }
+      } catch (e) {
+        errors.push(`--fixedFingerprint is not valid JSON: ${e.message}`);
+      }
+    }
   }
   return errors;
 }
@@ -358,6 +388,22 @@ function loadConfig(argv = process.argv.slice(2)) {
       burnLogPath: process.env.PROXY_BURN_LOG || null,
     },
 
+    // Phase 2.4 — Browser fingerprint randomization.
+    //   --noFingerprint              → profile 'off' (Phase 1 behavior preserved)
+    //   --fingerprintProfile random  → randomized coherent profile per run (DEFAULT)
+    //   --fingerprintProfile fixed   → use the profile supplied via --fixedFingerprint <json>
+    // The resolved profile is generated in src/index.js (it needs the fingerprint
+    // module + logger) and passed to launchBrowser({ fingerprint }).
+    fingerprint: {
+      profile: cli.noFingerprint || process.env.NO_FINGERPRINT === 'true'
+        ? 'off'
+        : (cli.fingerprintProfile || process.env.FINGERPRINT_PROFILE || 'random'),
+      fixedJson: cli.fixedFingerprint || process.env.FIXED_FINGERPRINT || null,
+      // Resolved at runtime in index.js (the actual profile object, not the JSON string).
+      // Stored on cfg so the pipeline can pass it to launchBrowser().
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -423,6 +469,14 @@ Optional:
   --proxyHealthCheck         Phase 2.3 — probe every proxy with a HEAD before scraping
   --noProxy                  Phase 2.3 — force direct connection (Phase 1 behavior)
 
+  --fingerprintProfile <s>   Phase 2.4 — random | fixed | off (default: random)
+                             Each run gets a coherent fingerprint: UA, viewport,
+                             timezone, locale, WebGL, canvas noise, hw concurrency.
+  --fixedFingerprint <json>  Phase 2.4 — pin a specific fingerprint (requires
+                             --fingerprintProfile fixed). JSON object with
+                             userAgent, platform, locale, timezone, viewport, etc.
+  --noFingerprint            Phase 2.4 — disable randomization (Phase 1 behavior)
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
@@ -444,6 +498,12 @@ Examples:
   npm start -- --query "Cafe" --location "Berlin" --proxyStrategy round-robin --sessionLength 5
   npm start -- --query "Cafe" --location "Berlin" --proxyListFile ./proxies.txt --proxyHealthCheck
   npm start -- --query "Cafe" --location "Berlin" --noProxy   # force direct connection
+
+  # Phase 2.4 — fingerprint randomization (on by default)
+  npm start -- --query "Cafe" --location "Berlin"               # random fingerprint per run
+  npm start -- --query "Cafe" --location "Berlin" --noFingerprint   # Phase 1 behavior
+  npm start -- --query "Cafe" --location "Berlin" --fingerprintProfile fixed \
+    --fixedFingerprint '{"userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131","platform":"Win32","locale":"en-US","timezone":"America/New_York","languages":["en-US","en"],"viewport":{"width":1920,"height":1080},"screen":{"width":1920,"height":1080},"webglVendor":"Intel Inc.","webglRenderer":"Intel(R) UHD Graphics 630","canvasNoiseSeed":42,"hardwareConcurrency":8,"deviceMemory":8,"geolocation":{"latitude":40.7128,"longitude":-74.006}}'
 
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun

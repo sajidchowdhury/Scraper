@@ -25,6 +25,10 @@ function cleanEnv() {
   delete process.env.RETRY_BASE_MS;
   delete process.env.RESUME;
   delete process.env.FRESH;
+  // Phase 2.4 — fingerprint env vars
+  delete process.env.NO_FINGERPRINT;
+  delete process.env.FINGERPRINT_PROFILE;
+  delete process.env.FIXED_FINGERPRINT;
 }
 
 describe('Phase 1.7 — CLI flag parsing', () => {
@@ -181,5 +185,154 @@ describe('Phase 1.7 — HELP_TEXT', () => {
 
   test('includes --resume example', () => {
     expect(HELP_TEXT).toContain('--resume   # continue after a crash');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2.4 — fingerprint config flags
+// ---------------------------------------------------------------------------
+
+describe('Phase 2.4 — fingerprint CLI flag parsing', () => {
+  beforeEach(() => cleanEnv());
+
+  test('default: fingerprint.profile = "random" (on by default)', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin']);
+    expect(cfg.fingerprint.profile).toBe('random');
+    expect(cfg.fingerprint.fixedJson).toBeNull();
+    expect(cfg.fingerprint.resolved).toBeNull(); // resolved later in index.js
+  });
+
+  test('--noFingerprint sets profile to "off"', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin', '--noFingerprint']);
+    expect(cfg.fingerprint.profile).toBe('off');
+  });
+
+  test('NO_FINGERPRINT=true env sets profile to "off"', () => {
+    process.env.NO_FINGERPRINT = 'true';
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin']);
+    expect(cfg.fingerprint.profile).toBe('off');
+  });
+
+  test('--fingerprintProfile random sets profile explicitly', () => {
+    const cfg = loadConfig([
+      '--query', 'Cafe', '--location', 'Berlin', '--fingerprintProfile', 'random',
+    ]);
+    expect(cfg.fingerprint.profile).toBe('random');
+  });
+
+  test('--fingerprintProfile fixed sets profile to "fixed"', () => {
+    const cfg = loadConfig([
+      '--query', 'Cafe', '--location', 'Berlin',
+      '--fingerprintProfile', 'fixed',
+      '--fixedFingerprint', '{"userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131","platform":"Win32","locale":"en-US","timezone":"America/New_York","languages":["en-US","en"],"viewport":{"width":1920,"height":1080},"screen":{"width":1920,"height":1080},"webglVendor":"Intel Inc.","webglRenderer":"Intel(R) UHD Graphics 630","canvasNoiseSeed":42,"hardwareConcurrency":8,"deviceMemory":8,"geolocation":{"latitude":40.7128,"longitude":-74.006}}',
+    ]);
+    expect(cfg.fingerprint.profile).toBe('fixed');
+    expect(cfg.fingerprint.fixedJson).toContain('"platform":"Win32"');
+  });
+
+  test('FINGERPRINT_PROFILE env var is honored', () => {
+    process.env.FINGERPRINT_PROFILE = 'off';
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin']);
+    expect(cfg.fingerprint.profile).toBe('off');
+  });
+
+  test('--noFingerprint overrides --fingerprintProfile random', () => {
+    const cfg = loadConfig([
+      '--query', 'Cafe', '--location', 'Berlin',
+      '--fingerprintProfile', 'random', '--noFingerprint',
+    ]);
+    expect(cfg.fingerprint.profile).toBe('off');
+  });
+});
+
+describe('Phase 2.4 — fingerprint validation', () => {
+  beforeEach(() => cleanEnv());
+
+  test('invalid fingerprintProfile value → error', () => {
+    const cfg = loadConfig([
+      '--query', 'Cafe', '--location', 'Berlin',
+      '--fingerprintProfile', 'bogus',
+    ]);
+    expect(cfg.errors).toContainEqual(
+      expect.stringContaining('fingerprintProfile must be one of random, fixed, off'),
+    );
+  });
+
+  test('fingerprintProfile=fixed without --fixedFingerprint → error', () => {
+    const cfg = loadConfig([
+      '--query', 'Cafe', '--location', 'Berlin',
+      '--fingerprintProfile', 'fixed',
+    ]);
+    expect(cfg.errors).toContainEqual(
+      expect.stringContaining('fingerprintProfile=fixed requires --fixedFingerprint'),
+    );
+  });
+
+  test('fingerprintProfile=fixed with invalid JSON → error', () => {
+    const cfg = loadConfig([
+      '--query', 'Cafe', '--location', 'Berlin',
+      '--fingerprintProfile', 'fixed',
+      '--fixedFingerprint', '{not valid json',
+    ]);
+    expect(cfg.errors).toContainEqual(
+      expect.stringContaining('--fixedFingerprint is not valid JSON'),
+    );
+  });
+
+  test('fingerprintProfile=fixed with non-object JSON (array) → error', () => {
+    const cfg = loadConfig([
+      '--query', 'Cafe', '--location', 'Berlin',
+      '--fingerprintProfile', 'fixed',
+      '--fixedFingerprint', '[1,2,3]',
+    ]);
+    expect(cfg.errors).toContainEqual(
+      expect.stringContaining('--fixedFingerprint must be a JSON object'),
+    );
+  });
+
+  test('valid fixed fingerprint → no fingerprint errors', () => {
+    const cfg = loadConfig([
+      '--query', 'Cafe', '--location', 'Berlin',
+      '--fingerprintProfile', 'fixed',
+      '--fixedFingerprint', '{"userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131","platform":"Win32","locale":"en-US","timezone":"America/New_York","languages":["en-US","en"],"viewport":{"width":1920,"height":1080},"screen":{"width":1920,"height":1080},"webglVendor":"Intel Inc.","webglRenderer":"Intel(R) UHD Graphics 630","canvasNoiseSeed":42,"hardwareConcurrency":8,"deviceMemory":8,"geolocation":{"latitude":40.7128,"longitude":-74.006}}',
+    ]);
+    const fpErrors = cfg.errors.filter((e) => e.toLowerCase().includes('fingerprint'));
+    expect(fpErrors).toEqual([]);
+  });
+
+  test('profile random → no fingerprint errors', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin']);
+    const fpErrors = cfg.errors.filter((e) => e.toLowerCase().includes('fingerprint'));
+    expect(fpErrors).toEqual([]);
+  });
+
+  test('profile off → no fingerprint errors', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin', '--noFingerprint']);
+    const fpErrors = cfg.errors.filter((e) => e.toLowerCase().includes('fingerprint'));
+    expect(fpErrors).toEqual([]);
+  });
+});
+
+describe('Phase 2.4 — HELP_TEXT', () => {
+  beforeEach(() => cleanEnv());
+
+  test('includes --fingerprintProfile', () => {
+    expect(HELP_TEXT).toContain('--fingerprintProfile');
+    expect(HELP_TEXT).toContain('random | fixed | off');
+  });
+
+  test('includes --fixedFingerprint', () => {
+    expect(HELP_TEXT).toContain('--fixedFingerprint');
+    expect(HELP_TEXT).toContain('pin a specific fingerprint');
+  });
+
+  test('includes --noFingerprint', () => {
+    expect(HELP_TEXT).toContain('--noFingerprint');
+    expect(HELP_TEXT).toContain('disable randomization');
+  });
+
+  test('includes Phase 2.4 examples', () => {
+    expect(HELP_TEXT).toContain('Phase 2.4 — fingerprint randomization');
+    expect(HELP_TEXT).toContain('--noFingerprint   # Phase 1 behavior');
   });
 });

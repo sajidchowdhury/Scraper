@@ -10,9 +10,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 2.2 complete. 3 of 13 sub-phases shipped.
+> **Last updated:** Phase 2.4 complete. 5 of 13 sub-phases shipped.
 >
-> **Overall:** 3 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
+> **Overall:** 5 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -20,7 +20,7 @@
 | 2.1 — PostgreSQL Persistence Layer | ✅ DONE | _(this commit)_ | 475 (+65) | `src/db.js` (pool, upserts, change-hash), `schema.sql`, `migrate.js`, `--output csv\|json\|db\|all` flag, batched upserts, transaction rollback, SQL-injection-safe |
 | 2.2 — Change Tracking & History | ✅ DONE | _(this commit)_ | 551 (+76) | `business_snapshots` + `field_changes` tables, `src/db/deltas.js` (computeChanges, numericDelta), snapshot-on-update, `changes_detected` on scrape_runs, `npm run db:history` CLI, change-breakdown banner |
 | 2.3 — Proxy Management & Rotation | ✅ DONE | 52 tests | `src/proxy.js`, `src/proxy/burn-detector.js` | pool, 3 rotation strategies, burn detection, health check |
-| 2.4 — Browser Fingerprint Randomization | ⬜ NOT STARTED | — | — | UA, viewport, timezone, locale, WebGL, canvas, fonts |
+| 2.4 — Browser Fingerprint Randomization | ✅ DONE | 96 tests | `src/fingerprint.js`, `src/browser.js` (fingerprint-aware launch), `src/config.js` (--fingerprintProfile/--fixedFingerprint/--noFingerprint), `src/banner.js` (fingerprint row), `src/index.js` (per-run generation + logging) | coherent UA+platform+viewport+timezone+locale+WebGL+canvas noise+hw concurrency+device memory+geolocation; init-script injection; 1000× coherence stress test |
 | 2.5 — Stealth Hardening | ⬜ NOT STARTED | — | — | `playwright-extra` + stealth, `navigator.webdriver`, headless evasion |
 | 2.6 — CAPTCHA Auto-Solving | ⬜ NOT STARTED | — | — | 2Captcha/Anti-Captcha/CapSolver integration, fallback chain |
 | 2.7 — Session & Cookie Rotation | ⬜ NOT STARTED | — | — | Fresh context every N requests, warmup hooks |
@@ -378,7 +378,7 @@ A proxy rotation layer that distributes requests across a pool and self-heals by
 
 ## Phase 2.4 — Browser Fingerprint Randomization
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE** — `src/fingerprint.js` ships coherent UA+platform+viewport+timezone+locale+WebGL+canvas noise+hw concurrency+device memory+geolocation profiles, with init-script injection. 96 module tests + 18 config tests, 1000× coherence stress test passes with zero issues.
 
 ### Goal
 Every browser session gets a randomized but coherent fingerprint: user-agent, viewport, timezone, locale, screen resolution, WebGL vendor, canvas noise, and platform. The fingerprint is internally consistent (a Chrome-on-Windows UA doesn't pair with a Mac platform) to avoid easy detection.
@@ -387,7 +387,7 @@ Every browser session gets a randomized but coherent fingerprint: user-agent, vi
 Google's bot detection looks for fingerprint inconsistencies (e.g., Chrome UA + Mac platform + Linux timezone = bot). Coherent randomization makes each session look like a distinct real user, dramatically reducing block rate.
 
 ### Task checklist
-- [ ] **Fingerprint generator.** `src/fingerprint.js`:
+- [x] **Fingerprint generator.** `src/fingerprint.js`:
   - `generateFingerprint({ logger })` — returns a coherent profile:
     - `userAgent` (from `user-agents` library, filtered to recent Chrome/Firefox/Safari)
     - `platform` (derived from UA — `Win32`, `MacIntel`, `Linux x86_64`)
@@ -405,7 +405,7 @@ Google's bot detection looks for fingerprint inconsistencies (e.g., Chrome UA + 
     - If UA says Windows → platform must be `Win32`, timezone must be American/European, not Asian.
     - If UA says Mac → platform `MacIntel`.
     - If locale is `de-DE` → timezone must be `Europe/Berlin` or `Europe/Vienna`.
-- [ ] **Browser application.** Modify `src/browser.js`:
+- [x] **Browser application.** Modify `src/browser.js`:
   - `launchBrowser({ fingerprint, ...opts })` — applies:
     - `--user-agent` arg via context options.
     - `viewport` via context options.
@@ -419,13 +419,13 @@ Google's bot detection looks for fingerprint inconsistencies (e.g., Chrome UA + 
     - `WebGLRenderingContext.getParameter` for vendor/renderer.
     - `HTMLCanvasElement.toDataURL` / `toBlob` to add canvas noise.
   - Log: `Fingerprint applied (ua=Chrome/120 Win, tz=America/New_York, vp=1920x1080, webgl=Intel)`.
-- [ ] **Fingerprint persistence per worker.** Each worker (Phase 2.8) gets one fingerprint for its lifetime. Rotating fingerprints within a session is suspicious (real users don't change UAs mid-session).
-- [ ] **Fingerprint logging.** Each run logs the fingerprint used (UA, timezone, viewport) so ops can correlate block events with fingerprints.
-- [ ] **Config flags.**
-  - `--fingerprintProfile random|fixed` (default: random)
+- [x] **Fingerprint persistence per worker.** Each worker (Phase 2.8) gets one fingerprint for its lifetime. Rotating fingerprints within a session is suspicious (real users don't change UAs mid-session). _Implemented as per-run generation in `src/index.js`; per-worker persistence lands with Phase 2.8._
+- [x] **Fingerprint logging.** Each run logs the fingerprint used (UA, timezone, viewport) so ops can correlate block events with fingerprints.
+- [x] **Config flags.**
+  - `--fingerprintProfile random|fixed|off` (default: random)
   - `--fixedFingerprint <json>` (for debugging — pins a specific fingerprint)
   - `--noFingerprint` (disables randomization; Phase 1 behavior)
-- [ ] **Unit tests.** `tests/fingerprint.test.js`:
+- [x] **Unit tests.** `tests/fingerprint.test.js`:
   - `generateFingerprint()` produces coherent profiles (run 1000 times, assert no incoherent combos).
   - UA says Windows → platform is Win32.
   - Locale de-DE → timezone is European.
@@ -444,7 +444,7 @@ Google's bot detection looks for fingerprint inconsistencies (e.g., Chrome UA + 
 Phase 2.0 (dependencies). Pairs with Phase 2.3 (proxies) and Phase 2.7 (sessions).
 
 ### Deliverable
-A fingerprint randomization layer that makes each browser session look like a distinct, coherent real user.
+A fingerprint randomization layer that makes each browser session look like a distinct, coherent real user. **Shipped:** `src/fingerprint.js` (generateFingerprint, validateCoherence, buildContextOptions, buildInitScript, applyFingerprintToContext, summarizeFingerprint; LOCALE_PROFILES for 6 locales en-US/en-GB/de-DE/fr-FR/es-ES/en-AU with timezone+geolocation pairs; WEBGL_PAIRS for 4 vendors with 2-3 renderers each; mulberry32 seeded PRNG for deterministic canvas noise), `src/browser.js` fingerprint-aware launch (buildContextOptions merged into newContext + addInitScript injection of navigator/WebGL/canvas overrides), `src/config.js` (--fingerprintProfile random|fixed|off, --fixedFingerprint <json>, --noFingerprint + validation), `src/banner.js` (Fingerprint row), `src/index.js` (per-run fingerprint generation + logging + cfg.fingerprint.resolved), `tests/fingerprint.test.js` (96 tests / 4909 assertions including 1000× coherence stress, UA→platform/locale→tz coherence, canvas noise determinism, WebGL pair coherence, stub-page init-script override verification), `tests/config.test.js` (+18 tests for fingerprint flag parsing + validation + HELP_TEXT). 717 tests / 6530 assertions passing.
 
 ---
 
