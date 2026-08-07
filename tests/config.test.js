@@ -619,3 +619,133 @@ describe('Phase 2.8 — HELP_TEXT', () => {
     expect(HELP_TEXT).toContain('--workers 3   # 3 parallel workers');
   });
 });
+
+describe('Phase 2.11 — self-healing selectors config', () => {
+  test('cfg.selectors section exists with all fields', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B']);
+    expect(cfg.selectors).toBeDefined();
+    expect(cfg.selectors).toHaveProperty('skipHealthCheck');
+    expect(cfg.selectors).toHaveProperty('autoDiscover');
+    expect(cfg.selectors).toHaveProperty('selectorDebugDump');
+    expect(cfg.selectors).toHaveProperty('maxSelectorAge');
+    expect(cfg.selectors).toHaveProperty('debugDumpDir');
+    expect(cfg.selectors).toHaveProperty('healthCheckFixture');
+  });
+
+  test('defaults: healthCheck on, autoDiscover on, debugDump on, maxSelectorAge 30', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B']);
+    expect(cfg.selectors.skipHealthCheck).toBe(false);
+    expect(cfg.selectors.autoDiscover).toBe(true);
+    expect(cfg.selectors.selectorDebugDump).toBe(true);
+    expect(cfg.selectors.maxSelectorAge).toBe(30);
+  });
+
+  test('--skipHealthCheck sets skipHealthCheck=true', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--skipHealthCheck']);
+    expect(cfg.selectors.skipHealthCheck).toBe(true);
+  });
+
+  test('--autoDiscover off sets autoDiscover=false', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--autoDiscover', 'off']);
+    expect(cfg.selectors.autoDiscover).toBe(false);
+  });
+
+  test('--autoDiscover on sets autoDiscover=true', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--autoDiscover', 'on']);
+    expect(cfg.selectors.autoDiscover).toBe(true);
+  });
+
+  test('--selectorDebugDump off sets selectorDebugDump=false', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--selectorDebugDump', 'off']);
+    expect(cfg.selectors.selectorDebugDump).toBe(false);
+  });
+
+  test('--maxSelectorAge 60 sets maxSelectorAge=60', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--maxSelectorAge', '60']);
+    expect(cfg.selectors.maxSelectorAge).toBe(60);
+  });
+
+  test('--selectorDebugDir /tmp/dumps sets debugDumpDir', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--selectorDebugDir', '/tmp/dumps']);
+    expect(cfg.selectors.debugDumpDir).toBe('/tmp/dumps');
+  });
+
+  test('default debugDumpDir is ./data/selector-debug', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B']);
+    expect(cfg.selectors.debugDumpDir).toBe('./data/selector-debug');
+  });
+
+  test('default healthCheckFixture points to tests/fixtures/Cafe_Berlin_feed.html', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B']);
+    expect(cfg.selectors.healthCheckFixture).toContain('Cafe_Berlin_feed.html');
+  });
+
+  test('AUTO_DISCOVER=off env var disables autoDiscover', () => {
+    process.env.AUTO_DISCOVER = 'off';
+    const cfg = loadConfig(['--query', 'C', '--location', 'B']);
+    expect(cfg.selectors.autoDiscover).toBe(false);
+    delete process.env.AUTO_DISCOVER;
+  });
+
+  test('SKIP_HEALTH_CHECK=true env var skips health check', () => {
+    process.env.SKIP_HEALTH_CHECK = 'true';
+    const cfg = loadConfig(['--query', 'C', '--location', 'B']);
+    expect(cfg.selectors.skipHealthCheck).toBe(true);
+    delete process.env.SKIP_HEALTH_CHECK;
+  });
+
+  test('HEALTH_CHECK=off env var skips health check', () => {
+    process.env.HEALTH_CHECK = 'off';
+    const cfg = loadConfig(['--query', 'C', '--location', 'B']);
+    expect(cfg.selectors.skipHealthCheck).toBe(true);
+    delete process.env.HEALTH_CHECK;
+  });
+
+  test('MAX_SELECTOR_AGE env var sets maxSelectorAge', () => {
+    process.env.MAX_SELECTOR_AGE = '45';
+    const cfg = loadConfig(['--query', 'C', '--location', 'B']);
+    expect(cfg.selectors.maxSelectorAge).toBe(45);
+    delete process.env.MAX_SELECTOR_AGE;
+  });
+
+  test('maxSelectorAge validation rejects 0', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--maxSelectorAge', '0']);
+    expect(cfg.errors.join('\n')).toMatch(/maxSelectorAge must be between 1 and 365/);
+  });
+
+  test('maxSelectorAge validation rejects 366', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--maxSelectorAge', '366']);
+    expect(cfg.errors.join('\n')).toMatch(/maxSelectorAge must be between 1 and 365/);
+  });
+
+  test('maxSelectorAge accepts 365 (boundary)', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--maxSelectorAge', '365']);
+    expect(cfg.errors.join('\n')).not.toMatch(/maxSelectorAge/);
+  });
+});
+
+describe('Phase 2.11 — HELP_TEXT', () => {
+  test('includes --skipHealthCheck', () => {
+    expect(HELP_TEXT).toContain('--skipHealthCheck');
+    expect(HELP_TEXT).toContain('Phase 2.11');
+  });
+
+  test('includes --autoDiscover', () => {
+    expect(HELP_TEXT).toContain('--autoDiscover on|off');
+    expect(HELP_TEXT).toContain('heuristic field auto-discovery');
+  });
+
+  test('includes --selectorDebugDump', () => {
+    expect(HELP_TEXT).toContain('--selectorDebugDump on|off');
+    expect(HELP_TEXT).toContain('data/selector-debug/');
+  });
+
+  test('includes --maxSelectorAge', () => {
+    expect(HELP_TEXT).toContain('--maxSelectorAge <days>');
+    expect(HELP_TEXT).toContain('selector sets are older');
+  });
+
+  test('includes --selectorDebugDir', () => {
+    expect(HELP_TEXT).toContain('--selectorDebugDir <path>');
+  });
+});

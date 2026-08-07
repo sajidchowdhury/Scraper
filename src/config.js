@@ -141,6 +141,49 @@ function parseArgs(argv) {
     else if (a === '--queuePriority') out.queuePriority = argv[++i];
     else if (a === '--queueAttempts') out.queueAttempts = argv[++i];
     else if (a === '--queueConcurrency') out.queueConcurrency = argv[++i];
+    // Phase 2.10 — memory management & long-run stability. These flags keep
+    // the scraper running 8+ hours without OOM or zombie Chromium processes:
+    //   --contextRestartEvery N — force-restart the browser context every N
+    //                             tasks (clears Chrome memory leaks; 0 = off).
+    //   --maxHeapMb N           — per-worker heap threshold (MB). Crossing it
+    //                             fires the memory monitor's onThreshold
+    //                             callback (which restarts the context).
+    //   --maxRssMb N            — total process RSS threshold (MB). Crossing it
+    //                             triggers graceful degradation (pause queue,
+    //                             restart contexts, reduce pool size).
+    //   --endless               — keep pulling jobs from the queue indefinitely
+    //                             (Phase 5 continuous scraping). Implies an
+    //                             aggressive memory monitor + hourly zombie
+    //                             reaper + HTTP /health endpoint.
+    //   --healthCheckIntervalMs — memory monitor + worker probe cadence (ms).
+    //                             Default 30000 (memory) / 60000 (worker probe).
+    //   --healthPort N          — bind a GET /health HTTP endpoint on this port
+    //                             (default: off; auto-on when --endless).
+    else if (a === '--contextRestartEvery') out.contextRestartEvery = argv[++i];
+    else if (a === '--maxHeapMb') out.maxHeapMb = argv[++i];
+    else if (a === '--maxRssMb') out.maxRssMb = argv[++i];
+    else if (a === '--endless') out.endless = true;
+    else if (a === '--healthCheckIntervalMs') out.healthCheckIntervalMs = argv[++i];
+    else if (a === '--healthPort') out.healthPort = argv[++i];
+    else if (a === '--healthHost') out.healthHost = argv[++i];
+    else if (a === '--noHealthServer') out.noHealthServer = true;
+    // Phase 2.11 — self-healing selectors & health checks. These flags
+    // control the startup selector health check, heuristic field auto-
+    // discovery, DOM-snippet debug dumps, and selector-set age warnings.
+    //   --skipHealthCheck       — don't run the pre-scrape extraction-rate
+    //                             health check (emergency runs only).
+    //   --autoDiscover on|off   — heuristic field discovery when selectors
+    //                             fail (default: on).
+    //   --selectorDebugDump on|off — write DOM snippets for low-rate fields
+    //                             to data/selector-debug/ (default: on).
+    //   --maxSelectorAge N      — warn when selector sets are older than N
+    //                             days (default: 30).
+    //   --selectorDebugDir <p>  — override the dump directory.
+    else if (a === '--skipHealthCheck') out.skipHealthCheck = true;
+    else if (a === '--autoDiscover') out.autoDiscover = argv[++i];
+    else if (a === '--selectorDebugDump') out.selectorDebugDump = argv[++i];
+    else if (a === '--maxSelectorAge') out.maxSelectorAge = argv[++i];
+    else if (a === '--selectorDebugDir') out.selectorDebugDir = argv[++i];
   }
   return out;
 }
@@ -482,6 +525,74 @@ function validate(cfg) {
   // a single-worker pool can still process queue jobs but with no concurrency
   // benefit). We WARN (not error) — a single worker + queue is a valid config
   // for low-throughput crash-resilient runs.
+  // Phase 2.10 — memory management validation.
+  if (cfg.health.contextRestartEvery !== 0 && cfg.health.contextRestartEvery < 1) {
+    errors.push(
+      `contextRestartEvery must be 0 (off) or >= 1 (got ${cfg.health.contextRestartEvery}). ` +
+        'Force-restart the browser context every N tasks to clear Chrome memory.',
+    );
+  }
+  if (cfg.health.contextRestartEvery > 10000) {
+    errors.push(
+      `contextRestartEvery is suspiciously large (got ${cfg.health.contextRestartEvery}). ` +
+        'For 8+ hour runs use 50–200; 10000+ defeats the memory-reclamation purpose.',
+    );
+  }
+  if (cfg.health.maxHeapMb < 64 || cfg.health.maxHeapMb > 8192) {
+    errors.push(
+      `maxHeapMb must be between 64 and 8192 (got ${cfg.health.maxHeapMb}). ` +
+        'Per-worker heap threshold for the memory monitor (default 1024).',
+    );
+  }
+  if (cfg.health.maxRssMb < 256 || cfg.health.maxRssMb > 32768) {
+    errors.push(
+      `maxRssMb must be between 256 and 32768 (got ${cfg.health.maxRssMb}). ` +
+        'Total process RSS threshold for graceful degradation (default 4096).',
+    );
+  }
+  if (cfg.health.maxRssMb <= cfg.health.maxHeapMb) {
+    errors.push(
+      `maxRssMb (${cfg.health.maxRssMb}) must be > maxHeapMb (${cfg.health.maxHeapMb}). ` +
+        'The total-process threshold must exceed the per-worker threshold.',
+    );
+  }
+  if (cfg.health.memoryIntervalMs < 1000 || cfg.health.memoryIntervalMs > 60 * 60 * 1000) {
+    errors.push(
+      `healthCheckIntervalMs must be between 1000 and 3600000 (got ${cfg.health.memoryIntervalMs}). ` +
+        'Memory monitor + worker probe cadence (default 30000).',
+    );
+  }
+  if (cfg.health.port !== null && (cfg.health.port < 1 || cfg.health.port > 65535)) {
+    errors.push(
+      `healthPort must be between 1 and 65535 (got ${cfg.health.port}). ` +
+        'Set to 0 or omit to disable the HTTP /health endpoint.',
+    );
+  }
+  // --endless requires --queue on (the endless loop pulls jobs from the queue;
+  // without a queue there's nothing to pull).
+  if (cfg.health.endless && !cfg.queue.enabled) {
+    errors.push(
+      '--endless requires --queue on (the endless loop pulls jobs from the ' +
+        'BullMQ queue; without a queue there is nothing to pull). See .env.example → Phase 2.10.',
+    );
+  }
+  // Phase 2.11 — self-healing selector validation.
+  if (cfg.selectors.autoDiscover !== true && cfg.selectors.autoDiscover !== false) {
+    errors.push(
+      `autoDiscover must be one of on, off (got "${cfg.selectors.autoDiscover}"). Use --autoDiscover on|off.`,
+    );
+  }
+  if (cfg.selectors.selectorDebugDump !== true && cfg.selectors.selectorDebugDump !== false) {
+    errors.push(
+      `selectorDebugDump must be one of on, off (got "${cfg.selectors.selectorDebugDump}"). Use --selectorDebugDump on|off.`,
+    );
+  }
+  if (cfg.selectors.maxSelectorAge < 1 || cfg.selectors.maxSelectorAge > 365) {
+    errors.push(
+      `maxSelectorAge must be between 1 and 365 days (got ${cfg.selectors.maxSelectorAge}). ` +
+        'Warn when selector sets are older than this (default 30).',
+    );
+  }
   return errors;
 }
 
@@ -770,6 +881,92 @@ function loadConfig(argv = process.argv.slice(2)) {
       resolved: null,
     },
 
+    // Phase 2.10 — memory management & long-run stability.
+    //   --contextRestartEvery N    — force-restart the browser context every N
+    //                                tasks (clears Chrome memory leaks; 0 = off,
+    //                                preserves Phase 2.7 behavior). Default 50
+    //                                (matches the execution plan).
+    //   --maxHeapMb N              — per-worker heap threshold (MB). Crossing
+    //                                it fires the memory monitor's onThreshold
+    //                                callback (which restarts the context).
+    //                                Default 1024.
+    //   --maxRssMb N               — total process RSS threshold (MB). Crossing
+    //                                it triggers graceful degradation (pause
+    //                                queue, restart contexts, reduce pool size).
+    //                                Default 4096.
+    //   --endless                  — keep pulling jobs from the queue indefinitely
+    //                                (Phase 5 continuous scraping). Implies an
+    //                                aggressive memory monitor + hourly zombie
+    //                                reaper + HTTP /health endpoint. Requires
+    //                                --queue on.
+    //   --healthCheckIntervalMs N  — memory monitor + worker probe cadence.
+    //                                Default 30000 (memory) / 60000 (worker probe).
+    //   --healthPort N             — bind a GET /health HTTP endpoint on this
+    //                                port (default: off; auto-on when --endless).
+    //   --healthHost <host>        — bind host (default 127.0.0.1; set 0.0.0.0
+    //                                to expose externally — make sure the port
+    //                                is firewalled).
+    //   --noHealthServer           — force-disable the HTTP /health endpoint
+    //                                even when --endless is set.
+    health: {
+      contextRestartEvery:
+        toIntOrNull(cli.contextRestartEvery ?? process.env.CONTEXT_RESTART_EVERY) ?? 50,
+      maxHeapMb: toIntOrNull(cli.maxHeapMb ?? process.env.MAX_HEAP_MB) ?? 1024,
+      maxRssMb: toIntOrNull(cli.maxRssMb ?? process.env.MAX_RSS_MB) ?? 4096,
+      endless: !!cli.endless || process.env.ENDLESS === 'on' || process.env.ENDLESS === 'true',
+      memoryIntervalMs:
+        toIntOrNull(cli.healthCheckIntervalMs ?? process.env.HEALTH_CHECK_INTERVAL_MS) ?? 30_000,
+      workerProbeIntervalMs:
+        toIntOrNull(process.env.WORKER_PROBE_INTERVAL_MS) ?? 60_000,
+      workerMaxHeapMb: toIntOrNull(process.env.WORKER_MAX_HEAP_MB) ?? 500,
+      stuckAfterMs: toIntOrNull(process.env.WORKER_STUCK_AFTER_MS) ?? 10 * 60 * 1000,
+      probeTimeoutMs: toIntOrNull(process.env.WORKER_PROBE_TIMEOUT_MS) ?? 5_000,
+      probeThreshold: toIntOrNull(process.env.WORKER_PROBE_THRESHOLD) ?? 3,
+      logEveryMs: toIntOrNull(process.env.MEMORY_LOG_EVERY_MS) ?? 5 * 60 * 1000,
+      port: toIntOrNull(cli.healthPort ?? process.env.HEALTH_PORT) ?? null,
+      host: cli.healthHost || process.env.HEALTH_HOST || '127.0.0.1',
+      serverEnabled:
+        (!!cli.endless || process.env.ENDLESS === 'on' || process.env.ENDLESS === 'true') &&
+        !cli.noHealthServer,
+      // Resolved at runtime in index.js into { stack } (null when not started).
+      resolved: null,
+    },
+
+    // Phase 2.11 — self-healing selectors & health checks.
+    //   --skipHealthCheck          — don't run the pre-scrape extraction-rate
+    //                                health check (emergency runs only).
+    //   --autoDiscover on|off      — heuristic field discovery when selectors
+    //                                fail (default: on). When a discoverable
+    //                                field (phone, website, rating,
+    //                                reviews_count) is null on a card, scan
+    //                                the card DOM for a pattern match.
+    //   --selectorDebugDump on|off — write DOM snippets for low-rate fields
+    //                                to data/selector-debug/ (default: on).
+    //   --maxSelectorAge N         — warn when selector sets are older than N
+    //                                days (default: 30).
+    //   --selectorDebugDir <path>  — override the dump directory (default:
+    //                                ./data/selector-debug).
+    selectors: {
+      skipHealthCheck:
+        !!cli.skipHealthCheck || process.env.SKIP_HEALTH_CHECK === 'true' ||
+        process.env.HEALTH_CHECK === 'off',
+      autoDiscover:
+        (cli.autoDiscover || process.env.AUTO_DISCOVER || 'on') === 'on',
+      selectorDebugDump:
+        (cli.selectorDebugDump || process.env.SELECTOR_DEBUG_DUMP || 'on') === 'on',
+      maxSelectorAge:
+        toIntOrNull(cli.maxSelectorAge ?? process.env.MAX_SELECTOR_AGE) ?? 30,
+      debugDumpDir: cli.selectorDebugDir || process.env.SELECTOR_DEBUG_DIR || './data/selector-debug',
+      // Path to the HTML fixture used by the startup health check. When set,
+      // the health check loads this fixture instead of doing a live search.
+      // Defaults to tests/fixtures/Cafe_Berlin_feed.html (captured in Phase 2.0).
+      healthCheckFixture:
+        process.env.HEALTH_CHECK_FIXTURE ||
+        path.join(process.cwd(), 'tests', 'fixtures', 'Cafe_Berlin_feed.html'),
+      // Resolved at runtime in index.js into { ran, ok, rates }.
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -917,6 +1114,52 @@ Optional:
   --queueConcurrency <n>     Phase 2.9 — worker concurrency (how many jobs the
                              worker pulls off the queue in parallel; default 1).
                              Should be <= --workers.
+
+  --contextRestartEvery <n>  Phase 2.10 — force-restart the browser context every
+                             N tasks to clear Chrome memory leaks (default 50;
+                             0 = off, preserves Phase 2.7 behavior).
+  --maxHeapMb <n>            Phase 2.10 — per-worker heap threshold (MB) for the
+                             memory monitor (default 1024). Crossing it fires the
+                             onThreshold callback (which restarts the context).
+  --maxRssMb <n>             Phase 2.10 — total process RSS threshold (MB) for
+                             graceful degradation (default 4096). Crossing it
+                             pauses the queue, restarts contexts, reduces pool.
+  --endless                  Phase 2.10 — keep pulling jobs from the queue
+                             indefinitely (Phase 5 continuous scraping). Requires
+                             --queue on. Implies an aggressive memory monitor +
+                             hourly zombie reaper + HTTP /health endpoint.
+  --healthCheckIntervalMs <ms> Phase 2.10 — memory monitor + worker probe cadence
+                             (default 30000 for memory; 60000 for worker probe).
+  --healthPort <n>           Phase 2.10 — bind a GET /health HTTP endpoint on
+                             this port (default: off; auto-on when --endless).
+  --healthHost <host>        Phase 2.10 — /health bind host (default 127.0.0.1).
+  --noHealthServer           Phase 2.10 — force-disable the HTTP /health endpoint.
+
+  --skipHealthCheck          Phase 2.11 — skip the pre-scrape extraction-rate
+                             health check (emergency runs only). The check
+                             loads a fixture, runs extraction, and aborts if
+                             core fields (name, rating, reviews_count,
+                             address) are below 50% — likely a DOM change.
+  --autoDiscover on|off      Phase 2.11 — heuristic field auto-discovery when
+                             selectors fail (default: on). When a discoverable
+                             field (phone, website, rating, reviews_count) is
+                             null on a card, scan the card DOM for a pattern
+                             match (phone regex, non-Google <a href>, aria-
+                             label containing "stars", etc.). Logs the
+                             suggested selector for the operator to add to
+                             src/extract.js.
+  --selectorDebugDump on|off Phase 2.11 — write DOM snippets for low-rate
+                             fields to data/selector-debug/ (default: on).
+                             When a field's extraction rate drops below 80%,
+                             the first 500 chars of each card's innerHTML is
+                             written to {field}_{timestamp}.html — gives the
+                             developer a sample to craft a new selector.
+  --maxSelectorAge <days>    Phase 2.11 — warn when selector sets are older
+                             than this many days (default: 30). Bump the
+                             version + lastVerifiedDate in src/selectors/
+                             version.js when you re-verify against a fixture.
+  --selectorDebugDir <path>  Phase 2.11 — override the debug-dump directory
+                             (default: ./data/selector-debug).
 
   --version                  Print version and exit
   --help, -h                 Show this help

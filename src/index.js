@@ -128,6 +128,32 @@ const {
 // dispatch runs unchanged (no Redis required).
 const { createQueue } = require('./queue');
 
+// Phase 2.10 — memory management & long-run stability. The health stack wires
+// together a memory monitor, worker probe, zombie reaper, graceful-degradation
+// handler, and (optionally) an HTTP /health endpoint. Only the zombie reaper
+// runs unconditionally (startup reap); the rest require --workers > 1 OR
+// --endless OR a non-default --contextRestartEvery / --maxHeapMb setting.
+const {
+  createHealthStack,
+  createZombieReaper,
+  startMemoryMonitor,
+  startWorkerProbe,
+  createDegradation,
+  createHealthServer,
+} = require('./health');
+
+// Phase 2.11 — self-healing selectors & health checks. The selectors module
+// wires together: selector versioning (with staleness warning), a startup
+// extraction-rate health check (loads a fixture, aborts if core fields are
+// below 50%), heuristic field auto-discovery (pattern-based fallback when
+// selectors fail), and DOM-snippet debug dumps for low-rate fields.
+const fs = require('fs');
+const {
+  logSelectorVersion,
+  healthCheck,
+  SELECTOR_FAILURE_EXIT_CODE,
+} = require('./selectors');
+
 async function main() {
   const cfg = loadConfig(process.argv.slice(2));
 
@@ -182,7 +208,20 @@ async function main() {
       provider: cfg.proxy.provider,
       healthCheck: cfg.proxy.healthCheck,
     },
+    selectors: {
+      skipHealthCheck: cfg.selectors.skipHealthCheck,
+      autoDiscover: cfg.selectors.autoDiscover,
+      selectorDebugDump: cfg.selectors.selectorDebugDump,
+      maxSelectorAge: cfg.selectors.maxSelectorAge,
+    },
   });
+
+  // Phase 2.11 — log the active selector versions + emit a staleness warning
+  // for any set older than --maxSelectorAge (default 30 days). This is the
+  // first line of defense against silent selector rot: if the selectors
+  // were last verified 60 days ago, the operator is warned to re-run the
+  // fixture test before trusting the extraction rates.
+  logSelectorVersion(logger, { maxAgeDays: cfg.selectors.maxSelectorAge });
 
   // Phase 1.8 — construct the rate limiter once and attach to cfg so every
   // module that makes Google-bound requests (search, detail) can acquire.
@@ -508,9 +547,32 @@ async function main() {
   }, cfg.globalTimeoutMs);
 
   // Graceful Ctrl-C — on SIGINT the checkpoint stays on disk for --resume.
+  // Phase 2.10 — also runs the zombie reaper shutdown sweep so no Chromium
+  // processes survive a Ctrl-C (acceptance criterion: "On Ctrl-C, zero
+  // orphaned Chromium processes remain").
   let browserClosed = false;
   const onSigInt = async () => {
     logger.warn('SIGINT received — shutting down (checkpoint preserved for --resume)');
+    // Phase 2.10 — best-effort zombie reap before exit. We can't await in a
+    // SIGINT handler reliably (the process may exit first), so we fire-and-
+    // forget with a 2s deadline. The finally blocks of runWithPool /
+    // runWithQueue / sequential pipeline also call stopHealthStack which
+    // runs the same reap — this is the backstop for when the run hasn't
+    // started yet or is stuck.
+    try {
+      const reaper = createZombieReaper({ logger });
+      const report = await Promise.race([
+        reaper.reapOnShutdown({ ownPid: process.pid }),
+        new Promise((resolve) => setTimeout(() => resolve({ killed: [] }), 2000)),
+      ]);
+      if (report && report.killed && report.killed.length > 0) {
+        logger.info('SIGINT zombie reaper: cleaned up Chromium processes', {
+          killed: report.killed,
+        });
+      }
+    } catch {
+      /* best-effort */
+    }
     process.exit(130);
   };
   process.on('SIGINT', onSigInt);
@@ -555,6 +617,175 @@ async function main() {
       hint: 'Use --queue on (requires REDIS_URL) for batch processing + crash resilience',
     });
   }
+
+  // Phase 2.10 — memory management & long-run stability.
+  // The zombie reaper ALWAYS runs: it scans for orphaned Chromium processes
+  // left over from a previous crashed run and kills them before we launch
+  // our own browsers (otherwise we'd compete for the display socket + RAM).
+  // The rest of the health stack (memory monitor, worker probe, degradation
+  // handler, HTTP /health server) is wired up after the pool/queue are built
+  // — see "Phase 2.10 — wire the health stack" further down.
+  const zombieReaper = createZombieReaper({ logger });
+  let startupReapReport = null;
+  try {
+    startupReapReport = await zombieReaper.reapOnStartup({ ownPid: process.pid });
+    zombieReaper.logReport(startupReapReport, { when: 'startup' });
+  } catch (err) {
+    logger.warn('Phase 2.10 — zombie reaper startup sweep failed (non-fatal)', {
+      error: err.message,
+    });
+  }
+
+  if (cfg.health.endless) {
+    logger.info('Phase 2.10 — endless mode enabled', {
+      hint: 'The scraper will pull jobs from the queue indefinitely (Phase 5 continuous scraping)',
+      memoryIntervalMs: cfg.health.memoryIntervalMs,
+      contextRestartEvery: cfg.health.contextRestartEvery,
+      maxHeapMb: cfg.health.maxHeapMb,
+      maxRssMb: cfg.health.maxRssMb,
+      healthPort: cfg.health.port,
+    });
+  } else if (cfg.health.contextRestartEvery > 0 || cfg.health.port) {
+    logger.info('Phase 2.10 — memory management enabled', {
+      contextRestartEvery: cfg.health.contextRestartEvery,
+      maxHeapMb: cfg.health.maxHeapMb,
+      maxRssMb: cfg.health.maxRssMb,
+      memoryIntervalMs: cfg.health.memoryIntervalMs,
+      healthPort: cfg.health.port,
+    });
+  } else {
+    logger.info('Phase 2.10 — memory management at defaults (contextRestartEvery=50, monitor + zombie reaper active)', {
+      hint: 'Use --endless (with --queue on) for continuous scraping, or --maxHeapMb / --maxRssMb to tune thresholds',
+    });
+  }
+
+  // Phase 2.10 — buildHealthStack: construct + start the memory monitor,
+  // worker probe, degradation handler, and HTTP /health server. Called by
+  // runWithPool + runWithQueue AFTER the pool (and queue, if any) are built
+  // — the health stack needs live references to them. The returned object's
+  // .stop() is wired into the finally block of each runner so intervals are
+  // cleared + the HTTP server is closed on shutdown.
+  //
+  // The onThreshold callback fires when the process-wide heap crosses
+  // cfg.health.maxHeapMb; it does nothing dramatic on its own (just logs)
+  // because the per-worker memory-based restart is handled by each worker's
+  // session manager (shouldRestartForMemory → restartForMemory) via the
+  // worker probe's onIssue callback below.
+  //
+  // The onIssue callback fires when a worker is bloated / stuck / unresponsive.
+  // For 'heap' issues it calls the worker's session manager restartForMemory
+  // (which closes + reopens the context, reclaiming Chrome memory). For
+  // 'stuck' / 'unresponsive' issues it logs — the pool's crash/re-queue
+  // machinery handles the actual restart (a stuck task eventually times out
+  // → throws → markCrashed → rotateIdentity).
+  const buildHealthStack = async (pool, queue) => {
+    const getWorkers = () => (pool && pool.workers ? pool.workers : []);
+    const onMemoryThreshold = (snap) => {
+      logger.warn('Phase 2.10 — process-wide heap threshold exceeded', {
+        heapMb: snap.heapUsedMb,
+        thresholdMb: cfg.health.maxHeapMb,
+        hint: 'Per-worker context restarts are handled by the worker probe; this is the process-wide backstop',
+      });
+    };
+    const onWorkerIssue = async (worker, issue) => {
+      logger.warn('Phase 2.10 — worker health issue detected', {
+        workerId: worker.id,
+        issueType: issue.type,
+        issue,
+      });
+      if (issue.type === 'heap' && worker.sessionManager) {
+        try {
+          await worker.sessionManager.restartForMemory({ reason: 'worker-probe-heap' });
+        } catch (err) {
+          logger.warn('Phase 2.10 — worker context restart failed (non-fatal)', {
+            workerId: worker.id,
+            error: err.message,
+          });
+        }
+      }
+      // 'stuck' + 'unresponsive' are logged only — the pool's task timeout
+      // + crash machinery handles the actual worker restart. A future phase
+      // could force-kill the worker's browser process here.
+    };
+    // Degradation callbacks — only wired when both pool + queue exist (the
+    // graceful-degradation sequence pauses the queue, which requires a queue).
+    const pauseFn = queue ? async () => { await queue.pause(); } : null;
+    const resumeFn = queue ? async () => { await queue.resume(); } : null;
+    const restartWorkerFn = async (worker) => {
+      if (worker.sessionManager && typeof worker.sessionManager.restartForMemory === 'function') {
+        await worker.sessionManager.restartForMemory({ reason: 'degradation' });
+      }
+    };
+    const reducePoolFn = () => {
+      // Retire the first non-retired worker to shed load. The pool's
+      // dispatch will route around it. Returns the new active size.
+      const w = pool.workers.find((x) => !x.isRetired());
+      if (w) {
+        try {
+          w.markCrashed(new Error('memory pressure — pool reduction'));
+        } catch {
+          /* best-effort */
+        }
+      }
+      return pool.activeSize;
+    };
+    const gcFn = typeof global.gc === 'function' ? () => global.gc() : null;
+
+    const stack = createHealthStack({
+      cfg,
+      logger,
+      pool,
+      queue,
+      getWorkers,
+      getRss: () => process.memoryUsage().rss,
+      gcFn,
+      onMemoryThreshold,
+      onWorkerIssue,
+      pauseFn,
+      resumeFn,
+      restartWorkerFn,
+      reducePoolFn,
+      startedAt: Date.now(),
+      version: '1.0.0-phase2.10',
+      endless: cfg.health.endless,
+    });
+    try {
+      await stack.start();
+    } catch (err) {
+      logger.warn('Phase 2.10 — health stack start failed (non-fatal — continuing)', {
+        error: err.message,
+      });
+    }
+    cfg.health.resolved = { stack };
+    return stack;
+  };
+
+  // Phase 2.10 — stopHealthStack: best-effort shutdown of the health stack.
+  // Called from the finally block of runWithPool + runWithQueue. Also runs
+  // the zombie reaper's shutdown sweep to ensure no Chromium processes
+  // survive the run.
+  const stopHealthStack = async (stack, knownBrowserPids = []) => {
+    if (stack && typeof stack.stop === 'function') {
+      try {
+        await stack.stop();
+      } catch (err) {
+        logger.warn('Phase 2.10 — health stack stop failed (non-fatal)', { error: err.message });
+      }
+    }
+    // Zombie reaper shutdown sweep — kill any Chromium processes we spawned
+    // that browser.close() didn't reap (defensive backstop).
+    try {
+      const report = await zombieReaper.reapOnShutdown({
+        ownPid: process.pid,
+        knownPids: knownBrowserPids,
+      });
+      zombieReaper.logReport(report, { when: 'shutdown' });
+    } catch (err) {
+      logger.warn('Phase 2.10 — zombie reaper shutdown sweep failed (non-fatal)', {
+        error: err.message,
+      });
+    }
+  };
 
   // Phase 2.8 — runWithPool: the multi-worker pipeline. Builds a pool, dispatches
   // a search-task (search + scroll + extract) to one worker, then — if deepScrape
@@ -614,6 +845,14 @@ async function main() {
         warmupFn: workerWarmupFn,
         createContext: workerSessionCreateContext,
         logger: logger.phase('session'),
+        // Phase 2.10 — periodic context restart + memory-based forced restart.
+        // contextRestartEvery clears Chrome memory leaks every N tasks; the
+        // getMemory accessor + memoryThresholdMb let the manager force-restart
+        // its own context when heap pressure is detected (called from the
+        // worker probe's onIssue callback — see healthStack wiring below).
+        contextRestartEvery: cfg.health.contextRestartEvery,
+        getMemory: () => process.memoryUsage(),
+        memoryThresholdMb: cfg.health.workerMaxHeapMb,
       });
       return { proxy, fingerprint: fp, sessionManager: workerSessionManager, rateLimiter: workerRateLimiter };
     };
@@ -667,6 +906,12 @@ async function main() {
                 location: task.location || cfg.location,
                 logger: wlogger,
                 retry: wcfg.retry,
+                selectors: {
+                  autoDiscover: cfg.selectors.autoDiscover,
+                  abortCheck: true,
+                  debugDump: cfg.selectors.selectorDebugDump,
+                  debugDumpDir: cfg.selectors.debugDumpDir,
+                },
               });
             return { businesses: freshBusinesses, scrollResult, extractionRates, extractStats };
           },
@@ -765,6 +1010,13 @@ async function main() {
       taskRetries: cfg.workers.taskRetries === null ? cfg.workers.size : cfg.workers.taskRetries,
       logger,
     });
+
+    // Phase 2.10 — start the health stack (memory monitor + worker probe +
+    // degradation handler + HTTP /health server) now that the pool exists.
+    // No queue is passed here (runWithPool is the in-process path); the
+    // degradation handler's pauseFn/resumeFn are null, so under memory
+    // pressure it skips the queue-pause step and just restarts contexts.
+    const healthStack = await buildHealthStack(pool, null);
 
     let poolResult;
     try {
@@ -958,6 +1210,9 @@ async function main() {
         pool: pool.stats(),
       };
     } finally {
+      // Phase 2.10 — stop the health stack (memory monitor + worker probe +
+      // HTTP /health server) and run the zombie reaper shutdown sweep.
+      await stopHealthStack(healthStack);
       // Graceful pool shutdown — workers finish current tasks, release proxies.
       try {
         await pool.shutdown();
@@ -1033,6 +1288,14 @@ async function main() {
         warmupFn: workerWarmupFn,
         createContext: workerSessionCreateContext,
         logger: logger.phase('session'),
+        // Phase 2.10 — periodic context restart + memory-based forced restart.
+        // contextRestartEvery clears Chrome memory leaks every N tasks; the
+        // getMemory accessor + memoryThresholdMb let the manager force-restart
+        // its own context when heap pressure is detected (called from the
+        // worker probe's onIssue callback — see healthStack wiring below).
+        contextRestartEvery: cfg.health.contextRestartEvery,
+        getMemory: () => process.memoryUsage(),
+        memoryThresholdMb: cfg.health.workerMaxHeapMb,
       });
       return { proxy, fingerprint: fp, sessionManager: workerSessionManager, rateLimiter: workerRateLimiter };
     };
@@ -1072,6 +1335,12 @@ async function main() {
                 location: task.location || cfg.location,
                 logger: wlogger,
                 retry: wcfg.retry,
+                selectors: {
+                  autoDiscover: cfg.selectors.autoDiscover,
+                  abortCheck: true,
+                  debugDump: cfg.selectors.selectorDebugDump,
+                  debugDumpDir: cfg.selectors.debugDumpDir,
+                },
               });
             return { businesses: freshBusinesses, scrollResult, extractionRates, extractStats };
           },
@@ -1196,7 +1465,13 @@ async function main() {
       return pool.dispatch(task);
     });
 
+    // Phase 2.10 — start the health stack now that BOTH the pool + queue
+    // exist. With a queue present, the degradation handler can pause/resume
+    // it under memory pressure (runWithPool skips this — no queue).
+    const healthStack = await buildHealthStack(pool, queue);
+
     let queueResult;
+    let queueErrored = false; // Phase 2.10 — drives endless-mode teardown decision
     try {
       // 1) Submit the search job + await completion. The job's result is the
       //    pool.dispatch return value: { businesses, scrollResult, extractionRates, extractStats }.
@@ -1456,26 +1731,52 @@ async function main() {
         pool: pool.stats(),
         queue: queueStats,
       };
+    } catch (err) {
+      // Phase 2.10 — mark the run as errored so the finally block tears down
+      // even in endless mode (a broken queue/pool shouldn't keep running).
+      queueErrored = true;
+      throw err;
     } finally {
-      // Graceful queue shutdown — stop accepting jobs, finish in-flight, close.
-      try {
-        await queue.shutdown();
-      } catch (err) {
-        logger.warn('Queue shutdown error (non-fatal)', { error: err.message });
-      }
-      // Graceful pool shutdown (same as runWithPool).
-      try {
-        await pool.shutdown();
-      } catch (err) {
-        logger.warn('Pool shutdown error (non-fatal)', { error: err.message });
-      }
-      if (proxyPool) {
-        for (const w of pool.workers) {
-          if (w.proxy && w.proxy.id) {
-            try {
-              proxyPool.release(w.proxy.id, { success: !w.isRetired() });
-            } catch {
-              /* best-effort */
+      // Phase 2.10 — in endless mode (AND the run succeeded), SKIP the
+      // teardown. The queue worker + pool + health stack stay alive so the
+      // BullMQ worker keeps pulling jobs from Redis as they arrive. The
+      // main() endless loop (further down) keeps the process alive; Ctrl-C
+      // triggers the SIGINT zombie reap + exit 130.
+      //
+      // If the run ERRORED, we tear down even in endless mode — a broken
+      // queue/pool shouldn't keep running. The operator restarts after
+      // investigating.
+      const skipTeardown = cfg.health.endless && !queueErrored;
+      if (skipTeardown) {
+        logger.info('Phase 2.10 — endless mode: keeping queue + pool + health stack alive for continuous scraping', {
+          queueName: queue.name,
+          activeWorkers: pool.activeSize,
+          healthPort: cfg.health.port,
+        });
+      } else {
+        // Phase 2.10 — stop the health stack (memory monitor + worker probe +
+        // HTTP /health server) and run the zombie reaper shutdown sweep.
+        await stopHealthStack(healthStack);
+        // Graceful queue shutdown — stop accepting jobs, finish in-flight, close.
+        try {
+          await queue.shutdown();
+        } catch (err) {
+          logger.warn('Queue shutdown error (non-fatal)', { error: err.message });
+        }
+        // Graceful pool shutdown (same as runWithPool).
+        try {
+          await pool.shutdown();
+        } catch (err) {
+          logger.warn('Pool shutdown error (non-fatal)', { error: err.message });
+        }
+        if (proxyPool) {
+          for (const w of pool.workers) {
+            if (w.proxy && w.proxy.id) {
+              try {
+                proxyPool.release(w.proxy.id, { success: !w.isRetired() });
+              } catch {
+                /* best-effort */
+              }
             }
           }
         }
@@ -1486,6 +1787,110 @@ async function main() {
 
   const startedAt = Date.now();
   let result;
+
+  // Phase 2.11 — startup extraction-rate health check. Loads a known-good
+  // HTML fixture (captured in Phase 2.0) into a throwaway browser, runs
+  // extractBusinesses, and aborts the run if any core field (name, rating,
+  // reviews_count, address) extracts below 50%. This catches a DOM change
+  // BEFORE the run spends time + proxy budget on a broken scrape.
+  //
+  // Skipped when:
+  //   - --skipHealthCheck is set (emergency runs)
+  //   - the fixture file is missing (fresh clone — warn but continue)
+  //   - --dryRun is set (smoke test — no point aborting)
+  //
+  // The health check uses a SEPARATE browser instance (launched + closed
+  // here) so it doesn't interfere with the main pipeline's browser state.
+  // Overhead: ~15s for browser launch + fixture load + extraction.
+  if (!cfg.selectors.skipHealthCheck && !cfg.dryRun) {
+    const fixturePath = cfg.selectors.healthCheckFixture;
+    if (!fs.existsSync(fixturePath)) {
+      logger.warn('Phase 2.11 — startup health check skipped (fixture not found)', {
+        fixturePath,
+        hint: 'Run `npm run capture-fixtures` to capture fixtures, or set HEALTH_CHECK_FIXTURE to a captured HTML file. Use --skipHealthCheck to silence this warning.',
+      });
+      cfg.selectors.resolved = { ran: false, ok: true, reason: 'fixture not found' };
+    } else {
+      logger.info('Phase 2.11 — running startup extraction-rate health check', {
+        fixturePath,
+        autoDiscover: cfg.selectors.autoDiscover,
+        hint: 'Loads a fixture, runs extraction, aborts if core fields < 50%',
+      });
+      const hcStartedAt = Date.now();
+      try {
+        // Use a minimal browser config for the health check — no fingerprint,
+        // no stealth, no proxy. The fixture is a static HTML file; we just
+        // need a DOM to extract from. This keeps the check fast (~15s).
+        const hcCfg = {
+          ...cfg,
+          headless: true,
+          fingerprint: { ...cfg.fingerprint, profile: 'off', resolved: null },
+          stealth: { ...cfg.stealth, profile: 'off', resolved: { enabled: false, debug: false } },
+          proxy: { ...cfg.proxy, enabled: false },
+        };
+        await withBrowser(hcCfg, async ({ page }) => {
+          const fixtureHtml = fs.readFileSync(fixturePath, 'utf8');
+          await page.setContent(fixtureHtml, { waitUntil: 'domcontentloaded' });
+          const { ok, health } = await healthCheck(page, {
+            logger,
+            autoDiscover: cfg.selectors.autoDiscover,
+            minSampleSize: 3,
+            coreThreshold: 50,
+            secondaryThreshold: 30,
+          });
+          const elapsedMs = Date.now() - hcStartedAt;
+          cfg.selectors.resolved = {
+            ran: true,
+            ok,
+            rates: health.coreRates,
+            elapsedMs,
+            failingCore: health.failingCore,
+            failingSecondary: health.failingSecondary,
+          };
+          if (!ok) {
+            logger.error('Phase 2.11 — startup health check FAILED — aborting run', {
+              elapsedMs,
+              failingCore: health.failingCore,
+              failingSecondary: health.failingSecondary,
+              coreRates: health.coreRates,
+              reason: health.reason,
+              hint: 'Run `npm run capture-fixtures` to refresh fixtures, then `bun test tests/selectors-fixture.test.js`. Use --skipHealthCheck to bypass for an emergency run.',
+            });
+            const err = new Error(health.reason || 'Selector health check failed');
+            err.code = 'SELECTOR_FAILURE';
+            err.exitCode = SELECTOR_FAILURE_EXIT_CODE;
+            err.health = health;
+            throw err;
+          }
+          logger.info('Phase 2.11 — startup health check passed', {
+            elapsedMs,
+            total: health.total,
+            coreRates: health.coreRates,
+            failingSecondary: health.failingSecondary,
+          });
+        });
+      } catch (err) {
+        if (err.code === 'SELECTOR_FAILURE') {
+          // Re-throw to the outer catch, which handles exit code 3.
+          throw err;
+        }
+        // Non-selector errors (browser launch failure, fixture parse error,
+        // etc.) are non-fatal — warn and continue. The main scrape might
+        // still work; the first-batch abort check is the backstop.
+        logger.warn('Phase 2.11 — startup health check errored (non-fatal — continuing)', {
+          error: err.message,
+          hint: 'The main scrape will proceed; the first-batch abort check is the backstop',
+        });
+        cfg.selectors.resolved = { ran: true, ok: true, error: err.message };
+      }
+    }
+  } else {
+    cfg.selectors.resolved = {
+      ran: false,
+      ok: true,
+      reason: cfg.selectors.skipHealthCheck ? '--skipHealthCheck' : '--dryRun',
+    };
+  }
 
   try {
     // Phase 2.9 — queue path. --queue on submits the search-task as a BullMQ
@@ -1585,6 +1990,12 @@ async function main() {
           location: cfg.location,
           logger,
           retry: cfg.retry,
+          selectors: {
+            autoDiscover: cfg.selectors.autoDiscover,
+            abortCheck: true,
+            debugDump: cfg.selectors.selectorDebugDump,
+            debugDumpDir: cfg.selectors.debugDumpDir,
+          },
         });
 
       logExtractionRates(extractionRates, logger);
@@ -1856,10 +2267,38 @@ async function main() {
           });
         }
       }
+      // Phase 2.10 — sequential-path zombie reaper shutdown sweep. The pool/
+      // queue paths do this in their own finally blocks via stopHealthStack;
+      // the sequential path has no health stack (single browser, no pool) but
+      // still needs to guarantee no orphaned Chromium processes survive.
+      try {
+        const report = await zombieReaper.reapOnShutdown({ ownPid: process.pid });
+        zombieReaper.logReport(report, { when: 'shutdown' });
+      } catch (err) {
+        logger.warn('Phase 2.10 — sequential zombie reaper failed (non-fatal)', {
+          error: err.message,
+        });
+      }
     }
     } // end Phase 2.8 else (sequential single-browser path)
   } catch (err) {
-    if (err && err.code === 'CAPTCHA_DETECTED') {
+    if (err && err.code === 'SELECTOR_FAILURE') {
+      // Phase 2.11 — extraction-rate abort. Core fields dropped below 50%,
+      // almost certainly because Google changed the DOM. Don't waste the
+      // run budget — exit with code 3 (selector failure) and tell the
+      // operator exactly which fields failed + how to fix.
+      logger.error('Run aborted — selector failure (extraction rates critically low)', {
+        failingCore: err.failingCore,
+        failingSecondary: err.failingSecondary,
+        coreRates: err.health ? err.health.coreRates : null,
+        reason: err.message,
+        hint: 'Run `npm run capture-fixtures` to refresh fixtures, then `bun test tests/selectors-fixture.test.js`. Inspect data/selector-debug/ for DOM snippets. Use --skipHealthCheck to bypass for an emergency run.',
+      });
+      clearTimeout(globalTimer);
+      process.removeListener('SIGINT', onSigInt);
+      logger.close();
+      process.exit(SELECTOR_FAILURE_EXIT_CODE);
+    } else if (err && err.code === 'CAPTCHA_DETECTED') {
       logger.error('Run aborted — CAPTCHA detected', {
         indicator: err.captchaIndicator,
         hint: 'Wait for the block to clear, then rerun with --resume',
@@ -1924,6 +2363,9 @@ async function main() {
     // Phase 2.8 — worker pool stats (per-worker counts + aggregate). Null when
     // --workers 1 (Phase 1 sequential behavior — no pool constructed).
     pool: result.pool || null,
+    // Phase 2.11 — self-healing selector stats: startup health check result +
+    // extraction-rate abort status + auto-discovery + debug-dump counts.
+    selectors: cfg.selectors.resolved || { ran: false, ok: true },
   };
 
   // Phase 2.1 — output dispatch. cfg.output is a normalized array of targets
@@ -2169,6 +2611,53 @@ async function main() {
   });
 
   clearTimeout(globalTimer);
+
+  // Phase 2.10 — endless mode. When --endless is on (requires --queue on),
+  // the scraper does NOT exit after the initial run. Instead it keeps the
+  // process alive so the BullMQ worker continues pulling jobs from the queue
+  // as they arrive (submitted by the batch CLI or any other producer). The
+  // memory monitor + worker probe + zombie reaper + HTTP /health server
+  // (all started inside runWithQueue) keep running. The operator stops the
+  // scraper with Ctrl-C (which triggers the SIGINT zombie reap + exit 130).
+  //
+  // Implementation: we DON'T call process.exit here. Instead we log a banner
+  // and await a never-resolving promise. The health server's /health endpoint
+  // keeps reporting status=ok|degraded|unhealthy. Memory pressure is handled
+  // by the degradation handler (pause queue → restart contexts → reduce pool).
+  if (cfg.health.endless && cfg.queue.enabled) {
+    logger.info('Phase 2.10 — endless mode: initial run complete, keeping process alive for queue jobs', {
+      hint: 'Submit more jobs via `npm run batch -- --file queries.csv`. Ctrl-C to stop.',
+      healthPort: cfg.health.port,
+      memoryIntervalMs: cfg.health.memoryIntervalMs,
+      exitCode,
+    });
+    // The queue adapter + pool + health stack were torn down in runWithQueue's
+    // finally block. For endless mode we need to RE-CONSTRUCT them so the
+    // BullMQ worker can keep pulling jobs. The cleanest path: re-call
+    // runWithQueue in a loop, but with an empty initial query (no search job
+    // submitted — just drain the queue). For Phase 2.10 we implement the
+    // simple version: keep the process alive with a periodic heartbeat log
+    // + the health endpoint. A future phase will add the full drain loop.
+    //
+    // NOTE: This is the documented Phase 2.10 surface. The full continuous-
+    // scrape loop (submitting a heartbeat search every N minutes to keep
+    // the queue warm) is Phase 5. Here we just guarantee the process
+    // doesn't exit + the health endpoint stays up.
+    const heartbeat = setInterval(() => {
+      const mem = process.memoryUsage();
+      logger.info('Phase 2.10 — endless heartbeat', {
+        uptimeMs: Date.now() - startedAt,
+        heapMb: Math.round(mem.heapUsed / (1024 * 1024)),
+        rssMb: Math.round(mem.rss / (1024 * 1024)),
+        exitCode,
+      });
+    }, 60 * 1000); // 1 min heartbeat
+    // Never-resolving promise — the process stays alive until Ctrl-C.
+    // The SIGINT handler (registered above) reaps zombies + exits 130.
+    await new Promise(() => {});
+    clearInterval(heartbeat);
+  }
+
   process.removeListener('SIGINT', onSigInt);
   logger.close();
   process.exit(exitCode);

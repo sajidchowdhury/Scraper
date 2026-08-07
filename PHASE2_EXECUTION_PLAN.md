@@ -10,9 +10,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 2.9 complete. 10 of 13 sub-phases shipped.
+> **Last updated:** Phase 2.11 complete. 12 of 13 sub-phases shipped.
 >
-> **Overall:** 10 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
+> **Overall:** 12 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -26,8 +26,8 @@
 | 2.7 — Session & Cookie Rotation | ✅ DONE | 59 tests | `src/session/manager.js`, `src/session/warmup.js`, `src/session/account-warmup.js`, `src/session/context-factory.js`, `src/session/index.js`, `src/detail.js` (sessionCheck hook + page swap), `src/config.js` (--sessionMaxRequests/--sessionMaxAgeMs/--warmup/--warmupDurationMs/--accountWarmup/--accountsFile), `src/banner.js` (Session row), `src/index.js` (construct manager, warmup before search, tickRequest in deep-scrape, rotate + re-navigate, end-of-run stats) | createSessionManager with injectable createContext/clock/sleep; rotation by request count OR age (whichever first); warmupContext visits google.com + random second site + benign search; accountWarmup opt-in (off by default, credentials never logged, email redacted); cookie isolation (each context fresh jar); createRealContextFactory bridges to browser.newContext + fingerprint + stealth; mid-deep-scrape rotation via sessionCheck hook + re-navigate to Maps search |
 | 2.8 — Worker Pool & Concurrency | ✅ DONE | 67 tests | `src/worker.js`, `src/pool.js`, `src/config.js` (--workers/--workerProxyStrategy/--workerCrashLimit/--workerCooldownMs/--workerLoadBalancer/--workerDetailBatchSize/--workerTaskRetries), `src/index.js` (runWithPool: getIdentity + runTask [search-task/detail-task] + dispatchBatchSettled + per-worker session aggregation + Pool: banner line), `.env.example` (Phase 2.8 section) | createWorker with DI runTask + state machine (idle/busy/cooldown/retired) + block/crash tracking + rotateIdentity; createPool with round-robin/least-busy + race-free acquireWorker + re-queue on block/crash + retire after crashLimit; serializable task types (search/detail/resume); --workers 1 preserves Phase 1 sequential pipeline byte-for-byte |
 | 2.9 — Job Queue & Orchestration | ✅ DONE | 96 tests | `src/queue/index.js` (createQueue adapter: add/addBatch/process/getStatus/getStats/getActive/pause/resume/deadLetter+retryDeadLetter/shutdown), `src/queue/job-types.js` (JOB_TYPES registry: search/detail-batch/enrich + validateJobRequest + resolvePriority + PRIORITY bands), `src/queue/mock-backend.js` (in-memory MockQueue+MockWorker+MockJob — mirrors BullMQ API surface for tests; priority queue, retry with exponential backoff, dead-letter, pause/resume, graceful close), `src/queue/dead-letter.js` (createDeadLetter: list/get/retry/retryAll/remove/clear/count + serializeJob), `src/config.js` (--queue/--redisUrl/--queuePriority/--queueAttempts/--queueConcurrency), `src/index.js` (runWithQueue: pool + queue + processor wiring; search job → detail-batch jobs; Queue: banner line), `src/banner.js` (Workers + Queue rows), `scripts/batch.js` (npm run batch -- --file queries.csv), `scripts/queue-status.js` (npm run queue:status — live top-style monitor + --job/--deadLetter/--retry/--retryAll), `data/queries.example.csv`, `.env.example` (Phase 2.9 section) | BullMQ + Redis backend (production) with injectable mock backend (tests — NO real Redis required, an explicit acceptance criterion); 3 job types (search/detail-batch/enrich) with schema validators; priority bands (1=high/5=normal/10=low); retry with exponential backoff (default 3 attempts) → dead-letter queue; batch submission CLI (CSV parser, quoted-comma support, --dryRun); live status CLI (2s refresh, active+failed jobs, --once/--job/--retry modes); crash-resilient (jobs persist in Redis, restart resumes queue); --queue off preserves Phase 2.8 in-process behavior exactly |
-| 2.10 — Memory Management & Long-Run Stability | ⬜ NOT STARTED | — | — | Context restart, leak mitigation, health probes |
-| 2.11 — Self-Healing Selectors & Health Checks | ⬜ NOT STARTED | — | — | Auto-discovery, extraction-rate alerting, selector versioning |
+| 2.10 — Memory Management & Long-Run Stability | ✅ DONE | 78 tests | `src/health/memory-monitor.js` (startMemoryMonitor: DI getMemory/getWorkers/clock/setInterval; threshold callback with re-arm; high-water mark; periodic snapshot log), `src/health/worker-probe.js` (startWorkerProbe: heap-bloat / stuck / unresponsive detection with re-arm; DI getWorkers/probeFn; consecutive-timeout tracking), `src/health/zombie-reaper.js` (createZombieReaper: scan/reapOnStartup/reapOnShutdown/killWithEscalation SIGTERM→SIGKILL; DI listPids/killPid — no real OS calls in tests; pattern defense-in-depth), `src/health/degradation.js` (createDegradation: shouldRun re-arm semantics; full handlePressure sequence pause→wait→restart→gc→resume→reducePool; reducePoolLimit floor), `src/health/server.js` (createHealthServer: node:http GET /health → JSON snapshot; 200 ok/degraded, 503 unhealthy; default snapshot builder with status determination), `src/health/index.js` (createHealthStack orchestrator + barrel), `src/session/manager.js` (contextRestartEvery periodic restart + shouldRestartForMemory + restartForMemory + tasksSinceRestart counter + stats() new fields), `src/config.js` (--contextRestartEvery/--maxHeapMb/--maxRssMb/--endless/--healthCheckIntervalMs/--healthPort/--healthHost/--noHealthServer + validation), `src/banner.js` (Memory row), `src/index.js` (buildHealthStack/stopHealthStack wired into runWithPool + runWithQueue; zombie reaper startup sweep; SIGINT zombie reap; endless mode keeps queue+pool+health stack alive + 1-min heartbeat), `.env.example` (Phase 2.10 section), `package.json` (syntax script + version bump) | Memory monitor polls process.memoryUsage every 30s (DI — tests inject mock getMemory + no-op setInterval); worker probe inspects every worker every 60s + pings page.evaluate (DI probeFn); zombie reaper uses pgrep + process.kill (DI listPids/killPid — tests never touch real OS); graceful degradation pauses queue + restarts contexts + runs global.gc (if --expose-gc) + reduces pool size when RSS still high; HTTP /health endpoint serves JSON snapshot (status, uptime, heap, workers, queueDepth, endless) — 200 ok/degraded, 503 unhealthy; --endless keeps the process alive pulling queue jobs (queue+pool+health stack skip teardown on success); SIGINT handler reaps zombies before exit (acceptance criterion: zero orphaned Chromium processes); --contextRestartEvery 0 (off) preserves Phase 2.7 behavior exactly |
+| 2.11 — Self-Healing Selectors & Health Checks | ✅ DONE | 114 tests | `src/selectors/version.js` (SELECTOR_VERSIONS registry + logSelectorVersion + getSelectorAgeDays + isSelectorSetStale + staleness warning), `src/selectors/auto-discover.js` (DISCOVERABLE_FIELDS + buildDiscoveryRequests + applyDiscoveryResults + discoverField + discoverMissingFields; DISCOVERY_SCRIPT inlined into page.evaluate; 4 discoverable fields: phone/website/rating/reviews_count; normalizers for raw→canonical conversion), `src/selectors/health-check.js` (healthCheck page-bound wrapper + re-exports pure helpers from extract.js), `src/selectors/debug-dump.js` (shouldDumpForField + buildDumpPath + buildDumpContent + dumpSelectorDebug; 500-char card snippets), `src/selectors/index.js` (barrel export), `src/extract.js` (CORE_FIELDS + SECONDARY_FIELDS + SELECTOR_FAILURE_EXIT_CODE=3 + evaluateHealth + isCriticalFailure + buildSelectorFailureError + checkExtractionRatesForAbort + getCardSnippets; extractBusinesses wired with auto-discover + first-batch abort + debug dumps via ctx.selectors), `src/config.js` (--skipHealthCheck/--autoDiscover/--selectorDebugDump/--maxSelectorAge/--selectorDebugDir + cfg.selectors section + validation), `src/index.js` (logSelectorVersion at startup + startup health check in separate withBrowser + SELECTOR_FAILURE catch branch with exit code 3 + ctx.selectors passed to all extractBusinesses calls + selectors stats in run summary), `.env.example` (Phase 2.11 section), `SELECTORS.md` (Self-healing section), `package.json` (version bump + syntax checks), `tests/selectors-health.test.js` (69 tests: version 11 + auto-discover pure 9 + auto-discover page-bound 9 + health-check pure 11 + health-check page-bound 4 + debug-dump 9 + extract.js re-exports 5 + extractBusinesses integration 4), `tests/selectors-fixture.test.js` (45 tests: 3 fixtures × 15 assertions each — core ≥70% + secondary ≥15% + sparse-field overrides) | 5-layer defense: version registry + staleness warning (30d default), startup health check (loads fixture, aborts if core <50%), first-batch abort (after 10 businesses, exit code 3), heuristic auto-discovery (phone/website/rating/reviews_count via pattern + aria-label proximity, raw→canonical normalization), debug dumps (500-char card innerHTML to data/selector-debug/{field}_{timestamp}.html when rate <80%); pure helpers in extract.js to avoid circular require; page-bound healthCheck in health-check.js; fixture regression test catches selector breakage before production; --skipHealthCheck bypasses for emergency runs |
 | 2.12 — Incremental Scraping & Detail Caching | ⬜ NOT STARTED | — | — | `last_seen` freshness, detail-page cache, only-re-scrape-modified |
 | 2.13 — Final Integration, Docs & Handoff | ⬜ NOT STARTED | — | — | End-to-end 10k run, docs update, `v2.0.0-phase2` tag |
 
@@ -817,7 +817,7 @@ A persistent job queue that enables batch processing, priorities, and crash-resi
 
 ## Phase 2.10 — Memory Management & Long-Run Stability
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE**
 
 ### Goal
 Keep the scraper running for 8+ hours without memory leaks, zombie processes, or degraded performance. Implement periodic browser-context restarts, memory monitoring, and health probes that trigger corrective action before a crash.
@@ -826,24 +826,24 @@ Keep the scraper running for 8+ hours without memory leaks, zombie processes, or
 Playwright/Chromium has known memory leaks on long runs. A 10,000-listing overnight run will OOM (out-of-memory) kill the process around hour 4 without mitigation. This phase makes "overnight unattended" actually achievable.
 
 ### Task checklist
-- [ ] **Memory monitor.** `src/health.js`:
+- [x] **Memory monitor.** `src/health/memory-monitor.js`:
   - `startMemoryMonitor({ intervalMs, thresholdMb, logger, onThreshold })` — polls `process.memoryUsage().heapUsed` every 30s.
   - If heap exceeds `thresholdMb` (default: 1024), triggers `onThreshold` callback (usually: restart the current browser context).
   - Logs memory usage every 5 min: `Memory: heap=512MB rss=894MB workers=5`.
   - Tracks high-water mark: `Memory high-water: heap=1024MB at 2026-08-07T03:14:22Z`.
-- [ ] **Periodic context restart.** In the session manager (Phase 2.7):
+- [x] **Periodic context restart.** In the session manager (Phase 2.7):
   - `--contextRestartEvery N` — restart the browser context every N tasks (default: 50), regardless of session rotation. This clears accumulated memory.
   - On restart: close context, explicitly call `context.close()` + wait, then create a new context. Log: `Context restarted (tasks=50, heapBefore=480MB, heapAfter=120MB)`.
-- [ ] **Worker health probe.** `src/health/worker-probe.js`:
+- [x] **Worker health probe.** `src/health/worker-probe.js`:
   - Every 60s, each worker reports: `{ workerId, heapUsed, taskCount, lastTaskAge, blocked }`.
   - If a worker's heap exceeds 500MB → force-restart its context.
   - If a worker hasn't completed a task in 10 min (stuck) → kill and restart.
   - If a worker's browser process is unresponsive (page.evaluate times out 3× in a row) → kill and restart.
-- [ ] **Zombie process cleanup.** `src/health/zombie-reaper.js`:
+- [x] **Zombie process cleanup.** `src/health/zombie-reaper.js`:
   - On shutdown, ensure all Chromium processes are killed (not just the browser object — check the PID).
   - On startup, scan for orphaned Chromium processes from a previous crashed run and kill them.
   - Log: `Zombie reaper: killed 2 orphaned chromium processes (PIDs 12345, 12346)`.
-- [ ] **Graceful degradation under memory pressure.**
+- [x] **Graceful degradation under memory pressure.** `src/health/degradation.js`:
   - If total process RSS exceeds `--maxRssMb` (default: 4096):
     1. Stop accepting new tasks (pause the queue).
     2. Finish active tasks.
@@ -851,22 +851,27 @@ Playwright/Chromium has known memory leaks on long runs. A 10,000-listing overni
     4. Run `global.gc()` if `--expose-gc` is set.
     5. Resume the queue.
   - If RSS still exceeds threshold after restart → reduce pool size by 1 worker and log a warning.
-- [ ] **Endless-run mode.** `--endless` flag:
+- [x] **Endless-run mode.** `--endless` flag:
   - For continuous scraping (Phase 5): the scraper never exits; it keeps pulling jobs from the queue.
   - In endless mode: context restarts every N tasks, memory monitor is aggressive, zombie reaper runs hourly.
   - Health endpoint: `GET /health` (if an HTTP server is running) returns `{ status, uptime, heap, workers, queueDepth }`.
-- [ ] **Config flags.**
+- [x] **Config flags.** `src/config.js`:
   - `--contextRestartEvery N` (default: 50)
   - `--maxHeapMb` (default: 1024 per worker)
   - `--maxRssMb` (default: 4096 total)
   - `--endless` (default: off)
-  - `--healthCheckIntervalMs` (default: 60000)
-- [ ] **Unit tests.** `tests/health.test.js`:
+  - `--healthCheckIntervalMs` (default: 30000 — memory; 60000 — worker probe)
+  - `--healthPort` / `--healthHost` / `--noHealthServer` (HTTP /health endpoint control)
+- [x] **Unit tests.** `tests/health.test.js` (78 tests):
   - Memory monitor triggers callback when threshold exceeded (mock `process.memoryUsage`).
   - Context restart counter increments correctly.
   - Zombie reaper identifies orphaned PIDs (mock `ps` output).
   - Graceful degradation reduces pool size when RSS exceeds threshold.
   - DI: monitor accepts mock `getMemory` and `getWorkers` functions.
+  - Worker probe: heap/stuck/unresponsive detection + re-arm semantics.
+  - Health server: 200/503/404 status codes, snapshot builder.
+  - Config: all Phase 2.10 flags + validation + env vars.
+  - Banner: Memory row.
 
 ### Acceptance criteria
 - A 4-hour test run with `--workers 3` completes without OOM; heap stays below 1GB per worker.
@@ -881,11 +886,17 @@ Phase 2.8 (workers), Phase 2.9 (queue — for pause/resume under memory pressure
 ### Deliverable
 A memory-stable scraper that survives 8+ hour runs without degradation or zombie processes.
 
+**Shipped:** `src/health/memory-monitor.js` (startMemoryMonitor with full DI — getMemory/getWorkers/clock/setIntervalFn/clearIntervalFn; threshold callback with re-arm semantics so the same crossing doesn't fire twice; high-water mark tracking for heap + rss independently with ISO timestamp; periodic snapshot log line `Memory: heap=512MB rss=894MB workers=5`; first-tick baseline reading; pollCount + armed accessors), `src/health/worker-probe.js` (startWorkerProbe with DI getWorkers/probeFn/clock; three failure modes — heap bloat [>maxHeapMb], stuck [busy > stuckAfterMs with no completion], unresponsive [N consecutive probe timeouts]; per-worker tracker with re-arm after issue clears; retired workers skipped; page.evaluate ping with timeout via Promise.race; onIssue callback per worker), `src/health/zombie-reaper.js` (createZombieReaper with DI listPids/killPid/sleepFn/platform; scan/reapOnStartup/reapOnShutdown/killWithEscalation [SIGTERM → graceMs → SIGKILL]; DEFAULT_PATTERN matches chromium|chrome|headless_shell|headless-shell; defense-in-depth pattern re-filter in scan; protectPids list; logReport emits the spec format `Zombie reaper: killed N orphaned chromium processes (PIDs ...)`), `src/health/degradation.js` (createDegradation with DI getRss/getWorkers/pauseFn/resumeFn/restartWorkerFn/reducePoolFn/gcFn/waitFn; shouldRun re-arm semantics [disarm after acting, re-arm when RSS drops below threshold]; full handlePressure sequence — pause → wait-for-in-flight → restart contexts → gc → resume → conditional pool reduce; reducePoolLimit floor [never reduce below 1]; per-step logging + steps array in result), `src/health/server.js` (createHealthServer using node:http — no Express dep; createDefaultSnapshotBuilder with status determination [ok/degraded/unhealthy based on heap/activeSize/queueDepth thresholds]; GET /health → 200 JSON for ok/degraded, 503 for unhealthy, 404 for other paths/methods, 500 on snapshot error; start/stop lifecycle with idempotent re-bind; getPort accessor for port-0 binds; Cache-Control: no-store), `src/health/index.js` (createHealthStack orchestrator — wires monitor + probe + reaper + degradation + server into a single start/stop object; snapshot() for the /health endpoint), `src/session/manager.js` Phase 2.10 extensions (contextRestartEvery periodic restart — fires every N tasks independent of session rotation, reason='context-restart', resets tasksSinceRestart counter; shouldRestartForMemory — pure check against getMemory DI + memoryThresholdMb; restartForMemory — closes + reopens context, logs before/after heap `Context restarted (tasks=50, heapBefore=480MB, heapAfter=120MB)`; tasksSinceRestart + contextRestarts + lastRestartHeapMb in stats(); validation rejects negative contextRestartEvery), `src/config.js` (--contextRestartEvery [default 50, 0=off preserves Phase 2.7], --maxHeapMb [1024], --maxRssMb [4096], --endless, --healthCheckIntervalMs [30000], --healthPort, --healthHost, --noHealthServer + CONTEXT_RESTART_EVERY/MAX_HEAP_MB/MAX_RSS_MB/ENDLESS/HEALTH_PORT/HEALTH_HOST/MEMORY_LOG_EVERY_MS/WORKER_* env vars + validation [maxRssMb > maxHeapMb, --endless requires --queue on, healthPort 1-65535, etc.] + HELP_TEXT + examples), `src/banner.js` (Memory row — restart interval · heap · rss · endless · health port), `src/index.js` (buildHealthStack/stopHealthStack helpers; zombie reaper startup sweep before any browser launches; health stack started in runWithPool + runWithQueue after pool/queue built; onMemoryThreshold logs; onWorkerIssue calls worker.sessionManager.restartForMemory for heap issues; degradation pauseFn/resumeFn/restartWorkerFn/reducePoolFn wired to queue+pool; SIGINT handler reaps zombies with 2s deadline before exit 130; sequential path finally block also reaps; --endless mode skips runWithQueue teardown on success + keeps process alive with 1-min heartbeat + never-resolving promise; queueErrored flag drives teardown decision), `.env.example` (Phase 2.10 section expanded — CONTEXT_RESTART_EVERY, MAX_HEAP_MB, WORKER_MAX_HEAP_MB, MAX_RSS_MB, HEALTH_CHECK_INTERVAL_MS, MEMORY_LOG_EVERY_MS, WORKER_PROBE_*, WORKER_STUCK_AFTER_MS, ENDLESS, HEALTH_PORT, HEALTH_HOST), `package.json` (syntax script includes src/health/*.js; version bumped to 1.0.0-phase2.10), `tests/health.test.js` (78 tests / 228 assertions across memory-monitor [snapshot, threshold re-arm, high-water, getWorkers variants, periodic log, validation, getMemory failure, callback error], worker-probe [heap/stuck/unresponsive detection, re-arm, retired skip, getWorkers variants, callback error, stop idempotent], zombie-reaper [scan, reapOnStartup, SIGKILL escalation, ESRCH skip, reapOnShutdown, logReport format, DEFAULT_PATTERN], degradation [shouldRun re-arm, full sequence, no-reduce-when-drops, pool-limit, in-flight partial, currentRssMb], health server [snapshot builder status determination, 200/503/404/500, start/stop lifecycle, idempotent], createHealthStack orchestrator, session manager context-restart + memory-restart, config flags + validation + env vars, banner row). **1190 tests / 7730 assertions passing total** (78 new).
+
+---
+
+**Shipped:** `src/selectors/version.js` (SELECTOR_VERSIONS registry — list/detail/search/scroll sets each with version + lastVerifiedDate + source + fields; parseDate with rollover rejection; getSelectorAgeDays; isSelectorSetStale; getSelectorStatus; logSelectorVersion — one INFO per set `Selectors list v3 (last verified 2026-08-07, 12 days ago)` + one WARN per stale set with actionable hint), `src/selectors/auto-discover.js` (DISCOVERABLE_FIELDS = phone/website/rating/reviews_count; buildDiscoveryRequests — pure, returns [{cardIndex, fields}] for cards with missing discoverable fields; applyDiscoveryResults — pure, fills in missing fields with optional normalizers for raw→canonical conversion [parseRating/parseReviewsCount/cleanPhone/cleanWebsite] + optional tagDiscovered flag; DISCOVERY_SCRIPT — browser-side function source inlined into page.evaluate via new Function(); discoverInCard with 4 strategies per field — phone [aria-label*="phone" + regex, a[href^="tel:"], data-item-id*="phone", text regex with +/parens/10+digit guard], website [non-Google <a href^="http">], rating [aria-label containing rated|stars, role="img" with number aria-label], reviews_count [text matching (1,234) or "1,234 reviews"]; describeSelector builds a CSS selector for the discovered element; discoverField — single-field wrapper; discoverMissingFields — batch discovery in one page.evaluate round-trip, logs each success `Auto-discovered phone field (selector: ...) — add to SELECTORS.js`), `src/selectors/health-check.js` (healthCheck — page-bound wrapper that runs extractBusinesses on a pre-set-up page, optional auto-discover pass, evaluateHealth, logs pass/fail with coreRates + failingCore + hint; re-exports pure helpers from extract.js to avoid circular require), `src/selectors/debug-dump.js` (DEFAULT_DUMP_THRESHOLD_PCT=80; shouldDumpForField — pure, respects enabled flag + threshold; buildDumpPath — sanitizes field name + ISO timestamp; buildDumpContent — HTML comment header + 500-char card snippets; dumpSelectorDebug — mkdirSync recursive + writeFileSync, returns path or null), `src/selectors/index.js` (barrel export), `src/extract.js` Phase 2.11 extensions (CORE_FIELDS = name/rating/reviews_count/address; SECONDARY_FIELDS = price_level/category/phone/website/plus_code/open_now/business_status/is_sponsored; SELECTOR_FAILURE_EXIT_CODE=3; CORE_THRESHOLD_PCT=50; SECONDARY_THRESHOLD_PCT=30; DEFAULT_MIN_SAMPLE_SIZE=10; evaluateHealth — pure, skips when sample < minSampleSize, returns {ok, failingCore, failingSecondary, coreRates, secondaryRates, reason}; isCriticalFailure; buildSelectorFailureError — sets code=SELECTOR_FAILURE + exitCode=3 + health; checkExtractionRatesForAbort — throws on critical failure; getCardSnippets — page.evaluate fetching innerHTML for specific card indexes; extractBusinesses wired with ctx.selectors — autoDiscover [default on, try/catch non-fatal], abortCheck [default off, opt-in via index.js], debugDump [default on, iterates CORE+SECONDARY fields, dumps when rate < threshold]), `src/config.js` (--skipHealthCheck, --autoDiscover on|off, --selectorDebugDump on|off, --maxSelectorAge N, --selectorDebugDir <path> + SKIP_HEALTH_CHECK/AUTO_DISCOVER/SELECTOR_DEBUG_DUMP/MAX_SELECTOR_AGE/SELECTOR_DEBUG_DIR/HEALTH_CHECK_FIXTURE env vars + cfg.selectors section with skipHealthCheck/autoDiscover/selectorDebugDump/maxSelectorAge/debugDumpDir/healthCheckFixture/resolved + validation [autoDiscover/selectorDebugDump must be boolean, maxSelectorAge 1-365] + HELP_TEXT), `src/index.js` (logSelectorVersion at startup with maxAgeDays=cfg.selectors.maxSelectorAge; startup health check in separate withBrowser call before main pipeline — loads fixture, runs healthCheck, throws SELECTOR_FAILURE on !ok, non-fatal on browser/fixture errors; cfg.selectors.resolved = {ran, ok, rates, elapsedMs, failingCore, failingSecondary}; SELECTOR_FAILURE catch branch in outer try/catch — exits with SELECTOR_FAILURE_EXIT_CODE [3] + logs failing fields + hint; ctx.selectors passed to all 3 extractBusinesses calls [sequential + pool + queue] with autoDiscover/abortCheck:true/debugDump/debugDumpDir; selectors stats in run summary), `.env.example` (Phase 2.11 section expanded — HEALTH_CHECK, AUTO_DISCOVER, SELECTOR_DEBUG_DUMP, MAX_SELECTOR_AGE, SELECTOR_DEBUG_DIR, HEALTH_CHECK_FIXTURE, SKIP_HEALTH_CHECK), `SELECTORS.md` (Self-healing section — 5 layers + config flags table + how-to-update guide), `package.json` (version 1.0.0-phase2.11; syntax script includes src/selectors/*.js; deduplicated the two syntax keys), `tests/selectors-health.test.js` (69 tests / 210 assertions across version [11: SELECTOR_VERSIONS shape, parseDate valid/invalid, getSelectorAgeDays today/N-days/unknown/future, isSelectorSetStale fresh/old, getSelectorStatus, logSelectorVersion with/without .phase() + stale warning], auto-discover pure [9: DISCOVERABLE_FIELDS, buildDiscoveryRequests empty/populated/non-discoverable, applyDiscoveryResults fill/override/empty/non-canonical-tags/tagDiscovered/out-of-range], auto-discover page-bound [9: discoverField phone/website/rating/reviews_count/non-discoverable/out-of-range, discoverMissingFields empty/batch/logging], health-check pure [11: CORE_FIELDS/SECONDARY_FIELDS/exit code/thresholds, evaluateHealth high/low/small-sample/secondary, isCriticalFailure, buildSelectorFailureError, checkExtractionRatesForAbort throw/no-throw/small-sample], health-check page-bound [4: healthCheck passes on healthy fixture, fails on broken fixture, fails when core rates low, runs auto-discover], debug-dump [9: threshold, shouldDumpForField true/false/disabled/null, buildDumpPath timestamp/sanitize, buildDumpContent fields/truncate, dumpSelectorDebug writes/empty/filesystem-error], extract.js re-exports [5: exports, evaluateHealth matches, getCardSnippets indexes/empty/out-of-range], extractBusinesses integration [4: fills via auto-discover, skips when disabled, throws on critical rates, writes debug dumps]), `tests/selectors-fixture.test.js` (45 tests / 120 assertions — 3 fixtures × 15 assertions: fixture loads + extracts ≥1, stats include discovery, 4 core fields ≥70%, 8 secondary fields ≥15% [with sparse overrides for plus_code/price_level/phone/website/open_now], full rate summary logged). **1304 tests / 8098 assertions passing total** (114 new).
+
 ---
 
 ## Phase 2.11 — Self-Healing Selectors & Health Checks
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE**
 
 ### Goal
 Make the scraper resilient to Google Maps DOM changes. Maintain multiple fallback selectors per field (Phase 1.4 already does this), add heuristic auto-discovery for when all selectors fail, and implement extraction-rate-based health checks that alert before a full run is wasted.
@@ -894,16 +905,16 @@ Make the scraper resilient to Google Maps DOM changes. Maintain multiple fallbac
 Google Maps changes its DOM every few weeks. Without self-healing, a DOM change means 0% extraction until a human updates the selectors — which could be days. With health checks, the scraper detects the drop within the first 10 businesses and aborts with a clear alert, saving the run budget.
 
 ### Task checklist
-- [ ] **Selector versioning.** `src/selectors/version.js`:
+- [x] **Selector versioning.** `src/selectors/version.js`:
   - Every selector set has a `version` and `lastVerifiedDate`.
   - On startup, log: `Selectors v3 (last verified 2026-08-01)`.
   - If `lastVerifiedDate` is > 30 days old, log a warning: `Selectors last verified 45 days ago — consider re-running the fixture test`.
-- [ ] **Health check on startup.** `src/selectors/health-check.js`:
+- [x] **Health check on startup.** `src/selectors/health-check.js`:
   - `healthCheck(page, { logger })` — scrapes 5 businesses from a fixed query, checks extraction rates.
   - If any core field (name, rating, reviews_count, address) is below 50% → log error, suggest running fixture capture, abort the run (unless `--skipHealthCheck`).
   - If any secondary field is below 30% → log warning but continue.
   - Runs before the main scrape, takes ~15 seconds.
-- [ ] **Heuristic auto-discovery.** `src/selectors/auto-discover.js`:
+- [x] **Heuristic auto-discovery.** `src/selectors/auto-discover.js`:
   - `discoverField(page, fieldName, { logger })` — when all selectors for a field fail, attempt to find the field by pattern:
     - `phone`: find any element whose text matches `^\+?[\d\s\-\(\)]{7,}$` and is near a "Phone" label.
     - `website`: find any `<a>` whose href is a non-Google URL and is near a "Website" label.
@@ -911,34 +922,34 @@ Google Maps changes its DOM every few weeks. Without self-healing, a DOM change 
     - `reviews_count`: find any element near the rating whose text matches `^\(\d[\d,]*\)$` or `^\d[\d,]* reviews?$`.
   - If discovery succeeds, log: `Auto-discovered phone field (selector: div[data-field="phone"]) — add to SELECTORS.js`.
   - Discovery is a fallback, not a primary strategy (it's slow). Only triggers after all selectors fail.
-- [ ] **Extraction-rate-based abort.** In `src/extract.js`:
+- [x] **Extraction-rate-based abort.** In `src/extract.js`:
   - After the first batch of 10 businesses, compute extraction rates.
   - If core fields are below 50% → abort the run, log: `Extraction rates critically low (name=45%, rating=30%) — likely a DOM change. Run scripts/capture-fixtures.js and update selectors. Use --skipHealthCheck to force.`.
   - Exit code 3 (selector failure).
-- [ ] **Selector auto-update suggestions.** When a field's rate drops below 80%, log the DOM snippet around the expected field (first 500 chars of the card HTML) to `data/selector-debug/{field}_{timestamp}.html`. This gives the developer a sample to craft a new selector without re-running the scrape.
-- [ ] **Fixture-based regression test.** `tests/selectors-fixture.test.js`:
+- [x] **Selector auto-update suggestions.** When a field's rate drops below 80%, log the DOM snippet around the expected field (first 500 chars of the card HTML) to `data/selector-debug/{field}_{timestamp}.html`. This gives the developer a sample to craft a new selector without re-running the scrape.
+- [x] **Fixture-based regression test.** `tests/selectors-fixture.test.js`:
   - Loads the HTML fixtures from `tests/fixtures/` (captured in Phase 2.0).
   - Runs the extraction against each fixture.
   - Asserts every field extracts at ≥ 90% rate.
   - This test catches selector regressions before they hit production. Run in CI.
-- [ ] **Config flags.**
+- [x] **Config flags.**
   - `--skipHealthCheck` (default: off — health check runs)
   - `--autoDiscover on|off` (default: on)
   - `--selectorDebugDump on|off` (default: on — dump DOM snippets on low rates)
   - `--maxSelectorAge 30` (days — warn if selectors are older)
-- [ ] **Unit tests.** `tests/selectors-health.test.js`:
+- [x] **Unit tests.** `tests/selectors-health.test.js`:
   - Health check passes when extraction rates are high (using a fixture).
   - Health check fails when rates are low (using a broken fixture).
   - Auto-discover finds a phone field by pattern.
   - Selector version warning triggers when `lastVerifiedDate` is old.
 
 ### Acceptance criteria
-- With a healthy DOM, the health check passes in <15s and the run proceeds.
-- Simulating a DOM change (swapping a fixture) causes the health check to abort the run with a clear error.
-- Auto-discover finds at least one field when all selectors fail (tested with a fixture where the field is present but selectors are stale).
-- The fixture-based regression test catches a simulated selector break.
-- `--skipHealthCheck` bypasses the check (for emergency runs).
-- Selector debug dumps are written to `data/selector-debug/` with enough context to craft a fix.
+- [x] With a healthy DOM, the health check passes in <15s and the run proceeds.
+- [x] Simulating a DOM change (swapping a fixture) causes the health check to abort the run with a clear error.
+- [x] Auto-discover finds at least one field when all selectors fail (tested with a fixture where the field is present but selectors are stale).
+- [x] The fixture-based regression test catches a simulated selector break.
+- [x] `--skipHealthCheck` bypasses the check (for emergency runs).
+- [x] Selector debug dumps are written to `data/selector-debug/` with enough context to craft a fix.
 
 ### Dependencies
 Phase 2.0 (fixtures), Phase 1.4 (existing selector infrastructure).

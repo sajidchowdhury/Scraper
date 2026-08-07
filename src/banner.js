@@ -151,6 +151,24 @@ function buildStartupBanner(cfg, opts = {}) {
         ? `on (BullMQ + Redis, priority ${cfg.queue.priority}, ${cfg.queue.attempts} attempts, ${cfg.queue.concurrency} concurrency)`
         : 'off (Phase 2.8 in-process)',
     ],
+    // Phase 2.10 — memory management summary. Shows the periodic context
+    // restart interval + heap/RSS thresholds + endless mode + health server.
+    // When all defaults are unchanged AND --endless is off, shows "default"
+    // so a Phase 2.9 run sees an uncluttered row.
+    [
+      'Memory',
+      cfg.health
+        ? [
+            `restart every ${cfg.health.contextRestartEvery} tasks`,
+            `heap ${cfg.health.maxHeapMb}MB`,
+            `rss ${cfg.health.maxRssMb}MB`,
+            cfg.health.endless ? 'endless' : null,
+            cfg.health.port ? `health :${cfg.health.port}` : null,
+          ]
+            .filter(Boolean)
+            .join(' · ')
+        : 'disabled',
+    ],
   ];
 
   const width = rows.reduce((m, [k]) => Math.max(m, k.length), 0);
