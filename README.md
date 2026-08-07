@@ -66,6 +66,10 @@ Optional:
   --noHumanTyping            Phase 1.8 — disable char-by-char search typing
   --noCaptchaPause           Phase 1.8 — don't pause on CAPTCHA (just exit)
   --captchaWaitMs <ms>       Phase 1.8 — CAPTCHA pause duration (300000)
+  --output <targets>         Phase 2.1 — output targets, comma-separated:
+                             csv, json, db, or all (default: csv,json).
+                             db writes to PostgreSQL (requires DATABASE_URL).
+                             all = csv,json,db.
   --version                  Print version and exit
   --help, -h                 Show this help
 ```
@@ -685,18 +689,27 @@ These are **deliberately deferred** to later phases (see `SCRAPER_FEATURES.md`):
 
 ## Roadmap
 
-Phase 1 (this release — `v1.0.0-phase1`) delivers a **single-query,
+Phase 1 (tagged `v1.0.0-phase1`) delivers a **single-query,
 single-machine, CSV-exporting** scraper that's robust against transient
 failures and polite to Google. The master roadmap in
 **[`SCRAPER_FEATURES.md`](SCRAPER_FEATURES.md)** covers Phases 2–5:
 
-- **Phase 2 — Robustness & Scale:** rotating proxies, browser fingerprint
-  randomization, stealth patches, CAPTCHA auto-solving, multi-worker
-  concurrency, job queue (BullMQ/Redis), PostgreSQL persistence with change
-  tracking, self-healing selectors, and incremental scraping. Target: survive
-  a 10,000+ listing overnight run unattended. See
+- **Phase 2 — Robustness & Scale** *(in progress, `phase2` branch)*: rotating
+  proxies, browser fingerprint randomization, stealth patches, CAPTCHA
+  auto-solving, multi-worker concurrency, job queue (BullMQ/Redis), PostgreSQL
+  persistence with change tracking, self-healing selectors, and incremental
+  scraping. Target: survive a 10,000+ listing overnight run unattended. See
   **[`PHASE2_EXECUTION_PLAN.md`](PHASE2_EXECUTION_PLAN.md)** for the granular
   13-sub-phase spec.
+  - **2.0 — Audit, Fixtures & Dependency Setup** ✅ — baseline metrics, DOM
+    fixtures, deps installed, `docker-compose.yml`.
+  - **2.1 — PostgreSQL Persistence Layer** ✅ — `src/db.js` (idempotent upserts
+    keyed by `place_id`, change-hash no-op detection, batched writes,
+    transaction rollback), `schema.sql`, `npm run db:migrate`, `--output
+    csv|json|db|all` flag. 475 tests / 1169 assertions.
+  - 2.2–2.13 — change tracking, proxies, fingerprints, stealth, CAPTCHA,
+    sessions, worker pool, job queue, memory mgmt, self-healing selectors,
+    incremental scraping, final integration *(not started)*.
 - **Phase 3 — Data Quality & Enrichment:** phone/email normalization &
   validation, email discovery, deduplication, lead scoring, grid-based
   geo-coverage.
@@ -708,5 +721,70 @@ failures and polite to Google. The master roadmap in
 
 See `PHASE1_EXECUTION_PLAN.md` for the granular Phase 1 sub-phase spec and
 acceptance criteria, `PHASE2_EXECUTION_PLAN.md` for Phase 2, and
-`CHANGELOG.md` for what shipped in this release.
+`CHANGELOG.md` for what shipped in each release.
+
+## PostgreSQL persistence (Phase 2.1)
+
+Scraped businesses can be upserted into PostgreSQL alongside (or instead of)
+CSV/JSON files. Every business is keyed by `place_id`, so re-scraping the same
+business updates the row instead of duplicating it; re-scraping with identical
+data is a no-op (detected via a SHA-256 `data_hash` column).
+
+### Quick start
+
+```bash
+# 1. Start PostgreSQL (one-time — docker-compose.yml ships Postgres 15 + Redis 7)
+docker compose up -d postgres
+
+# 2. Copy .env.example → .env and set DATABASE_URL
+cp .env.example .env
+# Edit .env:  DATABASE_URL=postgresql://gmaps:gmaps@localhost:5432/gmaps_scraper
+
+# 3. Create the schema (idempotent — safe to re-run)
+npm run db:migrate
+
+# 4. Scrape to Postgres (or --output all for CSV + JSON + DB)
+npm start -- --query "Cafe" --location "Berlin" --output db --yes
+```
+
+### Output targets
+
+The `--output` flag (or `OUTPUT` env var) selects where results go:
+
+| Target | Writes | Requires |
+|---|---|---|
+| `csv` (default) | `data/*.csv` | nothing |
+| `json` (default) | `data/*.json` + `*.summary.json` | nothing |
+| `db` | `businesses` + `scrape_runs` tables | `DATABASE_URL` (postgresql://) |
+| `all` | CSV + JSON + DB | `DATABASE_URL` |
+
+Comma-separated combinations work: `--output csv,db` writes CSV and Postgres
+but skips JSON.
+
+### Schema
+
+Two tables (see `src/db/schema.sql`):
+
+- **`businesses`** — one row per scraped business, keyed by `place_id` (UNIQUE).
+  All 25 scraped fields (17 canonical list-view + 8 detail-scrape) plus
+  `data_hash`, `run_id` (FK → `scrape_runs`), `updated_at`. Indexes on
+  `place_id`, `(query, location)`, `scraped_at`, `business_status`, `updated_at`.
+- **`scrape_runs`** — one row per pipeline invocation: query, location, timing,
+  extracted/failed counts, exit code, log path, and DB upsert counts
+  (`db_inserted`, `db_updated`, `db_unchanged`).
+
+### Idempotent upserts
+
+`upsertBusinessesBatch` classifies each business as `inserted`, `updated`, or
+`unchanged` by comparing a SHA-256 hash of the comparable field values against
+the stored `data_hash`. Only `updated` rows bump `updated_at` — identical
+re-scrapes produce zero writes. The end-of-run banner reports the counts:
+
+```
+DB:       50 inserted, 30 updated, 20 unchanged (run #3)
+```
+
+All queries are parameterized (no SQL injection surface). Writes happen in a
+single transaction per run; a failure rolls back and is logged as a partial-
+success (exit code 1) without discarding any CSV/JSON files already written.
 

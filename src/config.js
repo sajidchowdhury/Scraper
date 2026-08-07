@@ -82,6 +82,9 @@ function parseArgs(argv) {
     else if (a === '--noHumanTyping') out.humanTyping = false;
     else if (a === '--noCaptchaPause') out.captchaPause = false;
     else if (a === '--captchaWaitMs') out.captchaWaitMs = argv[++i];
+    // Phase 2.1 — output targets (csv, json, db, all). Accepts comma-separated
+    // values too: --output csv,json,db. The keyword `all` expands to csv,json,db.
+    else if (a === '--output') out.output = argv[++i];
   }
   return out;
 }
@@ -94,6 +97,34 @@ function toIntOrNull(v) {
   if (v === undefined || v === null || v === '') return null;
   const n = Number.parseInt(String(v), 10);
   return Number.isFinite(n) ? n : null;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.1 — resolve --output / OUTPUT into a normalized target array.
+// Accepts: 'csv', 'json', 'db', 'all', or comma-separated combinations.
+// Returns: string[] of targets in canonical order (csv, json, db) — de-duped.
+// 'all' expands to ['csv','json','db']. Empty/undefined → ['csv','json']
+// (preserves Phase 1 default behavior).
+// ---------------------------------------------------------------------------
+
+function resolveOutputTargets(raw) {
+  if (!raw) return ['csv', 'json'];
+  const parts = String(raw)
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (parts.length === 0) return ['csv', 'json'];
+  if (parts.includes('all')) return ['csv', 'json', 'db'];
+  // De-dup while preserving first-seen order.
+  const seen = new Set();
+  const out = [];
+  for (const p of parts) {
+    if (!seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out;
 }
 
 function validate(cfg) {
@@ -122,6 +153,34 @@ function validate(cfg) {
   }
   if (cfg.resume && cfg.fresh) {
     errors.push('--resume and --fresh are mutually exclusive');
+  }
+  // Phase 2.1 — validate --output targets.
+  for (const t of cfg.output) {
+    if (!['csv', 'json', 'db'].includes(t)) {
+      errors.push(
+        `--output target must be csv, json, db, or all (got "${t}"). ` +
+          'Use comma-separated values for multiple: --output csv,json,db',
+      );
+    }
+  }
+  // --output db requires DATABASE_URL at runtime (the pool is created lazily
+  // in src/index.js, but we fail fast here so the operator sees the error
+  // before any browser launches). The URL must be a PostgreSQL connection
+  // string (postgres:// or postgresql://) — a SQLite file:// URL won't work.
+  if (cfg.output.includes('db')) {
+    if (!cfg.databaseUrl) {
+      errors.push(
+        '--output db requires DATABASE_URL (set in .env or environment). ' +
+          'See .env.example → Phase 2.1 section.',
+      );
+    } else if (!/^postgres(ql)?:\/\//.test(cfg.databaseUrl)) {
+      errors.push(
+        '--output db requires a PostgreSQL DATABASE_URL (must start with ' +
+          'postgresql:// or postgres://). Got: ' +
+          cfg.databaseUrl.slice(0, 40) +
+          (cfg.databaseUrl.length > 40 ? '…' : ''),
+      );
+    }
   }
   // Phase 1.8 — antiblock validation
   if (cfg.antiblock.maxRequestsPerMin < 1 || cfg.antiblock.maxRequestsPerMin > 600) {
@@ -163,6 +222,12 @@ function loadConfig(argv = process.argv.slice(2)) {
     outputDir: cli.outputDir || process.env.OUTPUT_DIR || './data',
     outputFile: cli.outputFile || null, // null = auto-generate
     dryRun: !!cli.dryRun,
+
+    // Phase 2.1 — output targets. Resolved from --output (comma-separated) or
+    // the OUTPUT env var. Default ['csv','json'] preserves Phase 1 behavior.
+    // The keyword 'all' expands to ['csv','json','db'].
+    output: resolveOutputTargets(cli.output ?? process.env.OUTPUT),
+    databaseUrl: process.env.DATABASE_URL || null,
 
     // Phase 1.10 — DX: skip the startup-banner delay (scripted / CI runs).
     yes: !!cli.yes,
@@ -251,7 +316,7 @@ function loadConfig(argv = process.argv.slice(2)) {
   return cfg;
 }
 
-const HELP_TEXT = `gmaps-scraper — Google Maps business scraper (Phase 1)
+const HELP_TEXT = `gmaps-scraper — Google Maps business scraper (Phase 2)
 
 Usage:
   npm start -- --query <q> --location <loc> [options]
@@ -288,6 +353,15 @@ Optional:
   --noCaptchaPause           Phase 1.8 — don't pause on CAPTCHA (just exit)
   --captchaWaitMs <ms>       Phase 1.8 — how long to pause on CAPTCHA (default: 300000)
 
+  --output <targets>         Phase 2.1 — output targets, comma-separated:
+                             csv, json, db, or all (default: csv,json).
+                             db writes to PostgreSQL (requires DATABASE_URL).
+                             all = csv,json,db. Examples:
+                               --output csv          (CSV only)
+                               --output db           (Postgres only)
+                               --output csv,json,db  (all three, explicit)
+                               --output all          (all three, shorthand)
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
@@ -298,8 +372,13 @@ Examples:
   npm start -- --query "Restaurant" --location "Toronto" --deepScrape true --deepScrapeSampleStep 5
   npm start -- --query "Restaurant" --location "Toronto" --resume   # continue after a crash
 
+  # Phase 2.1 — write to PostgreSQL (set DATABASE_URL in .env first)
+  npm run db:migrate                                        # create schema (once)
+  npm start -- --query "Cafe" --location "Berlin" --output db --yes
+  npm start -- --query "Cafe" --location "Berlin" --output all   # CSV + JSON + DB
+
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun
 `;
 
-module.exports = { loadConfig, parseArgs, validate, HELP_TEXT };
+module.exports = { loadConfig, parseArgs, validate, HELP_TEXT, resolveOutputTargets };

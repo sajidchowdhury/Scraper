@@ -1,7 +1,7 @@
 {
   "name": "gmaps-scraper",
   "version": "1.0.0-phase1",
-  "description": "Google Maps business scraper — Phase 1 (search, paginate, extract, deep scrape, CSV export, crash recovery, anti-block, structured logging, CLI polish). Tagged v1.0.0-phase1.",
+  "description": "Google Maps business scraper — Phase 2 (PostgreSQL persistence, change tracking, proxy/stealth, scale). Phase 1 tagged v1.0.0-phase1.",
   "engines": {
     "node": ">=20"
   },
@@ -9,9 +9,10 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "bun test tests/",
-    "syntax": "node --check src/index.js && node --check src/extract.js && node --check src/detail.js && node --check src/export.js && node --check src/scroll.js && node --check src/search.js && node --check src/browser.js && node --check src/config.js && node --check src/logger.js && node --check src/retry.js && node --check src/checkpoint.js && node --check src/antiblock.js && node --check src/banner.js",
+    "syntax": "node --check src/index.js && node --check src/extract.js && node --check src/detail.js && node --check src/export.js && node --check src/scroll.js && node --check src/search.js && node --check src/browser.js && node --check src/config.js && node --check src/logger.js && node --check src/retry.js && node --check src/checkpoint.js && node --check src/antiblock.js && node --check src/banner.js && node --check src/db.js && node --check src/db/migrate.js",
     "baseline": "node scripts/run-baseline.js",
-    "capture-fixtures": "node scripts/capture-fixtures.js"
+    "capture-fixtures": "node scripts/capture-fixtures.js",
+    "db:migrate": "node src/db/migrate.js"
   },
   "dependencies": {
     "2captcha": "^3.0.5-2",

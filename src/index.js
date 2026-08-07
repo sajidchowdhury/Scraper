@@ -79,6 +79,9 @@ const {
 } = require('./checkpoint');
 const { RateLimiter, detectCaptcha } = require('./antiblock');
 const { showStartupBanner } = require('./banner');
+// Phase 2.1 — PostgreSQL persistence (lazy-loaded; only used when
+// cfg.output includes 'db').
+const { createPool, persistRunResults, closePool } = require('./db');
 
 async function main() {
   const cfg = loadConfig(process.argv.slice(2));
@@ -112,6 +115,7 @@ async function main() {
     maxResults: cfg.maxResults,
     headless: cfg.headless,
     dryRun: cfg.dryRun,
+    output: cfg.output,
     deepScrape: cfg.deepScrape,
     resume: cfg.resume,
     fresh: cfg.fresh,
@@ -377,19 +381,63 @@ async function main() {
     fields: [...CANONICAL_FIELDS, ...DETAIL_FIELDS],
   };
 
+  // Phase 2.1 — output dispatch. cfg.output is a normalized array of targets
+  // (csv, json, db). Dry runs skip ALL writes (files + DB) so --dryRun remains
+  // a true smoke test.
+  const wantsCsv = cfg.output.includes('csv');
+  const wantsJson = cfg.output.includes('json');
+  const wantsDb = cfg.output.includes('db');
+  const wantsFiles = wantsCsv || wantsJson;
+
   let outPaths = null;
-  if (!cfg.dryRun) {
+  if (!cfg.dryRun && wantsFiles) {
     outPaths = await exportResults({
       businesses: result.businesses,
       summary,
       outputFile: cfg.outputFile,
       outputDir: cfg.outputDir,
+      writeCsv: wantsCsv,
+      writeJson: wantsJson,
+      writeSummary: wantsFiles,
       logger,
     });
-  } else {
+  } else if (cfg.dryRun) {
     logger.info('Dry run — skipping file output', {
       wouldWrite: cfg.outputFile || path.join(cfg.outputDir, 'dryrun'),
+      outputTargets: cfg.output,
     });
+  }
+
+  // Phase 2.1 — PostgreSQL persistence. Opens a pool, upserts every business
+  // (keyed by place_id) in a single transaction, writes the run summary, and
+  // closes the pool. A DB failure is logged + reflected in the exit code but
+  // does NOT discard the file outputs already written above.
+  let dbResult = null;
+  if (!cfg.dryRun && wantsDb) {
+    const pool = createPool(cfg.databaseUrl);
+    if (!pool) {
+      logger.error('DB output requested but DATABASE_URL is unset', {
+        hint: 'Set DATABASE_URL in .env (see .env.example → Phase 2.1).',
+      });
+      process.exit(2);
+    }
+    try {
+      dbResult = await persistRunResults(pool, {
+        businesses: result.businesses,
+        summary: { ...summary, exitCode: null, logPath: logger.getLogFile ? logger.getLogFile() : null },
+        logger,
+      });
+    } catch (err) {
+      logger.error('DB persistence failed', {
+        phase: 'db',
+        message: err.message,
+        stack: err.stack,
+        hint: 'CSV/JSON outputs (if any) are unaffected. Re-run with --output db to retry.',
+      });
+      dbResult = { failed: true, message: err.message };
+    } finally {
+      await closePool(pool);
+    }
   }
 
   // Phase 1.7 — clear the checkpoint on successful completion. A leftover
@@ -414,9 +462,26 @@ async function main() {
     result.extractStats && result.extractStats.failed > 0
       ? `Extract:  ${result.extractStats.succeeded}/${result.extractStats.total} succeeded, ${result.extractStats.failed} failed`
       : null;
-  const outputLines = outPaths
-    ? [`CSV:      ${outPaths.csvPath}`, `JSON:     ${outPaths.jsonPath}`, `Summary:  ${outPaths.summaryPath}`]
-    : ['Output:   (dry run, no file written)'];
+  // Phase 2.1 — build the output lines for the end-of-run banner. Each target
+  // (csv, json, db) gets its own line; dry runs show a single placeholder.
+  const outputLines = [];
+  if (cfg.dryRun) {
+    outputLines.push('Output:   (dry run, no files / DB written)');
+  } else {
+    if (outPaths && outPaths.csvPath) outputLines.push(`CSV:      ${outPaths.csvPath}`);
+    if (outPaths && outPaths.jsonPath) outputLines.push(`JSON:     ${outPaths.jsonPath}`);
+    if (outPaths && outPaths.summaryPath) outputLines.push(`Summary:  ${outPaths.summaryPath}`);
+    if (dbResult) {
+      if (dbResult.failed) {
+        outputLines.push(`DB:       FAILED — ${dbResult.message}`);
+      } else {
+        outputLines.push(
+          `DB:       ${dbResult.inserted} inserted, ${dbResult.updated} updated, ${dbResult.unchanged} unchanged (run #${dbResult.runId})`,
+        );
+      }
+    }
+    if (outputLines.length === 0) outputLines.push('Output:   (no targets selected)');
+  }
   // Phase 1.9 — include the log file path in the banner so the operator knows
   // where the full JSON-lines record of this run lives.
   const logFile = logger.getLogFile ? logger.getLogFile() : null;
@@ -438,10 +503,13 @@ async function main() {
   console.log(banner);
 
   // Phase 1.10 prep — exit code 1 for partial success (some failures but
-  // run completed). Exit 0 only if everything succeeded.
+  // run completed). Exit 0 only if everything succeeded. A DB persistence
+  // failure also counts as partial success (exit 1), not a crash (exit 3),
+  // because the scrape itself completed — only the DB write failed.
   const hasExtractFailures = result.extractStats && result.extractStats.failed > 0;
   const hasDetailFailures = result.detailStats && result.detailStats.failed > 0;
-  const exitCode = hasExtractFailures || hasDetailFailures ? 1 : 0;
+  const hasDbFailure = !!(dbResult && dbResult.failed);
+  const exitCode = hasExtractFailures || hasDetailFailures || hasDbFailure ? 1 : 0;
 
   // Phase 1.9 — structured "Run complete" log line so the JSON-lines file has
   // a single machine-parseable record of the run's final status (duration,
@@ -459,8 +527,14 @@ async function main() {
     detailAttempted: result.detailStats ? result.detailStats.attempted : 0,
     detailFailed: result.detailStats ? result.detailStats.failed : 0,
     dryRun: cfg.dryRun,
+    output: cfg.output,
     csv: outPaths ? outPaths.csvPath : null,
     json: outPaths ? outPaths.jsonPath : null,
+    db: dbResult && !dbResult.failed
+      ? { runId: dbResult.runId, inserted: dbResult.inserted, updated: dbResult.updated, unchanged: dbResult.unchanged }
+      : dbResult && dbResult.failed
+        ? { failed: true, message: dbResult.message }
+        : null,
     log: logFile,
   });
 

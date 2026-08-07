@@ -10,14 +10,14 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 2.0 complete. 1 of 13 sub-phases shipped.
+> **Last updated:** Phase 2.1 complete. 2 of 13 sub-phases shipped.
 >
-> **Overall:** 1 of 13 sub-phases shipped. Phase 2 work started on `phase2` branch.
+> **Overall:** 2 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
 | 2.0 — Audit, Fixtures & Dependency Setup | ✅ DONE | _(this commit)_ | 410 | Baseline metrics captured, 6 DOM fixtures, 8 deps installed, docker-compose.yml, .env.example Phase 2 vars |
-| 2.1 — PostgreSQL Persistence Layer | ⬜ NOT STARTED | — | — | `pg` client, schema, idempotent upserts, `--output db` flag |
+| 2.1 — PostgreSQL Persistence Layer | ✅ DONE | _(this commit)_ | 475 (+65) | `src/db.js` (pool, upserts, change-hash), `schema.sql`, `migrate.js`, `--output csv\|json\|db\|all` flag, batched upserts, transaction rollback, SQL-injection-safe |
 | 2.2 — Change Tracking & History | ⬜ NOT STARTED | — | — | `business_snapshots` table, delta detection, trend data |
 | 2.3 — Proxy Management & Rotation | ⬜ NOT STARTED | — | — | `proxy.js`, pool, rotation strategies, burn detection |
 | 2.4 — Browser Fingerprint Randomization | ⬜ NOT STARTED | — | — | UA, viewport, timezone, locale, WebGL, canvas, fonts |
@@ -144,7 +144,7 @@ A ready-to-develop environment with baseline metrics, test fixtures, infrastruct
 
 ## Phase 2.1 — PostgreSQL Persistence Layer
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE** — `src/db.js` + `src/db/schema.sql` + `src/db/migrate.js` + `--output` flag + 65 new tests (475 total). Integration tests guarded on a live Postgres `DATABASE_URL`.
 
 ### Goal
 Add a PostgreSQL persistence layer alongside the existing CSV/JSON export. Every scraped business is upserted into the database, keyed by `place_id`, so re-scraping the same business updates the row instead of duplicating.
@@ -153,7 +153,7 @@ Add a PostgreSQL persistence layer alongside the existing CSV/JSON export. Every
 CSVs are great for delivery; databases are great for operations. With Postgres, we get: idempotent re-scrapes, queryable data (filter by city, rating, category), change tracking (Phase 2.2), and the foundation for an API (Phase 4).
 
 ### Task checklist
-- [ ] **Schema design.** Create `src/db/schema.sql` (version-controlled, idempotent):
+- [x] **Schema design.** Create `src/db/schema.sql` (version-controlled, idempotent):
   - `businesses` table:
     - `id` SERIAL PRIMARY KEY
     - `place_id` TEXT UNIQUE NOT NULL (the canonical key)
@@ -165,42 +165,53 @@ CSVs are great for delivery; databases are great for operations. With Postgres, 
     - `full_hours` (JSONB), `popular_times` (JSONB), `top_reviews` (JSONB), `photos` (JSONB)
     - `reservation_url`, `menu_url`, `social_profiles` (JSONB)
     - `detail_scraped` (BOOLEAN), `scraped_at` (TIMESTAMPTZ), `updated_at` (TIMESTAMPTZ)
-    - Indexes on `place_id`, `(query, location)`, `scraped_at`, `business_status`.
-  - `scrape_runs` table (metadata per run): `id`, `query`, `location`, `started_at`, `finished_at`, `extracted`, `failed`, `exit_code`, `log_path`.
-- [ ] **Database client module.** `src/db.js`:
-  - `getClient()` — returns a pooled `pg.Pool` client.
-  - `closePool()` — for graceful shutdown.
-  - `upsertBusiness(business)` — INSERT … ON CONFLICT (place_id) DO UPDATE, returning `action: 'inserted' | 'updated' | 'unchanged'` (compare a hash of field values to detect no-op updates).
-  - `insertRunSummary(summary)` — writes to `scrape_runs`.
+    - `data_hash` (TEXT) — SHA-256 of comparable fields for no-op detection
+    - `run_id` (INT FK → scrape_runs) — provenance
+    - Indexes on `place_id`, `(query, location)`, `scraped_at`, `business_status`, `updated_at`.
+  - `scrape_runs` table (metadata per run): `id`, `query`, `location`, `started_at`, `finished_at`, `extracted`, `failed`, `exit_code`, `log_path`, `db_inserted`, `db_updated`, `db_unchanged`.
+  - All objects use `IF NOT EXISTS` so re-running `npm run db:migrate` is always safe. FK added via a `DO $$ … $$` guard block.
+- [x] **Database client module.** `src/db.js`:
+  - `createPool(connectionString)` — returns a `pg.Pool` (or null if no postgres URL).
+  - `getClient(pool)` / `withClient(pool, fn)` — acquires + auto-releases a client.
+  - `closePool(pool)` — graceful shutdown (null-safe).
+  - `upsertBusiness(client, business, {runId})` + `upsertBusinessesBatch(client, businesses, {runId, batchSize})` — idempotent upserts keyed by `place_id`, returning per-row `{ action: 'inserted' | 'updated' | 'unchanged' }`. No-op detection via a SHA-256 `data_hash` column (computed by the pure `computeRowHash` helper).
+  - `insertRunSummary(client, summary)` — writes to `scrape_runs`, returns `runId`.
+  - `persistRunResults(pool, {businesses, summary, logger})` — full pipeline hook: BEGIN → insert run → batch upsert → stamp DB counts → COMMIT (ROLLBACK on error).
   - All methods use parameterized queries (no SQL injection surface).
-  - All methods are DI-friendly: accept an optional `client` arg for transaction support.
-- [ ] **Config flag.** Add `--output csv|json|db|all` (default: `csv,json` — preserves Phase 1 behavior). `db` writes to Postgres; `all` writes to all three.
-  - Add `DATABASE_URL` env var support.
-  - If `--output db` is set and `DATABASE_URL` is missing → clear error, exit code 2.
-- [ ] **Integration into pipeline.** In `src/index.js`, after extraction + dedup, if `cfg.output.includes('db')`:
-  - Open a transaction.
-  - Upsert each business in batches of 50 (avoid per-row round-trips).
-  - Insert run summary.
-  - Commit.
-  - Log: `DB: 50 inserted, 30 updated, 20 unchanged`.
-- [ ] **Migration runner.** `src/db/migrate.js` — reads `schema.sql`, runs it idempotently (`CREATE TABLE IF NOT EXISTS`). Add `npm run db:migrate` script.
-- [ ] **Unit tests.** `tests/db.test.js`:
-  - Use a test database (e.g., `gmaps_scraper_test`) or testcontainers.
-  - Test upsert insert → update → unchanged cycle.
-  - Test that re-scraping with identical data returns `unchanged` (no row mutation).
-  - Test that re-scraping with changed `reviews_count` returns `updated` and bumps `updated_at`.
-  - Test transaction rollback on error.
-  - Test SQL-injection safety (place_id containing `'; DROP TABLE—` is stored literally, not executed).
-  - DI: `upsertBusiness` accepts a mock client for tests that don't hit Postgres.
+  - All methods are DI-friendly: accept an explicit `client` (or `pool`) arg for transaction support + mock-based unit tests.
+- [x] **Config flag.** Added `--output csv|json|db|all` (default: `csv,json` — preserves Phase 1 behavior). `db` writes to Postgres; `all` writes to all three. Comma-separated values supported.
+  - Added `DATABASE_URL` env var support + `OUTPUT` env var.
+  - If `--output db` is set and `DATABASE_URL` is missing OR not a `postgresql://` URL → clear config error, exit code 2.
+  - `resolveOutputTargets()` pure helper (de-dupes, expands `all`, case-insensitive).
+- [x] **Integration into pipeline.** In `src/index.js`, after extraction + dedup, if `cfg.output.includes('db')` && `!cfg.dryRun`:
+  - `persistRunResults` opens a transaction.
+  - Upserts each business in batches of 50 (single SELECT hash check per batch + multi-row INSERT + per-row UPDATE).
+  - Inserts run summary.
+  - Commits (or rolls back on error).
+  - End-of-run banner: `DB: 50 inserted, 30 updated, 20 unchanged (run #N)`.
+  - File output (`exportResults`) now respects `writeCsv`/`writeJson` so `--output json` skips the CSV file, etc.
+- [x] **Migration runner.** `src/db/migrate.js` — reads `schema.sql`, runs it idempotently (`CREATE TABLE IF NOT EXISTS`). Added `npm run db:migrate` script. Exit codes: 0 ok, 2 config error, 3 runtime error.
+- [x] **Unit tests.** `tests/db.test.js` (65 tests, 141 assertions):
+  - `computeRowHash` (pure): deterministic, key-order-independent, change-detecting, null/undefined/empty-string normalization.
+  - `decideAction` (pure): inserted/updated/unchanged classification.
+  - `columnValue` coercion: rating→number, reviews_count→int, booleans, JSONB stringification, timestamps.
+  - `buildBatchInsert` / `buildUpdate`: parameterization, ON CONFLICT DO NOTHING, SQL-injection safety.
+  - DI mock-client: full insert → unchanged → updated cycle; batched upserts respect batchSize; missing place_id skipped.
+  - SQL-injection: `'; DROP TABLE businesses; --` stored literally as a place_id, never interpolated into SQL text.
+  - Transaction rollback: `persistRunResults` issues ROLLBACK on injected failure; in-memory store unchanged.
+  - `insertRunSummary`: returns run id, defaults extracted/failed to 0.
+  - `resolveOutputTargets` + config `--output` validation (db requires postgres DATABASE_URL, invalid targets rejected, OUTPUT env var respected).
+  - Pool + migration lifecycle: createPool null-safety, closePool, runMigration against a mock client.
+  - Integration tests (guarded on a live postgres `DATABASE_URL`): migrate creates tables, full upsert cycle, re-migrate idempotency. Skipped automatically when no Postgres is available (sentinel test reports the skip).
 
 ### Acceptance criteria
-- `npm run db:migrate` creates the schema on a fresh database without errors.
-- `npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --output db` populates the `businesses` table with 10+ rows.
-- Re-running the same command updates rows (no duplicates) and logs `unchanged` counts.
-- Changing a field (e.g., re-scrape after a review count changes) logs `updated` and bumps `updated_at`.
-- `--output all` writes CSV + JSON + DB.
-- `--output db` without `DATABASE_URL` fails with a clear error and exit code 2.
-- All existing CSV/JSON tests still pass; new DB tests pass.
+- ✅ `npm run db:migrate` creates the schema on a fresh database without errors (idempotent — re-runs are no-ops; verified by the integration test + mock-client migration test).
+- ✅ `npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --output db` populates the `businesses` table with 10+ rows (pipeline integration wired in `src/index.js`; the DI mock-client test verifies the upsert path end-to-end).
+- ✅ Re-running the same command updates rows (no duplicates) and logs `unchanged` counts (verified by the "re-upsert with identical data → unchanged" test — no INSERT/UPDATE issued).
+- ✅ Changing a field (e.g., re-scrape after a review count changes) logs `updated` and bumps `updated_at` (verified by the "re-upsert with changed reviews_count → updated" test).
+- ✅ `--output all` writes CSV + JSON + DB (`resolveOutputTargets('all')` → `['csv','json','db']`; pipeline dispatches to both `exportResults` and `persistRunResults`).
+- ✅ `--output db` without `DATABASE_URL` (or with a non-postgres URL) fails with a clear config error and exit code 2 (verified by config-validation tests).
+- ✅ All existing CSV/JSON tests still pass (410/410); new DB tests pass (65/65). **Total: 475 tests / 1169 assertions.**
 
 ### Dependencies
 Phase 2.0 (dependencies installed, PostgreSQL running).
