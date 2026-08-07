@@ -8,9 +8,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 1.10 complete (v0.10.0) — 397 tests / 999 assertions passing.
+> **Last updated:** Phase 1 milestone complete (v1.0.0-phase1) — 397 tests / 999 assertions passing.
 >
-> **Overall:** 11 of 12 sub-phases shipped. Phases 1.0–1.10 are done; 1.11 is partial.
+> **Overall:** 12 of 12 sub-phases shipped. Phases 1.0–1.11 are all done. Phase 1 milestone tagged `v1.0.0-phase1`.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -24,10 +24,10 @@
 | 1.7 — Reliability & Crash Recovery | ✅ DONE | `48c7306` | 85 | withRetry (3 attempts, 1s→2s→4s), checkpoint resume, per-business isolation |
 | 1.8 — Minimal Anti-Block Behavior | ✅ DONE | `2644759` | 55 | `antiblock.js`: rate limiter (30 RPM), human typing, CAPTCHA detection, UA rotation, 429/503 watcher |
 | 1.9 — Logging & Observability | ✅ DONE | `972a6bb` | 27 | `phase` field on every line, per-business + per-field debug logs, run-complete event, sync file sink |
-| 1.10 — CLI Polish & DX | ✅ DONE | _(this commit)_ | 39 | `banner.js`: startup banner + 1s confirm delay, `--yes`/`-y` to skip; `--help`/`--version`/`--dryRun`/`--limit`/exit codes all in place |
-| 1.11 — Documentation & Handoff | 🟡 PARTIAL | — | — | README has Quick start / CLI / per-phase docs ✓; missing Troubleshooting, CHANGELOG, git tag |
+| 1.10 — CLI Polish & DX | ✅ DONE | `d7a7d26` | 39 | `banner.js`: startup banner + 1s confirm delay, `--yes`/`-y` to skip; `--help`/`--version`/`--dryRun`/`--limit`/exit codes all in place |
+| 1.11 — Documentation & Handoff | ✅ DONE | _(this commit)_ | — | README Troubleshooting + Known limitations + Roadmap, `SELECTORS.md`, `CHANGELOG.md`, `v1.0.0-phase1` git tag |
 
-**Critical path remaining:** 1.11 (then Phase 1 milestone complete).
+**Critical path remaining:** ✅ None — Phase 1 milestone complete.
 
 ---
 
@@ -546,7 +546,7 @@ A CLI tool that's pleasant and predictable to use.
 
 ## Phase 1.11 — Documentation & Handoff
 
-> **Status: 🟡 PARTIAL (~50%)** — README has Quick start, Requirements, CLI, Configuration, Usage examples, Project structure, Output format, per-phase docs (1.4–1.7). Missing: Troubleshooting section, Known limitations section, Roadmap link, selector-strategy doc, `CHANGELOG.md`, `v1.0.0-phase1` git tag.
+> **Status: ✅ DONE (v1.0.0-phase1)** — README has all 9 required sections (What it does, Quick start, Requirements, Configuration, Usage examples, Output format, Troubleshooting, Known limitations, Roadmap). `SELECTORS.md` documents the primary/fallback selector strategy + update procedure. `CHANGELOG.md` has the Phase 1 release entry. Commit tagged `v1.0.0-phase1`.
 
 ### Goal
 A new user (the operator, a teammate, or a future you) should be able to clone the repo, follow the README, and produce a CSV within 10 minutes.
@@ -566,9 +566,9 @@ Undocumented tools die. The README is the contract between the script and its us
   - **Known limitations** (Phase 1 scope — no proxies, no auto-CAPTCHA, single concurrent run)
   - **Roadmap** (link to `SCRAPER_FEATURES.md` for Phases 2-5)
 - [x] Add inline code comments explaining **why**, not **what** (especially around selectors and scroll logic — the fragile parts).
-- [ ] Document the **selector strategy** — where the primary and fallback selectors are defined, how to update them when Google changes the DOM.
-- [ ] Add a `CHANGELOG.md` with the Phase 1 release entry.
-- [ ] Tag the git commit as `v1.0.0-phase1` (or similar) to mark the milestone.
+- [x] Document the **selector strategy** — where the primary and fallback selectors are defined, how to update them when Google changes the DOM.
+- [x] Add a `CHANGELOG.md` with the Phase 1 release entry.
+- [x] Tag the git commit as `v1.0.0-phase1` (or similar) to mark the milestone.
 
 ### Acceptance criteria
 - A fresh clone + `npm install` + `npx playwright install chromium` + `npm start -- --query "Restaurant" --location "Toronto" --limit 20` produces a CSV within 10 minutes.

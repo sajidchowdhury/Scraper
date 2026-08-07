@@ -1,25 +1,34 @@
 # gmaps-scraper
 
-Google Maps business scraper — **Phase 1**: search → paginate → extract → (deep scrape) → CSV export, with crash recovery.
+Google Maps business scraper — **Phase 1**: search → paginate → extract → (deep scrape) → CSV export, with crash recovery, anti-block, structured logging, and CLI polish.
 
-> Implements sub-phases 1.0 through 1.7 of `PHASE1_EXECUTION_PLAN.md`. The script survives
-> transient failures (retry with backoff), resumes from checkpoints after a crash, and
-> isolates per-business errors so one bad record never crashes the run.
+> Implements sub-phases 1.0 through 1.11 of `PHASE1_EXECUTION_PLAN.md` — the full Phase 1 milestone.
+> The script survives transient failures (retry with backoff), resumes from checkpoints after a crash,
+> isolates per-business errors so one bad record never crashes the run, throttles itself to avoid
+> blocks, and emits a JSON-lines log per run for post-hoc analysis.
+
+- **[CHANGELOG.md](CHANGELOG.md)** — release history for the Phase 1 milestone (`v1.0.0-phase1`).
+- **[SELECTORS.md](SELECTORS.md)** — where the primary/fallback CSS selectors live, and how to update them when Google changes the DOM.
+- **[PHASE1_EXECUTION_PLAN.md](PHASE1_EXECUTION_PLAN.md)** — granular per-sub-phase spec, acceptance criteria, and status.
+- **[SCRAPER_FEATURES.md](SCRAPER_FEATURES.md)** — master roadmap (Phases 2–5: proxies, auto-CAPTCHA, concurrency, …).
 
 ## Quick start
 
 ```bash
-# 1. Install (Playwright is symlinked from the global install — no npm install needed
-#    in this sandbox; in a fresh checkout run `npm install playwright`.)
-cp .env.example .env
+# 1. Clone + install dependencies
+npm install
+npx playwright install chromium
 
-# 2. Run (list-view fields only — fast)
+# 2. Configure (optional — CLI flags override everything)
+cp .env.example .env   # then edit DEFAULT_QUERY / DEFAULT_LOCATION
+
+# 3. Run (list-view fields only — fast)
 npm start -- --query "Restaurant" --location "Toronto" --maxResults 50
 
-# 3. Run with detail-page deep scrape (slower, ~2-4s/business, richer data)
+# 4. Run with detail-page deep scrape (slower, ~2-4s/business, richer data)
 npm start -- --query "Cafe" --location "Berlin" --deepScrape true --maxResults 20
 
-# 4. QA mode — deep-scrape every 5th business for a fast smoke test
+# 5. QA mode — deep-scrape every 5th business for a fast smoke test
 npm start -- --query "Cafe" --location "Berlin" --deepScrape true --deepScrapeSampleStep 5
 ```
 
@@ -517,4 +526,161 @@ banner still prints, but the run starts immediately:
 | `--yes` / `-y` to skip the banner delay | ✅ |
 | Friendly config errors (no stack traces) | ✅ |
 | Exit codes 0 / 1 / 2 / 3 / 130 | ✅ |
+
+## Troubleshooting
+
+### Google shows a CAPTCHA / "Our systems have detected unusual traffic"
+
+Google flags automated traffic. The scraper detects this (Phase 1.8) and
+**pauses** for `CAPTCHA_WAIT_MS` (default 5 min) so you can solve it in a
+`--headed` window, then aborts with exit code `3` — **leaving the checkpoint
+on disk** so you can continue.
+
+```bash
+# 1. Rerun headed so you can see / solve the CAPTCHA
+npm start -- --query "Restaurant" --location "Toronto" --headed --resume
+
+# 2. If it keeps happening, lower the request rate
+npm start -- --maxRPM 15 --query "Restaurant" --location "Toronto" --resume
+
+# 3. Wait it out — blocks usually clear in a few hours. Then:
+npm start -- --query "Restaurant" --location "Toronto" --resume
+```
+
+Prevention: keep `--maxRPM` at or below 30 (the default), leave human typing
+on (the default), and avoid re-running the same query/location back-to-back.
+Auto-solving CAPTCHAs is explicitly **Phase 2** scope (see `SCRAPER_FEATURES.md`).
+
+### No results / "Results feed detected" never logs
+
+- **Wrong query spelling or location granularity.** Try a broader location
+  (e.g. `Toronto` instead of `Downtown Toronto ON`).
+- **Google rendered the page in a non-English locale.** The scraper forces
+  `hl=en` on the Maps URL, but if you're behind a regional redirect, add the
+  country to the location: `"Dhaka, Bangladesh"`.
+- **The results feed selector changed.** Check `SELECTORS.md` for how to
+  inspect the live DOM and update the feed-detection selector.
+- Run with `--verbose` (alias `--logLevel debug`) to see every scroll step
+  and the raw result count.
+
+### `Error: Executable doesn't exist at .../chromium-*/chrome` (Playwright not installed)
+
+Playwright's npm package is JS-only; the browser binaries are a separate
+download. Install them once after `npm install`:
+
+```bash
+npx playwright install chromium
+```
+
+If you're on a fresh OS image you may also need system deps:
+
+```bash
+npx playwright install-deps chromium   # Linux (apt)
+```
+
+### CSV opens in Excel with garbled non-Latin text (Bengali, Arabic, emoji)
+
+The CSV is written **UTF-8 with BOM** (`\uFEFF`) and **CRLF** line endings
+(RFC 4180) specifically so Excel auto-detects the encoding. If you still see
+garbling:
+
+- **You opened it as plain text first.** Open the `.csv` directly from
+  Excel's *File → Open* (don't paste it in).
+- **Excel's default import codec is wrong.** Use *Data → From Text/CSV* and
+  pick `65001: Unicode (UTF-8)`.
+- **You re-saved it from a text editor** that stripped the BOM. Re-export
+  from the `.json` sidecar, or rerun the scraper.
+
+### Encoding issues in the JSON sidecar
+
+The `.json` file is UTF-8 (no BOM — JSON spec forbids it). Any modern parser
+(Node, Python `json`, `jq`) handles it natively. If your tool shows `\uXXXX`
+escapes, that's normal JSON Unicode escaping — the data is correct.
+
+### Extraction rates show `phone`, `website`, `plus_code`, `price_level` at 0%
+
+This is **expected** on modern Google Maps list-view cards — Google removed
+those fields from the compact list layout. They live on the **detail panel**
+now, so enable deep scrape to populate them:
+
+```bash
+npm start -- --query "Cafe" --location "Berlin" --deepScrape true
+```
+
+The extraction-rate reporter surfaces this as a `WARN (<80%)` line by
+design — it's an early-warning signal, not a bug.
+
+### The run crashed partway — how do I continue?
+
+A `.checkpoint_{query}_{location}.json` file is left in `data/`. Just rerun
+with `--resume`:
+
+```bash
+npm start -- --query "Restaurant" --location "Toronto" --resume
+```
+
+The scraper reloads the already-extracted businesses, re-searches +
+re-scrolls (a live browser session can't be restored, only the data), and
+**skips businesses already in the checkpoint** by `place_id` (or a
+name+address+phone hash as fallback). To start completely fresh instead:
+
+```bash
+npm start -- --query "Restaurant" --location "Toronto" --fresh
+```
+
+### Exit code reference
+
+| Code | Meaning |
+|---|---|
+| `0` | Success — all businesses extracted cleanly |
+| `1` | Partial success — run completed but some businesses failed (see logs) |
+| `2` | Config error — bad CLI input (e.g. `--maxResults abc`) |
+| `3` | Runtime error — crash or CAPTCHA abort (checkpoint preserved for `--resume`) |
+| `130` | `Ctrl-C` / `SIGINT` (checkpoint preserved) |
+
+## Known limitations (Phase 1 scope)
+
+These are **deliberately deferred** to later phases (see `SCRAPER_FEATURES.md`):
+
+- **No proxy / IP rotation.** All requests come from one IP. Sustained runs
+  against the same query/location will eventually trip a CAPTCHA. Phase 2
+  adds a proxy pool.
+- **No auto-CAPTCHA solving.** On detection the scraper pauses (so you can
+  solve it in a `--headed` window) then aborts with the checkpoint
+  preserved. Auto-solve is Phase 2.
+- **Single concurrent run.** One browser, one query, sequential extraction.
+  Parallelism (multiple workers / queries) is Phase 3.
+- **List-view field gaps.** `phone`, `website`, `plus_code`, and
+  `price_level` are absent from modern list-view cards — populate them with
+  `--deepScrape true` (Phase 1.5), which opens each detail panel
+  (~2–4 s/business).
+- **Selectors are DOM-coupled.** Google reshuffles the Maps DOM frequently.
+  When a field's extraction rate drops, see `SELECTORS.md` for how to
+  inspect the live DOM and add/update a fallback selector. There is no
+  machine-learning fallback in Phase 1.
+- **No incremental / scheduled runs.** Each run is a fresh search + scroll.
+  Delta detection ("what changed since last week?") is Phase 4.
+- **`commonjs`, not ESM.** The codebase uses `require()`/`module.exports`
+  for Node 20 compatibility with zero build step. ESM migration is Phase 5
+  housekeeping.
+- **No GUI.** CLI only. A web dashboard is Phase 5.
+
+## Roadmap
+
+Phase 1 (this release — `v1.0.0-phase1`) delivers a **single-query,
+single-machine, CSV-exporting** scraper that's robust against transient
+failures and polite to Google. The master roadmap in
+**[`SCRAPER_FEATURES.md`](SCRAPER_FEATURES.md)** covers Phases 2–5:
+
+- **Phase 2 — Anti-Block Hardening:** proxy pool, auto-CAPTCHA solver,
+  residential-IP rotation, fingerprint randomization.
+- **Phase 3 — Scale:** multi-worker concurrency, queue-based scheduling,
+  distributed checkpoints (SQLite/Postgres instead of `.checkpoint.json`).
+- **Phase 4 — Data Quality & Analytics:** delta detection, schema
+  validation, deduplication across runs, a small analytics dashboard.
+- **Phase 5 — Polish:** ESM migration, web UI, plugin system, packaging as
+  a CLI (`npx gmaps-scraper`), Docker image.
+
+See `PHASE1_EXECUTION_PLAN.md` for the granular Phase 1 sub-phase spec and
+acceptance criteria, and `CHANGELOG.md` for what shipped in this release.
 
