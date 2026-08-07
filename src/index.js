@@ -79,6 +79,16 @@ const {
 } = require('./checkpoint');
 const { RateLimiter, detectCaptcha } = require('./antiblock');
 const { showStartupBanner } = require('./banner');
+// Phase 2.4 — browser fingerprint randomization. Loaded eagerly so the
+// fingerprint can be generated + logged before the browser launches (and so
+// --fixedFingerprint coherence failures surface at config time, not at launch).
+const { generateFingerprint, summarizeFingerprint } = require('./fingerprint');
+// Phase 2.1 — PostgreSQL persistence (lazy-loaded; only used when
+// cfg.output includes 'db').
+const { createPool, persistRunResults, closePool } = require('./db');
+// Phase 2.3 — proxy management & rotation. Only initialized when cfg.proxy
+// is enabled (i.e. --noProxy is not set AND a proxy source is configured).
+const { createProxyPool } = require('./proxy');
 
 async function main() {
   const cfg = loadConfig(process.argv.slice(2));
@@ -112,6 +122,7 @@ async function main() {
     maxResults: cfg.maxResults,
     headless: cfg.headless,
     dryRun: cfg.dryRun,
+    output: cfg.output,
     deepScrape: cfg.deepScrape,
     resume: cfg.resume,
     fresh: cfg.fresh,
@@ -124,11 +135,142 @@ async function main() {
       scrollDelay: [cfg.antiblock.scrollDelayMinMs, cfg.antiblock.scrollDelayMaxMs],
       detailDelay: [cfg.antiblock.detailDelayMinMs, cfg.antiblock.detailDelayMaxMs],
     },
+    proxy: {
+      enabled: cfg.proxy.enabled,
+      strategy: cfg.proxy.strategy,
+      sessionLength: cfg.proxy.sessionLength,
+      cooldownMs: cfg.proxy.cooldownMs,
+      listFile: cfg.proxy.listFile,
+      provider: cfg.proxy.provider,
+      healthCheck: cfg.proxy.healthCheck,
+    },
   });
 
   // Phase 1.8 — construct the rate limiter once and attach to cfg so every
   // module that makes Google-bound requests (search, detail) can acquire.
   cfg.rateLimiter = new RateLimiter(cfg.antiblock.maxRequestsPerMin, { logger });
+
+  // Phase 2.3 — construct the proxy pool (if enabled). The pool is then
+  // queried before each browser launch to pick a proxy; release() is called
+  // in the finally block with the outcome so the burn detector can track it.
+  let proxyPool = null;
+  if (cfg.proxy.enabled) {
+    const proxySources = {};
+    if (cfg.proxy.listFile) proxySources.file = cfg.proxy.listFile;
+    if (cfg.proxy.provider && cfg.proxy.providerUrl) {
+      // The provider() function is wired up here. Currently a stub that reads
+      // from a local file or returns an empty list — real provider APIs
+      // (Bright Data / Smartproxy / Oxylabs) are integrated in Phase 2.7.
+      proxySources.provider = async () => {
+        logger.warn('Proxy provider configured but not yet implemented', {
+          provider: cfg.proxy.provider,
+          hint: 'Use --proxyListFile for now. Provider API integration is Phase 2.7.',
+        });
+        return [];
+      };
+    }
+    proxyPool = createProxyPool({
+      sources: proxySources,
+      strategy: cfg.proxy.strategy,
+      sessionLength: cfg.proxy.sessionLength,
+      cooldownMs: cfg.proxy.cooldownMs,
+      burnLogPath: cfg.proxy.burnLogPath || undefined,
+      logger,
+    });
+
+    // Optional pre-run health check. Probes every proxy with a HEAD to Google;
+    // benches failures for one cooldown cycle. Useful before long overnight runs.
+    if (cfg.proxy.healthCheck) {
+      logger.info('Phase 2.3 — running proxy health check', {
+        hint: 'Probes every proxy with a HEAD to google.com before scraping',
+      });
+      try {
+        const hc = await proxyPool.healthCheck();
+        logger.info('Proxy health check result', {
+          total: hc.total,
+          healthy: hc.healthy.length,
+          dead: hc.dead.length,
+        });
+        if (hc.healthy.length === 0) {
+          logger.error('All proxies failed health check — aborting', {
+            dead: hc.dead,
+            hint: 'Check your proxy list or provider credentials, or rerun with --noProxy',
+          });
+          process.exit(3);
+        }
+      } catch (err) {
+        logger.error('Proxy health check failed (non-fatal — continuing)', {
+          message: err.message,
+        });
+      }
+    }
+  } else {
+    logger.info('Phase 2.3 — proxy rotation disabled (direct connection)', {
+      reason: cfg.proxy.enabled === false ? 'no proxy source configured (use --proxyListFile or PROXY_LIST_FILE)' : '--noProxy flag set',
+    });
+  }
+
+  // Phase 2.4 — generate the per-run fingerprint. Generated ONCE here (before
+  // the browser launches) so the same fingerprint is used for the whole
+  // session. Per-worker persistence (Phase 2.8) will move this into the worker
+  // pool — for now, the single-browser pipeline gets one fingerprint.
+  //
+  // --noFingerprint / fingerprintProfile 'off' → no fingerprint (Phase 1
+  //   behavior: pickUserAgent() + cfg.viewport + 'en-US' + 'America/Toronto').
+  // --fingerprintProfile random  → generateFingerprint() picks a coherent
+  //   profile (UA + platform + viewport + timezone + locale + WebGL + canvas
+  //   noise + hw concurrency + device memory + geolocation).
+  // --fingerprintProfile fixed   → use the profile supplied via
+  //   --fixedFingerprint <json>. Coherence is validated; an incoherent fixed
+  //   profile is rejected (treated as 'off' with a warning) rather than
+  //   shipping a detectable mismatch.
+  let fingerprint = null;
+  if (cfg.fingerprint.profile === 'off') {
+    logger.info('Phase 2.4 — fingerprint randomization disabled (Phase 1 behavior)', {
+      reason: '--noFingerprint flag or NO_FINGERPRINT=true',
+    });
+  } else if (cfg.fingerprint.profile === 'fixed') {
+    let fixed = null;
+    try {
+      fixed = JSON.parse(cfg.fingerprint.fixedJson);
+    } catch (err) {
+      // Should never happen — validate() catches this at config time. But we
+      // defend in depth so a runtime .env change can't crash the run.
+      logger.error('Phase 2.4 — --fixedFingerprint JSON parse failed', { error: err.message });
+    }
+    if (fixed) {
+      fingerprint = generateFingerprint({ fixed, logger });
+      if (!fingerprint) {
+        logger.warn('Phase 2.4 — fixed fingerprint failed coherence check; falling back to Phase 1 behavior', {
+          hint: 'Fix the --fixedFingerprint JSON or rerun with --fingerprintProfile random',
+        });
+      }
+    }
+  } else {
+    // 'random' (the default)
+    fingerprint = generateFingerprint({ logger });
+    if (!fingerprint) {
+      logger.warn('Phase 2.4 — fingerprint generation failed; falling back to Phase 1 behavior', {
+        hint: 'This is unexpected — check that the user-agents library is installed',
+      });
+    }
+  }
+  if (fingerprint) {
+    logger.info('Phase 2.4 — fingerprint generated', {
+      summary: summarizeFingerprint(fingerprint),
+      profile: cfg.fingerprint.profile,
+      userAgent: fingerprint.userAgent,
+      platform: fingerprint.platform,
+      viewport: fingerprint.viewport,
+      timezone: fingerprint.timezone,
+      locale: fingerprint.locale,
+      webglVendor: fingerprint.webglVendor,
+      hardwareConcurrency: fingerprint.hardwareConcurrency,
+      deviceMemory: fingerprint.deviceMemory,
+    });
+  }
+  // Store on cfg so downstream code (banner, future worker pool) can read it.
+  cfg.fingerprint.resolved = fingerprint;
 
   // Phase 1.10 — startup banner. Prints the resolved config and waits 1s so
   // the operator can eyeball it and Ctrl-C if it looks wrong. Skipped (no
@@ -166,12 +308,30 @@ async function main() {
   let result;
 
   try {
-    result = await withBrowser(
-      cfg,
-      async ({ page }) => {
-        // We always re-search + re-scroll on resume — a live browser session
-        // can't be restored, only the extracted data can.
-        await performSearch(page, cfg, logger, cfg.retry, cfg.rateLimiter);
+    // Phase 2.3 — acquire a proxy (if the pool is enabled) before launching
+    // the browser. The proxy descriptor flows through withBrowser →
+    // launchBrowser → chromium.launch({ proxy }). On teardown (success OR
+    // failure) we release the proxy back to the pool with the outcome so the
+    // burn detector can track success rate + consecutive failures.
+    let acquiredProxy = null;
+    if (proxyPool) {
+      acquiredProxy = await proxyPool.acquire();
+      if (!acquiredProxy) {
+        logger.error('Proxy pool exhausted — every proxy is burned', {
+          hint: 'Wait for the cooldown window to elapse, add more proxies, or rerun with --noProxy',
+        });
+        process.exit(3);
+      }
+    }
+
+    let pipelineError = null;
+    try {
+      result = await withBrowser(
+        cfg,
+        async ({ page }) => {
+          // We always re-search + re-scroll on resume — a live browser session
+          // can't be restored, only the extracted data can.
+          await performSearch(page, cfg, logger, cfg.retry, cfg.rateLimiter);
 
         const scrollResult = await scrollFeedToBottomOnPage(page, cfg, logger);
         logger.info('Scroll complete', {
@@ -321,11 +481,51 @@ async function main() {
       // Phase 1.8 — wire the 429/503 watcher. On a blocked response we just
       // log (the rate limiter + CAPTCHA check handle the actual backoff).
       logger,
+      // Phase 2.3 — pass the acquired proxy through to launchBrowser.
+      proxy: acquiredProxy,
+      // Phase 2.4 — pass the per-run fingerprint through to launchBrowser.
+      // null when --noFingerprint / profile 'off' → Phase 1 context defaults.
+      fingerprint: cfg.fingerprint.resolved,
       onBlocked: ({ status, url, count }) => {
         logger.warn('Google returned a block-status response', { status, url, count });
+        // Phase 2.3 — a 429/503 from Google while using a proxy is a strong
+        // signal that the proxy is being rate-limited. We mark it burned via
+        // release() below (the onBlocked hook is informational only; the
+        // actual burn decision happens in the finally block based on whether
+        // the pipeline threw).
       },
     },
   );
+    } catch (err) {
+      pipelineError = err;
+      throw err;
+    } finally {
+      // Phase 2.3 — release the proxy back to the pool with the outcome so the
+      // burn detector can track success rate + consecutive failures. A CAPTCHA
+      // or 429 from Google counts as a soft failure (the proxy may be getting
+      // rate-limited); a hard crash counts as a timeout-equivalent failure.
+      if (proxyPool && acquiredProxy) {
+        let outcome;
+        if (pipelineError && pipelineError.code === 'CAPTCHA_DETECTED') {
+          // CAPTCHA → treat as a 429 (block signal) for burn-detection purposes.
+          outcome = { success: false, statusCode: 429 };
+        } else if (pipelineError) {
+          // Other crash → treat as a timeout (different burn rule, separate
+          // streak counter in the detector).
+          outcome = { success: false, statusCode: 'TIMEOUT' };
+        } else {
+          outcome = { success: true };
+        }
+        try {
+          proxyPool.release(acquiredProxy.id, outcome);
+        } catch (releaseErr) {
+          logger.warn('Proxy release failed (non-fatal)', {
+            proxyId: acquiredProxy.id,
+            error: releaseErr.message,
+          });
+        }
+      }
+    }
   } catch (err) {
     if (err && err.code === 'CAPTCHA_DETECTED') {
       logger.error('Run aborted — CAPTCHA detected', {
@@ -342,6 +542,14 @@ async function main() {
     process.exit(3);
   } finally {
     browserClosed = true;
+    // Phase 2.3 — flush + close the proxy pool (best-effort).
+    if (proxyPool && typeof proxyPool.close === 'function') {
+      try {
+        proxyPool.close();
+      } catch {
+        /* best-effort */
+      }
+    }
   }
 
   const durationMs = Date.now() - startedAt;
@@ -375,21 +583,67 @@ async function main() {
     startedAt: new Date(startedAt).toISOString(),
     durationMs,
     fields: [...CANONICAL_FIELDS, ...DETAIL_FIELDS],
+    // Phase 2.3 — proxy pool stats for this run (null when proxy disabled).
+    proxy: proxyPool ? proxyPool.stats() : { enabled: false },
   };
 
+  // Phase 2.1 — output dispatch. cfg.output is a normalized array of targets
+  // (csv, json, db). Dry runs skip ALL writes (files + DB) so --dryRun remains
+  // a true smoke test.
+  const wantsCsv = cfg.output.includes('csv');
+  const wantsJson = cfg.output.includes('json');
+  const wantsDb = cfg.output.includes('db');
+  const wantsFiles = wantsCsv || wantsJson;
+
   let outPaths = null;
-  if (!cfg.dryRun) {
+  if (!cfg.dryRun && wantsFiles) {
     outPaths = await exportResults({
       businesses: result.businesses,
       summary,
       outputFile: cfg.outputFile,
       outputDir: cfg.outputDir,
+      writeCsv: wantsCsv,
+      writeJson: wantsJson,
+      writeSummary: wantsFiles,
       logger,
     });
-  } else {
+  } else if (cfg.dryRun) {
     logger.info('Dry run — skipping file output', {
       wouldWrite: cfg.outputFile || path.join(cfg.outputDir, 'dryrun'),
+      outputTargets: cfg.output,
     });
+  }
+
+  // Phase 2.1 — PostgreSQL persistence. Opens a pool, upserts every business
+  // (keyed by place_id) in a single transaction, writes the run summary, and
+  // closes the pool. A DB failure is logged + reflected in the exit code but
+  // does NOT discard the file outputs already written above.
+  let dbResult = null;
+  if (!cfg.dryRun && wantsDb) {
+    const pool = createPool(cfg.databaseUrl);
+    if (!pool) {
+      logger.error('DB output requested but DATABASE_URL is unset', {
+        hint: 'Set DATABASE_URL in .env (see .env.example → Phase 2.1).',
+      });
+      process.exit(2);
+    }
+    try {
+      dbResult = await persistRunResults(pool, {
+        businesses: result.businesses,
+        summary: { ...summary, exitCode: null, logPath: logger.getLogFile ? logger.getLogFile() : null },
+        logger,
+      });
+    } catch (err) {
+      logger.error('DB persistence failed', {
+        phase: 'db',
+        message: err.message,
+        stack: err.stack,
+        hint: 'CSV/JSON outputs (if any) are unaffected. Re-run with --output db to retry.',
+      });
+      dbResult = { failed: true, message: err.message };
+    } finally {
+      await closePool(pool);
+    }
   }
 
   // Phase 1.7 — clear the checkpoint on successful completion. A leftover
@@ -414,9 +668,53 @@ async function main() {
     result.extractStats && result.extractStats.failed > 0
       ? `Extract:  ${result.extractStats.succeeded}/${result.extractStats.total} succeeded, ${result.extractStats.failed} failed`
       : null;
-  const outputLines = outPaths
-    ? [`CSV:      ${outPaths.csvPath}`, `JSON:     ${outPaths.jsonPath}`, `Summary:  ${outPaths.summaryPath}`]
-    : ['Output:   (dry run, no file written)'];
+  // Phase 2.1 — build the output lines for the end-of-run banner. Each target
+  // (csv, json, db) gets its own line; dry runs show a single placeholder.
+  const outputLines = [];
+  if (cfg.dryRun) {
+    outputLines.push('Output:   (dry run, no files / DB written)');
+  } else {
+    if (outPaths && outPaths.csvPath) outputLines.push(`CSV:      ${outPaths.csvPath}`);
+    if (outPaths && outPaths.jsonPath) outputLines.push(`JSON:     ${outPaths.jsonPath}`);
+    if (outPaths && outPaths.summaryPath) outputLines.push(`Summary:  ${outPaths.summaryPath}`);
+    if (dbResult) {
+      if (dbResult.failed) {
+        outputLines.push(`DB:       FAILED — ${dbResult.message}`);
+      } else {
+        // Phase 2.2 — include the change breakdown when any tracked field
+        // changed. Format: "30 updated (12 rating changes, 8 review-count
+        // changes, 2 status changes), 20 unchanged". When there are zero
+        // changes, fall back to the compact Phase 2.1 line.
+        const cbf = dbResult.changesByField || {};
+        const changeParts = [];
+        if (cbf.rating) changeParts.push(`${cbf.rating} rating changes`);
+        if (cbf.reviews_count) changeParts.push(`${cbf.reviews_count} review-count changes`);
+        if (cbf.business_status) changeParts.push(`${cbf.business_status} status changes`);
+        if (cbf.phone) changeParts.push(`${cbf.phone} phone changes`);
+        if (cbf.website) changeParts.push(`${cbf.website} website changes`);
+        const changesClause =
+          dbResult.updated > 0 && changeParts.length > 0
+            ? ` (${changeParts.join(', ')})`
+            : '';
+        outputLines.push(
+          `DB:       ${dbResult.inserted} inserted, ${dbResult.updated} updated${changesClause}, ${dbResult.unchanged} unchanged (run #${dbResult.runId})`,
+        );
+      }
+    }
+    if (outputLines.length === 0) outputLines.push('Output:   (no targets selected)');
+  }
+  // Phase 2.3 — proxy stats line. Shows total/healthy/burned + the strategy.
+  // When proxy is disabled, the line is omitted entirely (matches Phase 1).
+  const proxyLines = [];
+  if (proxyPool) {
+    const ps = proxyPool.stats();
+    const rate = ps.avgSuccessRate !== null
+      ? `${Math.round(ps.avgSuccessRate * 100)}% success`
+      : 'no requests yet';
+    proxyLines.push(
+      `Proxy:    ${ps.healthy}/${ps.total} healthy, ${ps.cooldown} cooling, ${ps.burned} burned (${ps.strategy}, ${rate})`,
+    );
+  }
   // Phase 1.9 — include the log file path in the banner so the operator knows
   // where the full JSON-lines record of this run lives.
   const logFile = logger.getLogFile ? logger.getLogFile() : null;
@@ -431,6 +729,7 @@ async function main() {
     ...(recoveryLine ? [recoveryLine] : []),
     ...(extractFailLine ? [extractFailLine] : []),
     ...outputLines,
+    ...proxyLines,
     ...(logLine ? [logLine] : []),
     '========================================',
   ].join('\n');
@@ -438,10 +737,13 @@ async function main() {
   console.log(banner);
 
   // Phase 1.10 prep — exit code 1 for partial success (some failures but
-  // run completed). Exit 0 only if everything succeeded.
+  // run completed). Exit 0 only if everything succeeded. A DB persistence
+  // failure also counts as partial success (exit 1), not a crash (exit 3),
+  // because the scrape itself completed — only the DB write failed.
   const hasExtractFailures = result.extractStats && result.extractStats.failed > 0;
   const hasDetailFailures = result.detailStats && result.detailStats.failed > 0;
-  const exitCode = hasExtractFailures || hasDetailFailures ? 1 : 0;
+  const hasDbFailure = !!(dbResult && dbResult.failed);
+  const exitCode = hasExtractFailures || hasDetailFailures || hasDbFailure ? 1 : 0;
 
   // Phase 1.9 — structured "Run complete" log line so the JSON-lines file has
   // a single machine-parseable record of the run's final status (duration,
@@ -459,8 +761,14 @@ async function main() {
     detailAttempted: result.detailStats ? result.detailStats.attempted : 0,
     detailFailed: result.detailStats ? result.detailStats.failed : 0,
     dryRun: cfg.dryRun,
+    output: cfg.output,
     csv: outPaths ? outPaths.csvPath : null,
     json: outPaths ? outPaths.jsonPath : null,
+    db: dbResult && !dbResult.failed
+      ? { runId: dbResult.runId, inserted: dbResult.inserted, updated: dbResult.updated, unchanged: dbResult.unchanged }
+      : dbResult && dbResult.failed
+        ? { failed: true, message: dbResult.message }
+        : null,
     log: logFile,
   });
 

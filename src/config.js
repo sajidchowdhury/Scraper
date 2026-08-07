@@ -82,6 +82,20 @@ function parseArgs(argv) {
     else if (a === '--noHumanTyping') out.humanTyping = false;
     else if (a === '--noCaptchaPause') out.captchaPause = false;
     else if (a === '--captchaWaitMs') out.captchaWaitMs = argv[++i];
+    // Phase 2.1 — output targets (csv, json, db, all). Accepts comma-separated
+    // values too: --output csv,json,db. The keyword `all` expands to csv,json,db.
+    else if (a === '--output') out.output = argv[++i];
+    // Phase 2.3 — proxy management & rotation
+    else if (a === '--proxyStrategy') out.proxyStrategy = argv[++i];
+    else if (a === '--sessionLength') out.sessionLength = argv[++i];
+    else if (a === '--proxyCooldownMs') out.proxyCooldownMs = argv[++i];
+    else if (a === '--noProxy') out.noProxy = true;
+    else if (a === '--proxyListFile') out.proxyListFile = argv[++i];
+    else if (a === '--proxyHealthCheck') out.proxyHealthCheck = true;
+    // Phase 2.4 — browser fingerprint randomization
+    else if (a === '--fingerprintProfile') out.fingerprintProfile = argv[++i];
+    else if (a === '--fixedFingerprint') out.fixedFingerprint = argv[++i];
+    else if (a === '--noFingerprint') out.noFingerprint = true;
   }
   return out;
 }
@@ -94,6 +108,34 @@ function toIntOrNull(v) {
   if (v === undefined || v === null || v === '') return null;
   const n = Number.parseInt(String(v), 10);
   return Number.isFinite(n) ? n : null;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.1 — resolve --output / OUTPUT into a normalized target array.
+// Accepts: 'csv', 'json', 'db', 'all', or comma-separated combinations.
+// Returns: string[] of targets in canonical order (csv, json, db) — de-duped.
+// 'all' expands to ['csv','json','db']. Empty/undefined → ['csv','json']
+// (preserves Phase 1 default behavior).
+// ---------------------------------------------------------------------------
+
+function resolveOutputTargets(raw) {
+  if (!raw) return ['csv', 'json'];
+  const parts = String(raw)
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (parts.length === 0) return ['csv', 'json'];
+  if (parts.includes('all')) return ['csv', 'json', 'db'];
+  // De-dup while preserving first-seen order.
+  const seen = new Set();
+  const out = [];
+  for (const p of parts) {
+    if (!seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out;
 }
 
 function validate(cfg) {
@@ -123,6 +165,34 @@ function validate(cfg) {
   if (cfg.resume && cfg.fresh) {
     errors.push('--resume and --fresh are mutually exclusive');
   }
+  // Phase 2.1 — validate --output targets.
+  for (const t of cfg.output) {
+    if (!['csv', 'json', 'db'].includes(t)) {
+      errors.push(
+        `--output target must be csv, json, db, or all (got "${t}"). ` +
+          'Use comma-separated values for multiple: --output csv,json,db',
+      );
+    }
+  }
+  // --output db requires DATABASE_URL at runtime (the pool is created lazily
+  // in src/index.js, but we fail fast here so the operator sees the error
+  // before any browser launches). The URL must be a PostgreSQL connection
+  // string (postgres:// or postgresql://) — a SQLite file:// URL won't work.
+  if (cfg.output.includes('db')) {
+    if (!cfg.databaseUrl) {
+      errors.push(
+        '--output db requires DATABASE_URL (set in .env or environment). ' +
+          'See .env.example → Phase 2.1 section.',
+      );
+    } else if (!/^postgres(ql)?:\/\//.test(cfg.databaseUrl)) {
+      errors.push(
+        '--output db requires a PostgreSQL DATABASE_URL (must start with ' +
+          'postgresql:// or postgres://). Got: ' +
+          cfg.databaseUrl.slice(0, 40) +
+          (cfg.databaseUrl.length > 40 ? '…' : ''),
+      );
+    }
+  }
   // Phase 1.8 — antiblock validation
   if (cfg.antiblock.maxRequestsPerMin < 1 || cfg.antiblock.maxRequestsPerMin > 600) {
     errors.push(
@@ -133,6 +203,56 @@ function validate(cfg) {
     errors.push(
       `captchaWaitMs must be between 0 and 3600000 (got ${cfg.antiblock.captchaWaitMs})`,
     );
+  }
+  // Phase 2.3 — proxy validation
+  if (!['round-robin', 'random', 'sticky'].includes(cfg.proxy.strategy)) {
+    errors.push(
+      `proxyStrategy must be one of round-robin, random, sticky (got "${cfg.proxy.strategy}")`,
+    );
+  }
+  if (cfg.proxy.sessionLength < 1 || cfg.proxy.sessionLength > 10000) {
+    errors.push(
+      `sessionLength must be between 1 and 10000 (got ${cfg.proxy.sessionLength})`,
+    );
+  }
+  if (cfg.proxy.cooldownMs < 0 || cfg.proxy.cooldownMs > 24 * 60 * 60 * 1000) {
+    errors.push(
+      `proxyCooldownMs must be between 0 and 86400000 (got ${cfg.proxy.cooldownMs})`,
+    );
+  }
+  // --proxyListFile must point to a readable file IF specified. We don't
+  // require it (the pool can also be populated via a provider() function),
+  // but a non-existent file is a config error, not a runtime one.
+  if (cfg.proxy.listFile && !fs.existsSync(cfg.proxy.listFile)) {
+    errors.push(
+      `--proxyListFile not found: ${cfg.proxy.listFile} (set PROXY_LIST_FILE in .env or pass --proxyListFile <path>)`,
+    );
+  }
+  // Phase 2.4 — fingerprint validation
+  if (!['random', 'fixed', 'off'].includes(cfg.fingerprint.profile)) {
+    errors.push(
+      `fingerprintProfile must be one of random, fixed, off (got "${cfg.fingerprint.profile}")`,
+    );
+  }
+  // --fixedFingerprint must be valid JSON when fingerprintProfile is 'fixed'.
+  // We parse it here so a malformed string fails fast at config time, not at
+  // the first browser launch. The coherence check itself happens in index.js
+  // (it needs the fingerprint module loaded).
+  if (cfg.fingerprint.profile === 'fixed') {
+    if (!cfg.fingerprint.fixedJson) {
+      errors.push(
+        'fingerprintProfile=fixed requires --fixedFingerprint <json> (a JSON object with userAgent, platform, locale, timezone, ...)',
+      );
+    } else {
+      try {
+        const parsed = JSON.parse(cfg.fingerprint.fixedJson);
+        if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) {
+          errors.push('--fixedFingerprint must be a JSON object, not ' + typeof parsed);
+        }
+      } catch (e) {
+        errors.push(`--fixedFingerprint is not valid JSON: ${e.message}`);
+      }
+    }
   }
   return errors;
 }
@@ -163,6 +283,12 @@ function loadConfig(argv = process.argv.slice(2)) {
     outputDir: cli.outputDir || process.env.OUTPUT_DIR || './data',
     outputFile: cli.outputFile || null, // null = auto-generate
     dryRun: !!cli.dryRun,
+
+    // Phase 2.1 — output targets. Resolved from --output (comma-separated) or
+    // the OUTPUT env var. Default ['csv','json'] preserves Phase 1 behavior.
+    // The keyword 'all' expands to ['csv','json','db'].
+    output: resolveOutputTargets(cli.output ?? process.env.OUTPUT),
+    databaseUrl: process.env.DATABASE_URL || null,
 
     // Phase 1.10 — DX: skip the startup-banner delay (scripted / CI runs).
     yes: !!cli.yes,
@@ -239,6 +365,45 @@ function loadConfig(argv = process.argv.slice(2)) {
       typeKeyMaxMs: toIntOrNull(process.env.TYPE_KEY_MAX_MS) ?? 150,
     },
 
+    // Phase 2.3 — Proxy management & rotation
+    proxy: {
+      // --noProxy forces a direct connection (Phase 1 behavior). Overrides
+      // every other proxy flag. Also implied when no proxy source is configured.
+      enabled: !cli.noProxy && process.env.NO_PROXY !== 'true' &&
+        !!(cli.proxyListFile || process.env.PROXY_LIST_FILE || process.env.PROXY_PROVIDER),
+      strategy: cli.proxyStrategy || process.env.PROXY_STRATEGY || 'random',
+      sessionLength: toIntOrNull(cli.sessionLength ?? process.env.SESSION_LENGTH) ?? 1,
+      cooldownMs: toIntOrNull(cli.proxyCooldownMs ?? process.env.PROXY_COOLDOWN_MS) ?? 10 * 60 * 1000,
+      listFile: cli.proxyListFile || process.env.PROXY_LIST_FILE || null,
+      // Provider name (informational — the actual fetch impl is wired in index.js
+      // based on this string, e.g. 'brightdata' → Bright Data API).
+      provider: process.env.PROXY_PROVIDER || null,
+      providerUrl: process.env.PROXY_PROVIDER_URL || null,
+      providerToken: process.env.PROXY_PROVIDER_TOKEN || null,
+      // Optional pre-run health check (--proxyHealthCheck probes every proxy
+      // with a HEAD to google.com before the scrape starts).
+      healthCheck: !!cli.proxyHealthCheck,
+      // Burn log path (defaults to data/proxy_burn_log.jsonl). Override via env
+      // for ops teams that want to centralize the log.
+      burnLogPath: process.env.PROXY_BURN_LOG || null,
+    },
+
+    // Phase 2.4 — Browser fingerprint randomization.
+    //   --noFingerprint              → profile 'off' (Phase 1 behavior preserved)
+    //   --fingerprintProfile random  → randomized coherent profile per run (DEFAULT)
+    //   --fingerprintProfile fixed   → use the profile supplied via --fixedFingerprint <json>
+    // The resolved profile is generated in src/index.js (it needs the fingerprint
+    // module + logger) and passed to launchBrowser({ fingerprint }).
+    fingerprint: {
+      profile: cli.noFingerprint || process.env.NO_FINGERPRINT === 'true'
+        ? 'off'
+        : (cli.fingerprintProfile || process.env.FINGERPRINT_PROFILE || 'random'),
+      fixedJson: cli.fixedFingerprint || process.env.FIXED_FINGERPRINT || null,
+      // Resolved at runtime in index.js (the actual profile object, not the JSON string).
+      // Stored on cfg so the pipeline can pass it to launchBrowser().
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -251,7 +416,7 @@ function loadConfig(argv = process.argv.slice(2)) {
   return cfg;
 }
 
-const HELP_TEXT = `gmaps-scraper — Google Maps business scraper (Phase 1)
+const HELP_TEXT = `gmaps-scraper — Google Maps business scraper (Phase 2)
 
 Usage:
   npm start -- --query <q> --location <loc> [options]
@@ -288,6 +453,30 @@ Optional:
   --noCaptchaPause           Phase 1.8 — don't pause on CAPTCHA (just exit)
   --captchaWaitMs <ms>       Phase 1.8 — how long to pause on CAPTCHA (default: 300000)
 
+  --output <targets>         Phase 2.1 — output targets, comma-separated:
+                             csv, json, db, or all (default: csv,json).
+                             db writes to PostgreSQL (requires DATABASE_URL).
+                             all = csv,json,db. Examples:
+                               --output csv          (CSV only)
+                               --output db           (Postgres only)
+                               --output csv,json,db  (all three, explicit)
+                               --output all          (all three, shorthand)
+
+  --proxyStrategy <s>        Phase 2.3 — round-robin | random | sticky (default: random)
+  --sessionLength <n>        Phase 2.3 — requests per proxy before rotation (sticky only; default: 1)
+  --proxyCooldownMs <ms>     Phase 2.3 — burn cooldown window (default: 600000 = 10 min)
+  --proxyListFile <path>     Phase 2.3 — proxy list file (one proxy per line)
+  --proxyHealthCheck         Phase 2.3 — probe every proxy with a HEAD before scraping
+  --noProxy                  Phase 2.3 — force direct connection (Phase 1 behavior)
+
+  --fingerprintProfile <s>   Phase 2.4 — random | fixed | off (default: random)
+                             Each run gets a coherent fingerprint: UA, viewport,
+                             timezone, locale, WebGL, canvas noise, hw concurrency.
+  --fixedFingerprint <json>  Phase 2.4 — pin a specific fingerprint (requires
+                             --fingerprintProfile fixed). JSON object with
+                             userAgent, platform, locale, timezone, viewport, etc.
+  --noFingerprint            Phase 2.4 — disable randomization (Phase 1 behavior)
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
@@ -298,8 +487,26 @@ Examples:
   npm start -- --query "Restaurant" --location "Toronto" --deepScrape true --deepScrapeSampleStep 5
   npm start -- --query "Restaurant" --location "Toronto" --resume   # continue after a crash
 
+  # Phase 2.1 — write to PostgreSQL (set DATABASE_URL in .env first)
+  npm run db:migrate                                        # create schema (once)
+  npm start -- --query "Cafe" --location "Berlin" --output db --yes
+  npm start -- --query "Cafe" --location "Berlin" --output all   # CSV + JSON + DB
+
+  # Phase 2.3 — proxy rotation (set PROXY_LIST_FILE in .env or pass --proxyListFile)
+  #   Format: one proxy per line — protocol://[user:pass@]host:port or host:port:user:pass
+  npm start -- --query "Cafe" --location "Berlin" --proxyListFile ./proxies.txt
+  npm start -- --query "Cafe" --location "Berlin" --proxyStrategy round-robin --sessionLength 5
+  npm start -- --query "Cafe" --location "Berlin" --proxyListFile ./proxies.txt --proxyHealthCheck
+  npm start -- --query "Cafe" --location "Berlin" --noProxy   # force direct connection
+
+  # Phase 2.4 — fingerprint randomization (on by default)
+  npm start -- --query "Cafe" --location "Berlin"               # random fingerprint per run
+  npm start -- --query "Cafe" --location "Berlin" --noFingerprint   # Phase 1 behavior
+  npm start -- --query "Cafe" --location "Berlin" --fingerprintProfile fixed \
+    --fixedFingerprint '{"userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131","platform":"Win32","locale":"en-US","timezone":"America/New_York","languages":["en-US","en"],"viewport":{"width":1920,"height":1080},"screen":{"width":1920,"height":1080},"webglVendor":"Intel Inc.","webglRenderer":"Intel(R) UHD Graphics 630","canvasNoiseSeed":42,"hardwareConcurrency":8,"deviceMemory":8,"geolocation":{"latitude":40.7128,"longitude":-74.006}}'
+
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun
 `;
 
-module.exports = { loadConfig, parseArgs, validate, HELP_TEXT };
+module.exports = { loadConfig, parseArgs, validate, HELP_TEXT, resolveOutputTargets };

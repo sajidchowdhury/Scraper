@@ -66,6 +66,10 @@ Optional:
   --noHumanTyping            Phase 1.8 — disable char-by-char search typing
   --noCaptchaPause           Phase 1.8 — don't pause on CAPTCHA (just exit)
   --captchaWaitMs <ms>       Phase 1.8 — CAPTCHA pause duration (300000)
+  --output <targets>         Phase 2.1 — output targets, comma-separated:
+                             csv, json, db, or all (default: csv,json).
+                             db writes to PostgreSQL (requires DATABASE_URL).
+                             all = csv,json,db.
   --version                  Print version and exit
   --help, -h                 Show this help
 ```
@@ -685,18 +689,31 @@ These are **deliberately deferred** to later phases (see `SCRAPER_FEATURES.md`):
 
 ## Roadmap
 
-Phase 1 (this release — `v1.0.0-phase1`) delivers a **single-query,
+Phase 1 (tagged `v1.0.0-phase1`) delivers a **single-query,
 single-machine, CSV-exporting** scraper that's robust against transient
 failures and polite to Google. The master roadmap in
 **[`SCRAPER_FEATURES.md`](SCRAPER_FEATURES.md)** covers Phases 2–5:
 
-- **Phase 2 — Robustness & Scale:** rotating proxies, browser fingerprint
-  randomization, stealth patches, CAPTCHA auto-solving, multi-worker
-  concurrency, job queue (BullMQ/Redis), PostgreSQL persistence with change
-  tracking, self-healing selectors, and incremental scraping. Target: survive
-  a 10,000+ listing overnight run unattended. See
+- **Phase 2 — Robustness & Scale** *(in progress, `phase2` branch)*: rotating
+  proxies, browser fingerprint randomization, stealth patches, CAPTCHA
+  auto-solving, multi-worker concurrency, job queue (BullMQ/Redis), PostgreSQL
+  persistence with change tracking, self-healing selectors, and incremental
+  scraping. Target: survive a 10,000+ listing overnight run unattended. See
   **[`PHASE2_EXECUTION_PLAN.md`](PHASE2_EXECUTION_PLAN.md)** for the granular
   13-sub-phase spec.
+  - **2.0 — Audit, Fixtures & Dependency Setup** ✅ — baseline metrics, DOM
+    fixtures, deps installed, `docker-compose.yml`.
+  - **2.1 — PostgreSQL Persistence Layer** ✅ — `src/db.js` (idempotent upserts
+    keyed by `place_id`, change-hash no-op detection, batched writes,
+    transaction rollback), `schema.sql`, `npm run db:migrate`, `--output
+    csv|json|db|all` flag. 475 tests / 1169 assertions.
+  - **2.2 — Change Tracking & History** ✅ — `business_snapshots` +
+    `field_changes` tables, `src/db/deltas.js` (pure `computeChanges` /
+    `numericDelta`), snapshot-on-update, `changes_detected` on `scrape_runs`,
+    `npm run db:history` CLI, change-breakdown banner. 551 tests / 1407 assertions.
+  - 2.3–2.13 — proxies, fingerprints, stealth, CAPTCHA,
+    sessions, worker pool, job queue, memory mgmt, self-healing selectors,
+    incremental scraping, final integration *(not started)*.
 - **Phase 3 — Data Quality & Enrichment:** phone/email normalization &
   validation, email discovery, deduplication, lead scoring, grid-based
   geo-coverage.
@@ -708,5 +725,266 @@ failures and polite to Google. The master roadmap in
 
 See `PHASE1_EXECUTION_PLAN.md` for the granular Phase 1 sub-phase spec and
 acceptance criteria, `PHASE2_EXECUTION_PLAN.md` for Phase 2, and
-`CHANGELOG.md` for what shipped in this release.
+`CHANGELOG.md` for what shipped in each release.
 
+## PostgreSQL persistence (Phase 2.1)
+
+Scraped businesses can be upserted into PostgreSQL alongside (or instead of)
+CSV/JSON files. Every business is keyed by `place_id`, so re-scraping the same
+business updates the row instead of duplicating it; re-scraping with identical
+data is a no-op (detected via a SHA-256 `data_hash` column).
+
+### Quick start
+
+```bash
+# 1. Start PostgreSQL (one-time — docker-compose.yml ships Postgres 15 + Redis 7)
+docker compose up -d postgres
+
+# 2. Copy .env.example → .env and set DATABASE_URL
+cp .env.example .env
+# Edit .env:  DATABASE_URL=postgresql://gmaps:gmaps@localhost:5432/gmaps_scraper
+
+# 3. Create the schema (idempotent — safe to re-run)
+npm run db:migrate
+
+# 4. Scrape to Postgres (or --output all for CSV + JSON + DB)
+npm start -- --query "Cafe" --location "Berlin" --output db --yes
+```
+
+### Output targets
+
+The `--output` flag (or `OUTPUT` env var) selects where results go:
+
+| Target | Writes | Requires |
+|---|---|---|
+| `csv` (default) | `data/*.csv` | nothing |
+| `json` (default) | `data/*.json` + `*.summary.json` | nothing |
+| `db` | `businesses` + `scrape_runs` tables | `DATABASE_URL` (postgresql://) |
+| `all` | CSV + JSON + DB | `DATABASE_URL` |
+
+Comma-separated combinations work: `--output csv,db` writes CSV and Postgres
+but skips JSON.
+
+### Schema
+
+Four tables (see `src/db/schema.sql`):
+
+- **`businesses`** — one row per scraped business, keyed by `place_id` (UNIQUE).
+  All 25 scraped fields (17 canonical list-view + 8 detail-scrape) plus
+  `data_hash`, `run_id` (FK → `scrape_runs`), `updated_at`. Indexes on
+  `place_id`, `(query, location)`, `scraped_at`, `business_status`, `updated_at`.
+- **`scrape_runs`** — one row per pipeline invocation: query, location, timing,
+  extracted/failed counts, exit code, log path, DB upsert counts
+  (`db_inserted`, `db_updated`, `db_unchanged`), and `changes_detected`
+  (Phase 2.2 — total field-level changes written this run).
+- **`business_snapshots`** *(Phase 2.2)* — pre-update snapshot of the five
+  high-value tracked fields (`rating`, `reviews_count`, `business_status`,
+  `phone`, `website`) captured before every UPDATE. Indexed on
+  `(business_id, snapshot_at DESC)`.
+- **`field_changes`** *(Phase 2.2)* — computed, queryable per-field delta log
+  (one row per field that changed, with `old_value`/`new_value`/`delta`).
+  Indexed on `(business_id, field, detected_at DESC)`.
+
+### Idempotent upserts
+
+`upsertBusinessesBatch` classifies each business as `inserted`, `updated`, or
+`unchanged` by comparing a SHA-256 hash of the comparable field values against
+the stored `data_hash`. Only `updated` rows bump `updated_at` — identical
+re-scrapes produce zero writes (and zero snapshots/changes — no noise). The
+end-of-run banner reports the counts:
+
+```
+DB:       50 inserted, 30 updated (12 rating changes, 8 review-count changes, 2 status changes), 20 unchanged (run #3)
+```
+
+All queries are parameterized (no SQL injection surface). Writes happen in a
+single transaction per run; a failure rolls back and is logged as a partial-
+success (exit code 1) without discarding any CSV/JSON files already written.
+
+## Change tracking & history (Phase 2.2)
+
+Every time a business is re-scraped and its data has changed, the scraper now
+snapshots the **old** values into `business_snapshots` and logs one
+`field_changes` row per tracked field that actually changed. This turns the
+scraper from a "snapshot tool" into a **trend data tool** — the foundation for
+delta alerts (Phase 5) and freshness scoring.
+
+### Tracked fields
+
+Five high-value columns (the ones clients pay a premium for trend data on):
+
+| Field | Delta type | Example change |
+|---|---|---|
+| `rating` | numeric (Δ) | 4.5 → 4.3 (Δ -0.2) |
+| `reviews_count` | numeric (Δ) | 1234 → 1289 (Δ +55) |
+| `business_status` | text (null delta) | open → permanently_closed |
+| `phone` | text (null delta) | +1-555-0100 → +1-555-0200 |
+| `website` | text (null delta) | https://old.example.com → null |
+
+Re-scraping with **identical** data produces zero snapshots and zero changes
+(detected via the `data_hash` no-op path from Phase 2.1 — no noise).
+
+### Viewing a business's history
+
+`npm run db:history` prints the full change timeline for a single business
+(keyed by `place_id`), most recent first:
+
+```bash
+npm run db:history -- --placeId ChIJxxx
+# or with aliases:
+npm run db:history -- -p ChIJxxx --limit 20
+```
+
+```
+Business:  Test Cafe (ChIJxxx)
+Current:   rating 4.3 | reviews 1289 | status open | phone +1-555-0100 | website https://example.com
+
+Timeline (5 change events, 2 snapshots):
+  2026-08-07 14:03  rating 4.5 → 4.3  (Δ -0.2)
+  2026-08-07 14:03  reviews 1234 → 1289 (Δ +55)
+  2026-07-01 09:12  rating 4.6 → 4.5  (Δ -0.1)
+  2026-06-15 18:44  status open → temporarily_closed
+  2026-06-15 18:44  phone +1-555-0100 → +1-555-0200
+```
+
+Flags: `--placeId <id>` (required), `--place-id`/`-p` aliases, `--limit N`
+(default 100), `--help`/`-h`. A positional connection string overrides
+`DATABASE_URL`. The pure formatting helpers are exported from
+`src/db/history.js` for unit testing.
+
+### Transactional snapshotting
+
+The snapshot + field_changes writes run **inside the same BEGIN/COMMIT
+transaction** as the `businesses` UPDATE (in `persistRunResults`). A crash
+mid-upsert rolls back the snapshot, the changes, and the update atomically —
+the database is never left in a state where the old values were snapshotted
+but the update didn't happen (or vice versa).
+
+
+## Proxy management & rotation (Phase 2.3)
+
+Phase 2.3 introduces a configurable proxy pool that sits between the scraper
+and Google. Every browser launch (or every N requests, via `--sessionLength`)
+pulls a different proxy from the pool. Burned proxies (3 consecutive 403/429,
+<50% success rate over last 20 requests, 3 consecutive timeouts) are benched
+for a cooldown window; permanently bad proxies (HTTP 407, provider-reported
+retired) are removed entirely.
+
+### Quick start
+
+Create a proxy list file (one proxy per line):
+
+```bash
+# proxies.txt — accepted formats per line:
+#   protocol://[user:pass@]host:port   e.g. http://u:p@1.2.3.4:8080
+#   host:port:user:pass                e.g. 1.2.3.4:8080:u:p
+#   host:port                           (no auth — public proxy)
+http://user1:pass1@1.2.3.4:8080
+http://5.6.7.8:3128
+socks5://9.10.11.12:1080
+```
+
+Run with proxy rotation:
+
+```bash
+npm start -- --query "Cafe" --location "Berlin" --proxyListFile ./proxies.txt
+npm start -- --query "Cafe" --location "Berlin" --proxyListFile ./proxies.txt --proxyStrategy round-robin
+npm start -- --query "Cafe" --location "Berlin" --proxyListFile ./proxies.txt --proxyHealthCheck
+```
+
+Or via env vars (in `.env`):
+
+```bash
+PROXY_LIST_FILE=./proxies.txt
+PROXY_STRATEGY=random
+SESSION_LENGTH=1
+PROXY_COOLDOWN_MS=600000
+```
+
+### CLI flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--proxyListFile <path>` | — | Proxy list file (one proxy per line) |
+| `--proxyStrategy <s>` | `random` | `round-robin` \| `random` \| `sticky` |
+| `--sessionLength <n>` | `1` | Requests per proxy before rotation (sticky only) |
+| `--proxyCooldownMs <ms>` | `600000` | Burn cooldown window (10 min) |
+| `--proxyHealthCheck` | off | Probe every proxy with a HEAD before scraping |
+| `--noProxy` | off | Force direct connection (Phase 1 behavior) |
+
+### Rotation strategies
+
+- **`round-robin`** — cycle through the pool sequentially. Deterministic, best
+  for evenly distributing load across a small pool.
+- **`random`** (default) — pick uniformly at random. Better for large pools
+  where round-robin's predictability could be fingerprinted.
+- **`sticky`** — same proxy per session of N requests (`--sessionLength N`).
+  Useful when Google's session cookies should stay consistent within a session.
+
+### Burn detection
+
+The burn detector (`src/proxy/burn-detector.js`) tracks per-proxy:
+- request count, success count, last 10 status codes
+- consecutive failures (resets on success)
+- consecutive timeouts (resets on any non-timeout outcome)
+- state: `healthy` | `cooldown` | `burned` (permanent)
+
+Auto-burn rules:
+- **3 consecutive 403/429** → cooldown (10 min default)
+- **Success rate < 50%** over last 20 requests (min 5 samples) → cooldown
+- **3 consecutive timeouts** (`statusCode === 'TIMEOUT'`) → cooldown
+- **HTTP 407** (Proxy Authentication Required) → permanent (removed entirely)
+
+Cooldown proxies auto-recover after `PROXY_COOLDOWN_MS`. Permanent proxies
+never recover.
+
+### Burn log
+
+Every burn event is appended to `data/proxy_burn_log.jsonl` with timestamp,
+proxy id, reason, recent status codes, provider, and burn kind. Used for ops
+debugging and provider charge disputes.
+
+```json
+{"ts":"2026-08-07T16:08:24.501Z","kind":"cooldown","proxyId":"1.1.1.1:80","reason":"3 consecutive 403/429 responses","recentStatusCodes":[403,403,403],"provider":"file","stats":{...}}
+{"ts":"2026-08-07T16:08:24.502Z","kind":"permanent","proxyId":"2.2.2.2:80","reason":"provider retired IP","manual":true,"provider":"manual","stats":{...}}
+```
+
+### Health check
+
+`--proxyHealthCheck` probes every proxy with a HEAD to `google.com/robots.txt`
+before scraping starts. Failed proxies are benched for one cooldown cycle. If
+all proxies fail, the run aborts with exit code 3.
+
+### End-of-run banner
+
+The banner now includes a `Proxy:` line showing healthy/cooling/burned counts
++ strategy + avg success rate:
+
+```
+========================================
+Run complete
+Query:    Cafe in Berlin
+Results:  50 extracted (50 loaded, reason=maxResults)
+Duration: 42.3s
+Detail:   disabled (--deepScrape false)
+CSV:      data/cafe_berlin_2026-08-07_160824.csv
+JSON:     data/cafe_berlin_2026-08-07_160824.json
+Summary:  data/cafe_berlin_2026-08-07_160824_summary.json
+Proxy:    4/5 healthy, 1 cooling, 0 burned (round-robin, 96% success)
+Log:      logs/cafe_berlin_2026-08-07_160824.log
+========================================
+```
+
+### Design notes
+
+- **`--noProxy` preserves Phase 1 behavior.** When proxy rotation is disabled
+  (the default), the scraper launches a direct browser with no proxy — exactly
+  the Phase 1 code path.
+- **CAPTCHA → 429 mapping.** When the pipeline aborts with `CAPTCHA_DETECTED`,
+  the proxy is released with `statusCode: 429` (not `'TIMEOUT'`). This feeds
+  the consecutive-block burn rule: 3 CAPTCHAs from the same proxy → cooldown.
+  The signal is correct — a CAPTCHA means Google is rate-limiting that IP.
+- **Provider API integration is Phase 2.7.** The `PROXY_PROVIDER` env var is
+  parsed and validated but the actual provider fetch is a stub that returns an
+  empty list. Use `--proxyListFile` for now; Bright Data / Smartproxy / Oxylabs
+  integration lands in Phase 2.7 (Session & Cookie Rotation).

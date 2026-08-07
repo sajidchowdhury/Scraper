@@ -1,0 +1,88 @@
+{
+  "metadata": {
+    "recordedAt": "2026-08-07T15:01:46.780Z",
+    "phase": "phase1-baseline",
+    "purpose": "Phase 2.0 baseline metrics for before/after comparison",
+    "command": "npm start -- --query \"Restaurant\" --location \"Toronto\" --maxResults 100 --yes",
+    "scraperVersion": "1.0.0-phase1",
+    "nodeVersion": "v24.18.0",
+    "platform": "linux",
+    "deepScrapeEnabled": false
+  },
+  "wallClockMs": 47485,
+  "wallClockSeconds": 47.5,
+  "exitCode": 0,
+  "memory": {
+    "before": {
+      "heapUsed": 4674520,
+      "heapUsedMb": 4.5,
+      "rss": 49836032,
+      "rssMb": 47.5
+    },
+    "after": {
+      "heapUsed": 5159792,
+      "heapUsedMb": 4.9,
+      "rss": 50606080,
+      "rssMb": 48.3
+    },
+    "note": "before/after are the parent process (this script), not the scraper child. The child's peak memory is not directly observable; rss delta is a rough proxy. For precise child memory, run /usr/bin/time -v on the scraper directly."
+  },
+  "captchaAppeared": false,
+  "deepScrape": {
+    "attempted": 0,
+    "succeeded": null,
+    "successRatePct": null
+  },
+  "extractionRates": {
+    "name": 100,
+    "rating": 100,
+    "reviews_count": 100,
+    "price_level": 80,
+    "category": 100,
+    "address": 100,
+    "phone": 0,
+    "website": 0,
+    "maps_url": 100,
+    "place_id": 100,
+    "plus_code": 0,
+    "open_now": 37,
+    "business_status": 100,
+    "is_sponsored": 100,
+    "scraped_at": 100,
+    "query": 100,
+    "location": 100
+  },
+  "rowCounts": {
+    "extracted": 99,
+    "loaded": 100,
+    "sponsored": 2,
+    "permanentlyClosed": 0,
+    "temporarilyClosed": 0,
+    "scrollReason": "maxResults"
+  },
+  "timing": {
+    "startedAt": "2026-08-07T15:01:47.117Z",
+    "durationMs": 47114,
+    "durationSeconds": 47.1
+  },
+  "outputFiles": {
+    "csv": "Restaurant_Toronto_2026-08-07_15-02-34.csv",
+    "json": "Restaurant_Toronto_2026-08-07_15-02-34.json",
+    "summary": "Restaurant_Toronto_2026-08-07_15-02-34.summary.json",
+    "log": "Restaurant_Toronto_2026-08-07_15-01-47.log"
+  },
+  "testCountAtBaseline": {
+    "tests": 410,
+    "assertions": 1028,
+    "note": "Frozen at Phase 1 milestone (v1.0.0-phase1) + post-tag hotfixes. Track net-new tests across Phase 2 against this number."
+  },
+  "knownIssues": {
+    "deepScrapeNavigationRegression": {
+      "description": "backToListOnPage lands on about:blank after ~40 detail scrapes, causing all subsequent detail-panel opens to fail with \"no anchor/card found in DOM\". First observed during this baseline run (attempted with --deepScrape true, hit timeout at business 42).",
+      "rootCause": "page.goBack() on Google Maps pushState SPA can over-navigate past the search page to the initial blank page. The in-Maps Back button click + 400ms sleep is insufficient — the feed has not restored when the next openDetailPanelOnPage runs.",
+      "workaround": "Baseline run uses deepScrape=false. List-view metrics are the primary Phase 2 comparison target.",
+      "fixPlannedIn": "Phase 2.7 (session rotation — fresh context per N requests resets navigation state) and/or a targeted fix to backToListOnPage (wait for feed container after back-nav, re-navigate to search URL if about:blank detected).",
+      "diagnosticValue": "The warn-level diagnostics added in commit c7f7dc1 (Phase 1.11 hardening) revealed this issue clearly — beforeUrl:about:blank + triedSelectors logged on every failure. This validates the diagnostic investment."
+    }
+  }
+}

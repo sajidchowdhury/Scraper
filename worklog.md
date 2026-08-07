@@ -81,3 +81,74 @@ Stage Summary:
   the tactics are in place; delays observable in debug logs; human typing visible
   in headed mode; CAPTCHA pause+alert implemented).
 - Critical path remaining: 1.9 → 1.10 → 1.11 (then Phase 1 milestone complete).
+
+---
+Task ID: 2.2
+Agent: main (Z.ai Code)
+Task: Implement Phase 2.2 — Change Tracking & History (per PHASE2_EXECUTION_PLAN.md §2.2)
+
+Work Log:
+- Read Phase 2.2 spec from PHASE2_EXECUTION_PLAN.md (lines 224-293): business_snapshots +
+  field_changes tables, snapshot-on-update logic, deltas.js pure helpers, run-summary
+  changes_detected column, db:history CLI, unit tests.
+- Confirmed baseline: Phase 2.1 already committed (b606fbc), working tree clean on phase2
+  branch, 475 tests / 1028 assertions passing.
+- Extended src/db/schema.sql: added business_snapshots table (id, business_id FK, place_id
+  denormalized, rating, reviews_count, business_status, phone, website, snapshot_at, run_id FK)
+  with indexes on (business_id, snapshot_at DESC), place_id, run_id; added field_changes table
+  (id, business_id FK, place_id denormalized, field, old_value, new_value, delta, detected_at,
+  run_id FK) with indexes on (business_id, field, detected_at DESC), (place_id, detected_at DESC),
+  run_id; added scrape_runs.changes_detected INTEGER via idempotent DO $$ ALTER guard.
+- Created src/db/deltas.js (pure helpers): TRACKED_FIELDS (rating, reviews_count,
+  business_status, phone, website), normalizeValue, coerceNumber (parses numeric strings,
+  rejects NaN/Infinity), valuesEqual (numeric string vs number compare equal), numericDelta
+  (new-old for numbers, new value when old is null = gain, null for non-numeric/NaN/Infinity,
+  rounded to 1dp for rating precision), computeChanges (returns [] when nothing changed or
+  oldRow is null), summarizeChanges ({total, byField} rollup with every tracked field = 0).
+- Wired snapshot + field_changes into src/db.js upsertBusinessesBatch: when a business is
+  classified 'updated', SELECT existing id + tracked fields (1 round-trip), compute per-field
+  deltas, INSERT old values into business_snapshots (multi-row, 1 round-trip), INSERT changes
+  into field_changes (multi-row, 1 round-trip), then UPDATE businesses (existing path). All
+  inside persistRunResults BEGIN/COMMIT transaction → atomic rollback on crash.
+- Added buildSnapshotInsert + buildFieldChangesInsert pure parameterized SQL builders (exported
+  for testing, SQL-injection-safe). Added SNAPSHOT_COLUMNS + FIELD_CHANGE_COLUMNS constants.
+- Extended persistRunResults to stamp changes_detected onto scrape_runs (alongside
+  db_inserted/updated/unchanged) and return {changesDetected, changesByField, snapshotsWritten}.
+- Updated src/index.js banner: DB line now includes per-field change breakdown when any tracked
+  field changed — "30 updated (12 rating changes, 8 review-count changes, 2 status changes)".
+- Created src/db/history.js CLI: npm run db:history -- --placeId <id> prints Business/Current/
+  Timeline. Pure formatters (formatValue, formatDelta, fieldLabel, formatTimestamp,
+  formatChangeLine, formatCurrentLine, parseArgs) exported for testing. Flags: --placeId/--place-id/-p,
+  --limit (default 100), --help/-h, positional connection-string override. Exit codes 0/2/3.
+- Extended tests/db.test.js mock client: added _snapshots + _fieldChanges in-memory arrays with
+  transaction snapshot/restore (ROLLBACK clears them); added handlers for SELECT tracked fields,
+  INSERT business_snapshots, INSERT field_changes; added 19 new Phase 2.2 tests (insert→no
+  snapshots, unchanged→no snapshots, changed reviews_count→1 snapshot + 1 field_change, rating
+  delta -0.2, status flip null delta, multi-field update, changesByField rollup, persistRunResults
+  stamps changes_detected, SQL-builder tests, summarizeChanges tests); extended integration tests
+  to drop+recreate all 4 tables and verify real-Postgres re-scrape writes snapshot+changes +
+  identical re-scrape writes neither.
+- Created tests/db-deltas.test.js (57 tests): normalizeValue, coerceNumber, valuesEqual,
+  numericDelta (null→gain, value→loss, string coercion, NaN, Infinity, 1dp rounding),
+  computeChanges (all 5 tracked fields, null↔value, empty-string normalization, custom field
+  list), summarizeChanges, history.js formatters + parseArgs.
+- Fixed numericDelta edge case: distinguished null/undefined/'' old (legitimate gain → +new)
+  from NaN/Infinity old (can't compute → null).
+- Updated package.json: added db:history script; extended syntax script to check deltas.js +
+  history.js.
+- Updated PHASE2_EXECUTION_PLAN.md: status table (2.2 → ✅ DONE, 3/13 shipped, 551 tests),
+  Phase 2.2 section header + all task-checklist items + acceptance criteria marked done with
+  implementation notes.
+- Updated CHANGELOG.md: added Phase 2.2 section (Added/Tests/Documentation).
+- Updated README.md: roadmap (2.2 ✅), schema section (4 tables), new "Change tracking &
+  history (Phase 2.2)" section with tracked-fields table + db:history usage + transactional
+  snapshotting note; updated banner example to show change breakdown.
+
+Stage Summary:
+- Phase 2.2 fully implemented. 551 tests / 1407 assertions passing (was 475 / 1028; +76 tests).
+- New pure module src/db/deltas.js is the single source of truth for change detection; new CLI
+  src/db/history.js makes trend data queryable per-business.
+- All 5 task-checklist items shipped + all 5 acceptance criteria met (transactional snapshotting
+  verified via mock rollback machinery; identical re-scrape produces zero snapshots/changes).
+- Critical path remaining (per plan): 2.3 (Proxy Management) next on the stealth/scale track;
+  2.12 (Incremental Scraping) next on the data track (builds on 2.2's change_hash).

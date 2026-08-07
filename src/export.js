@@ -261,6 +261,7 @@ async function exportResults({
   summary,
   outputFile = null,
   outputDir = './data',
+  writeCsv = true,
   writeJson = true,
   writeSummary = true,
   logger = { info() {}, debug() {}, warn() {} },
@@ -281,14 +282,17 @@ async function exportResults({
   const summaryPath = basePath + '.summary.json';
 
   // --- CSV (UTF-8 with BOM) ---
-  const csvContent = buildCsv(businesses);
-  fs.writeFileSync(csvPath, csvContent, 'utf8');
-  const csvBytes = Buffer.byteLength(csvContent, 'utf8');
-  log.info('CSV written', {
-    path: path.resolve(csvPath),
-    rows: businesses.length,
-    bytes: csvBytes,
-  });
+  let csvBytes = 0;
+  if (writeCsv) {
+    const csvContent = buildCsv(businesses);
+    fs.writeFileSync(csvPath, csvContent, 'utf8');
+    csvBytes = Buffer.byteLength(csvContent, 'utf8');
+    log.info('CSV written', {
+      path: path.resolve(csvPath),
+      rows: businesses.length,
+      bytes: csvBytes,
+    });
+  }
 
   // --- JSON sidecar (full nested data) ---
   let jsonBytes = 0;
@@ -309,7 +313,7 @@ async function exportResults({
     const summaryPayload = {
       ...summary,
       outputFiles: {
-        csv: path.resolve(csvPath),
+        csv: writeCsv ? path.resolve(csvPath) : null,
         json: writeJson ? path.resolve(jsonPath) : null,
         summary: path.resolve(summaryPath),
       },
@@ -322,7 +326,7 @@ async function exportResults({
   // Phase 1.9 — single structured record of all output paths + sizes so the
   // JSON-lines log file has one machine-parseable line for the export stage.
   log.info('Export complete', {
-    csv: path.resolve(csvPath),
+    csv: writeCsv ? path.resolve(csvPath) : null,
     csvBytes,
     json: writeJson ? path.resolve(jsonPath) : null,
     jsonBytes,
@@ -331,9 +335,9 @@ async function exportResults({
   });
 
   return {
-    csvPath: path.resolve(csvPath),
+    csvPath: writeCsv ? path.resolve(csvPath) : null,
     jsonPath: writeJson ? path.resolve(jsonPath) : null,
-    summaryPath: path.resolve(summaryPath),
+    summaryPath: writeSummary ? path.resolve(summaryPath) : null,
     csvBytes,
     jsonBytes,
     rows: businesses.length,
@@ -354,6 +358,7 @@ async function exportToCsv(businesses, options = {}) {
     },
     outputFile: options.outputFile,
     outputDir: options.outputDir,
+    writeCsv: options.writeCsv !== false,
     writeJson: options.writeJson !== false,
     writeSummary: options.writeSummary !== false,
     logger: options.logger,

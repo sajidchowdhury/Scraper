@@ -26,6 +26,11 @@
 
 const DEFAULT_DELAY_MS = 1000;
 
+// Phase 2.4 — lazy import to summarize the resolved fingerprint for the banner
+// row. Required lazily (not at module top) to keep banner.js free of any
+// fingerprint module side effects during unit tests of the pure builder.
+const { summarizeFingerprint } = require('./fingerprint');
+
 /**
  * Default sleep — a plain Promise-based delay. Exported so tests can stub it
  * via the `sleep` dependency of `showStartupBanner`.
@@ -82,6 +87,25 @@ function buildStartupBanner(cfg, opts = {}) {
     ['Max RPM', fmt(cfg.antiblock.maxRequestsPerMin)],
     ['Human typing', fmt(cfg.antiblock.humanTyping)],
     ['CAPTCHA pause', cfg.antiblock.captchaPause ? `yes (${cfg.antiblock.captchaWaitMs}ms)` : 'no'],
+    // Phase 2.3 — proxy rotation summary. Shows strategy + session length +
+    // cooldown when enabled, or "disabled" when --noProxy or no source is set.
+    [
+      'Proxy',
+      cfg.proxy && cfg.proxy.enabled
+        ? `${cfg.proxy.strategy} (session ${cfg.proxy.sessionLength}, cooldown ${Math.round(cfg.proxy.cooldownMs / 1000)}s)${cfg.proxy.listFile ? ` [${cfg.proxy.listFile}]` : ''}${cfg.proxy.healthCheck ? ' +healthcheck' : ''}`
+        : 'disabled (direct)',
+    ],
+    // Phase 2.4 — fingerprint summary. Shows the resolved profile summary when
+    // a fingerprint was generated, the profile mode (random/fixed) when not yet
+    // resolved (e.g. tests), or "disabled" when --noFingerprint / profile 'off'.
+    [
+      'Fingerprint',
+      cfg.fingerprint && cfg.fingerprint.resolved
+        ? `${cfg.fingerprint.profile}: ${summarizeFingerprint(cfg.fingerprint.resolved)}`
+        : cfg.fingerprint && cfg.fingerprint.profile && cfg.fingerprint.profile !== 'off'
+          ? `${cfg.fingerprint.profile} (not yet generated)`
+          : 'disabled (Phase 1 behavior)',
+    ],
   ];
 
   const width = rows.reduce((m, [k]) => Math.max(m, k.length), 0);

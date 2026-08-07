@@ -1,0 +1,45 @@
+{
+  "capturedAt": "2026-08-07T15:05:51.019Z",
+  "scraperVersion": "1.0.0-phase1",
+  "fixtures": [
+    {
+      "query": "Cafe",
+      "location": "Berlin",
+      "feed": {
+        "name": "Cafe_Berlin_feed.html",
+        "sizeBytes": 656746
+      },
+      "detail": {
+        "name": "Cafe_Berlin_detail.html",
+        "sizeBytes": 1047470
+      },
+      "error": null
+    },
+    {
+      "query": "Plumber",
+      "location": "Dhaka",
+      "feed": {
+        "name": "Plumber_Dhaka_feed.html",
+        "sizeBytes": 673285
+      },
+      "detail": {
+        "name": "Plumber_Dhaka_detail.html",
+        "sizeBytes": 1040890
+      },
+      "error": null
+    },
+    {
+      "query": "Restaurant",
+      "location": "Toronto",
+      "feed": {
+        "name": "Restaurant_Toronto_feed.html",
+        "sizeBytes": 688738
+      },
+      "detail": {
+        "name": "Restaurant_Toronto_detail.html",
+        "sizeBytes": 1117404
+      },
+      "error": null
+    }
+  ]
+}
