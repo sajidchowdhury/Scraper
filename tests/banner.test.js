@@ -372,4 +372,12 @@ describe('Phase 1.10 — config --yes flag', () => {
   test('HELP_TEXT has a --yes example', () => {
     expect(HELP_TEXT).toContain('--yes --dryRun');
   });
+
+  test('HELP_TEXT warns that --dryRun writes NO files', () => {
+    expect(HELP_TEXT).toMatch(/--dryRun\s+Smoke test:.*write NO output files/);
+  });
+
+  test('HELP_TEXT dryRun example is clearly labeled as writing no files', () => {
+    expect(HELP_TEXT).toMatch(/Smoke test — runs the pipeline but writes NO files/);
+  });
 });

@@ -268,7 +268,7 @@ Optional:
   --headless / --headed      Force browser mode (default: headless)
   --logLevel <level>         debug | info | warn | error (default: info)
   --verbose                  Alias for --logLevel debug
-  --dryRun                   Run pipeline but skip writing output files
+  --dryRun                   Smoke test: run pipeline but write NO output files
   --yes, -y                  Skip the 1s startup-banner delay (scripted / CI runs)
 
   --deepScrape true|false    Phase 1.5 — open each detail panel to fetch
@@ -292,11 +292,14 @@ Optional:
   --help, -h                 Show this help
 
 Examples:
+  # Real runs — write CSV + JSON + summary to ./data/
   npm start -- --query "Cafe" --location "Berlin" --maxResults 50
   npm start -- --query "Plumber" --location "Dhaka, Bangladesh" --headed --verbose
   npm start -- --query "Restaurant" --location "Toronto" --deepScrape true --deepScrapeSampleStep 5
   npm start -- --query "Restaurant" --location "Toronto" --resume   # continue after a crash
-  npm start -- --query "Cafe" --location "Berlin" --yes --dryRun    # no delay, scripted
+
+  # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
+  npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun
 `;
 
 module.exports = { loadConfig, parseArgs, validate, HELP_TEXT };

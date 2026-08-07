@@ -51,7 +51,7 @@ Optional:
   --headless / --headed      Force browser mode (default: headless)
   --logLevel <level>         debug | info | warn | error (default: info)
   --verbose                  Alias for --logLevel debug
-  --dryRun                   Run pipeline but skip writing output files
+  --dryRun                   Smoke test: run pipeline but write NO output files
   --yes, -y                  Phase 1.10 — skip the 1s startup-banner delay (CI)
   --deepScrape true|false    Phase 1.5 — open each detail panel to fetch
                              hours, popular times, reviews, photos, links
@@ -596,6 +596,23 @@ garbling:
 The `.json` file is UTF-8 (no BOM — JSON spec forbids it). Any modern parser
 (Node, Python `json`, `jq`) handles it natively. If your tool shows `\uXXXX`
 escapes, that's normal JSON Unicode escaping — the data is correct.
+
+### The run finished but there's no CSV in `data/`
+
+You almost certainly ran with `--dryRun`. That flag runs the **entire** pipeline
+(launch browser → search → scroll → extract) but **writes no files** — it only
+logs where it *would* have written them. Check the end of your log; you'll see:
+
+```json
+{"msg":"Dry run — skipping file output","wouldWrite":"data\\dryrun"}
+{"msg":"Run complete", ... "csv":null, "json":null}
+```
+
+Re-run **without** `--dryRun` to actually produce the CSV:
+
+```bash
+npm start -- --query "Cafe" --location "Berlin" --maxResults 10
+```
 
 ### Extraction rates show `phone`, `website`, `plus_code`, `price_level` at 0%
 
