@@ -272,3 +272,135 @@ Stage Summary:
 - All 8 task-checklist items shipped + all 6 acceptance criteria met.
 - Only Phase 2.12 (Incremental Scraping & Detail Caching) and Phase 2.13 (Final
   Integration, Docs & Handoff) remain.
+
+---
+Task ID: 2.12
+Agent: main (Z.ai Code)
+Task: Implement Phase 2.12 — Incremental Scraping & Detail Caching (per PHASE2_EXECUTION_PLAN.md §2.12)
+
+Work Log:
+- Read Phase 2.12 spec from PHASE2_EXECUTION_PLAN.md (lines 962-1027). Verified
+  prior phases 2.9/2.10/2.11 committed on phase2 branch (1326 tests baseline).
+- Explored project structure: src/db.js (computeRowHash, upsertBusinessesBatch,
+  persistRunResults), src/db/schema.sql (businesses table), src/config.js (flag
+  pattern), src/index.js (sequential scrape flow around line 1980-2080 +
+  result assembly + banner + persistRunResults call).
+- Created src/incremental.js (new module, ~520 lines):
+  - LIST_VIEW_HASH_COLUMNS (15 fields: name/rating/reviews_count/.../query/location).
+  - computeChangeHash (SHA-256 list-view-only — distinct from db.js data_hash
+    which includes detail JSONB).
+  - ageDays, classifyListFreshness (new/fresh/stale), reviewDeltaPct,
+    decideDetailScrape (cache_hit/cache_miss/forced_refresh/no_cache),
+    mergeCachedDetail (merges detail fields + sets detail_scraped=true).
+  - CacheStats accumulator (recordList/recordDetail/recordPreflightSkip +
+    estimateSavings + toJSON).
+  - formatCacheStatsSummary (renders the execution-plan banner format).
+  - createIncrementalCache (DI pg Pool wrapper: preflightRun/lookupBusinesses/
+    loadBusinessesForRun/close).
+  - rowToBusiness (JSONB parse + Date→ISO).
+- Modified src/db/schema.sql: added 3 columns via idempotent DO$$ ALTER blocks
+  (last_list_scraped TIMESTAMPTZ, last_detail_scraped TIMESTAMPTZ, change_hash
+  TEXT) + 2 composite indexes. Migration re-runnable against 2.1/2.2 DBs.
+- Modified src/db.js:
+  - Imported computeChangeHash from incremental.js (one-way require, no cycle).
+  - buildBatchInsert: +change_hash/last_list_scraped/last_detail_scraped
+    (NOW() for list; NOW() when detail_scraped else NULL for detail).
+  - buildUpdate: +same 3 columns; last_detail_scraped uses CASE WHEN
+    detail_scraped THEN NOW() ELSE last_detail_scraped END (preserves cached
+    timestamp when no detail scrape this run).
+  - buildUnchangedRefresh (new): batched VALUES-table UPDATE of
+    last_list_scraped + change_hash for unchanged businesses — does NOT touch
+    updated_at (preserves Phase 2.1 contract).
+  - upsertBusinessesBatch: +opts.incremental flag; unchanged businesses
+    collected + batched refresh issued (non-fatal on error).
+  - persistRunResults: passes incremental through to upsert.
+  - Exports: +computeChangeHash, +buildUnchangedRefresh.
+- Modified src/config.js:
+  - parseArgs: +--incremental/--listFreshnessDays/--detailCacheTtlDays/
+    --detailRefreshOnReviewDelta/--noDetailCache/--swrr.
+  - cfg.incremental section (enabled/listFreshnessDays/detailCacheTtlDays/
+    detailRefreshOnReviewDelta/noDetailCache/swrr/resolved) + env-var parity
+    (INCREMENTAL/LIST_FRESHNESS_DAYS/DETAIL_CACHE_TTL_DAYS/
+    DETAIL_REFRESH_ON_REVIEW_DELTA/NO_DETAIL_CACHE/SWRR).
+  - Validation: --incremental requires --output db; range checks
+    (listFreshnessDays 0-365, detailCacheTtlDays 0-365,
+    detailRefreshOnReviewDelta 0-1000).
+  - HELP_TEXT: Phase 2.12 section + 6 example commands.
+- Modified src/index.js:
+  - Imported incremental helpers (createIncrementalCache, classifyListFreshness,
+    decideDetailScrape, mergeCachedDetail, computeChangeHash, CacheStats,
+    formatCacheStatsSummary).
+  - Constructed shared dbPool + incrementalCache + cacheStats early in main()
+    (after rate limiter, before proxy pool). cfg.incremental.resolved set.
+  - Run-level preflight before browser launch: if preflight.skip → load
+    businesses from DB, synthesize minimal result object, skip browser +
+    health check + scrape (guarded by !incrementalPreflightSkip).
+  - Per-business detail-cache check in sequential detail-setup loop: batched
+    lookup → fresh+change_hash match skips detail entirely (mergeCachedDetail
+    + detail_scraped=true); detail TTL check (cache_hit reuses cached detail,
+    cache_miss/forced_refresh/no_cache leave for deepScrapeAll).
+  - persistRunResults reuses shared dbPool + passes incremental flag.
+  - Cache-stats banner block (Incremental/Detail cache/Saved lines) +
+    structured run-complete log (incremental: {list, detail, preflight,
+    savings}).
+  - dbPool closed at end (best-effort; skipped in endless mode).
+- Updated .env.example: expanded Phase 2.12 section (INCREMENTAL/
+  LIST_FRESHNESS_DAYS/DETAIL_CACHE_TTL_DAYS/DETAIL_REFRESH_ON_REVIEW_DELTA/
+  NO_DETAIL_CACHE/SWRR) with explanatory comments.
+- Updated package.json: version 1.0.0-phase2.11 → 1.0.0-phase2.12; syntax
+  script includes src/incremental.js.
+- Wrote tests/incremental.test.js (110 tests / 276 assertions):
+  - computeChangeHash (11): deterministic, list-view-only (detail fields
+    don't change it), 64-char hex, key-order-independent.
+  - ageDays (8): null/invalid/future/Date/epoch-ms/defaults.
+  - classifyListFreshness (7): new/fresh/stale/boundary/null-timestamp/
+    freshness=0/default.
+  - reviewDeltaPct (9): 100→115, negative, 0→N, 0→0, null-as-0, undefined→null.
+  - decideDetailScrape (13): the 8 required cases + boundary (exactly 10%),
+    threshold=0, negative delta, ttl=0, null last_detail_scraped.
+  - mergeCachedDetail (6): merges detail, sets detail_scraped, no mutation,
+    preserves fresh list-view, null cached, null cached fields.
+  - CacheStats (7): empty, recordList, recordDetail, recordDetailDisabled,
+    recordPreflightSkip, estimateSavings, toJSON.
+  - formatCacheStatsSummary (4): empty, acceptance-criteria shape, preflight
+    skip, accepts serialized object.
+  - createIncrementalCache (11): preflight skip/no-skip/error, lookup Map,
+    empty placeIds, error tolerance, loadBusinessesForRun, null pool, close.
+  - rowToBusiness (5): JSONB string parse, object preserve, Date→ISO, null,
+    invalid JSON.
+  - Integration scenarios (7): all 6 acceptance criteria end-to-end +
+    full preflight-skip flow.
+  - db.js integration (5): re-export parity, buildUnchangedRefresh null/
+    VALUES-table/no-updated_at/injection-safe.
+  - Config (17): defaults, all 6 flags, env vars, validation (3 range errors
+    + boundary), HELP_TEXT coverage.
+- Added 4 tests to tests/db.test.js: incremental freshness-refresh on
+  unchanged (query issued), no-refresh when flag off (Phase 2.1 behavior),
+  change_hash/last_list_scraped populated on INSERT, last_detail_scraped NULL
+  when not detail_scraped. Fixed 1 existing assertion (params.length +2 → +5
+  for the 3 new columns).
+- Ran full test suite: 1440 pass / 0 fail / 8401 assertions (was 1326/8079).
+  114 new tests (110 incremental + 4 db). Syntax check clean. No regressions.
+
+Stage Summary:
+- Phase 2.12 fully implemented. 1440 tests / 8401 assertions passing.
+- Two-tier incremental cache: run-level preflight (skip browser when most-
+  recent scrape of query/location is within --listFreshnessDays → 100% cache
+  hits, ~0 requests, <30s) + per-business detail cache (--detailCacheTtlDays
+  default 7d, reuse cached hours/reviews/photos via mergeCachedDetail +
+  detail_scraped=true so deepScrapeAll skips).
+- change_hash is list-view-only SHA-256 (distinct from Phase 2.1 data_hash
+  which includes detail JSONB) — a detail-only change does NOT invalidate
+  list freshness. This is the core design contract.
+- Review-delta heuristic (--detailRefreshOnReviewDelta default 10%) forces
+  detail re-scrape on review SURGES even within TTL (only positive deltas;
+  0→N reports 1000 so any threshold triggers).
+- Unchanged businesses get a lightweight batched last_list_scraped refresh
+  (no updated_at bump — preserves Phase 2.1 "unchanged = no updated_at
+  bump" contract) so frequently-re-scraped businesses stay fresh.
+- --noDetailCache forces deep-scrape; --swrr stubbed for Phase 5.
+- All pure helpers DI-testable with mock DB (no real Postgres needed).
+- --incremental off preserves Phase 2.1/1.5 behavior byte-for-byte
+  (incremental flag defaults false everywhere; upserts populate the new
+  columns but they're harmless NULLs when unused).
+- Only Phase 2.13 (Final Integration, Docs & Handoff) remains.

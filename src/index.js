@@ -109,6 +109,19 @@ const {
 // Phase 2.1 — PostgreSQL persistence (lazy-loaded; only used when
 // cfg.output includes 'db').
 const { createPool, persistRunResults, closePool } = require('./db');
+// Phase 2.12 — incremental scraping & detail caching. Pure decision helpers
+// + a thin DB-aware cache wrapper. Only active when --incremental is on AND
+// --output db is configured (validated in config.js). The cache uses the same
+// pg Pool as the persistence layer (created lazily in main()).
+const {
+  createIncrementalCache,
+  classifyListFreshness,
+  decideDetailScrape,
+  mergeCachedDetail,
+  computeChangeHash,
+  CacheStats,
+  formatCacheStatsSummary,
+} = require('./incremental');
 // Phase 2.3 — proxy management & rotation. Only initialized when cfg.proxy
 // is enabled (i.e. --noProxy is not set AND a proxy source is configured).
 const { createProxyPool } = require('./proxy');
@@ -214,6 +227,14 @@ async function main() {
       selectorDebugDump: cfg.selectors.selectorDebugDump,
       maxSelectorAge: cfg.selectors.maxSelectorAge,
     },
+    incremental: {
+      enabled: cfg.incremental.enabled,
+      listFreshnessDays: cfg.incremental.listFreshnessDays,
+      detailCacheTtlDays: cfg.incremental.detailCacheTtlDays,
+      detailRefreshOnReviewDelta: cfg.incremental.detailRefreshOnReviewDelta,
+      noDetailCache: cfg.incremental.noDetailCache,
+      swrr: cfg.incremental.swrr,
+    },
   });
 
   // Phase 2.11 — log the active selector versions + emit a staleness warning
@@ -226,6 +247,40 @@ async function main() {
   // Phase 1.8 — construct the rate limiter once and attach to cfg so every
   // module that makes Google-bound requests (search, detail) can acquire.
   cfg.rateLimiter = new RateLimiter(cfg.antiblock.maxRequestsPerMin, { logger });
+
+  // Phase 2.12 — incremental scraping & detail caching. Construct the cache
+  // (backed by the same pg Pool used for persistence) + a stats accumulator.
+  // The cache is null when --incremental is off OR --output db isn't set
+  // (config.js validates that --incremental requires --output db). The stats
+  // accumulator is always constructed (even when incremental is off) so the
+  // banner can render a "not enabled" line consistently.
+  let dbPool = null; // shared pg Pool (DB output + incremental share one connection)
+  let incrementalCache = null;
+  const cacheStats = new CacheStats();
+  if (cfg.incremental.enabled) {
+    dbPool = createPool(cfg.databaseUrl);
+    if (!dbPool) {
+      logger.error('Incremental mode enabled but DATABASE_URL is unset/invalid', {
+        hint: 'Set DATABASE_URL in .env (see .env.example → Phase 2.1). --incremental requires --output db.',
+      });
+      process.exit(2);
+    }
+    incrementalCache = createIncrementalCache(dbPool, { logger });
+    if (cfg.incremental.swrr) {
+      logger.info('Phase 2.12 — stale-while-revalidate (SWRR) requested', {
+        hint: 'SWRR is stubbed for Phase 5; this run behaves like normal incremental mode.',
+      });
+    }
+    logger.info('Phase 2.12 — incremental scraping enabled', {
+      listFreshnessDays: cfg.incremental.listFreshnessDays,
+      detailCacheTtlDays: cfg.incremental.detailCacheTtlDays,
+      detailRefreshOnReviewDelta: cfg.incremental.detailRefreshOnReviewDelta,
+      noDetailCache: cfg.incremental.noDetailCache,
+      swrr: cfg.incremental.swrr,
+      hint: 'Repeat runs skip fresh/unchanged businesses; detail data reused within TTL.',
+    });
+  }
+  cfg.incremental.resolved = { cache: incrementalCache, stats: cacheStats, dbPool };
 
   // Phase 2.3 — construct the proxy pool (if enabled). The pool is then
   // queried before each browser launch to pick a proxy; release() is called
@@ -1788,6 +1843,53 @@ async function main() {
   const startedAt = Date.now();
   let result;
 
+  // Phase 2.12 — run-level incremental pre-flight. If --incremental is on and
+  // the most recent scrape of this (query, location) is within
+  // --listFreshnessDays, skip the browser entirely and load the businesses
+  // from the DB. This is the acceptance criterion: "second run immediately
+  // after → 100% cache hits, ~0 requests, runtime < 30s". Skipped for dry
+  // runs (no point caching) and when --fresh is set (operator explicitly wants
+  // a full re-scrape).
+  let incrementalPreflightSkip = false;
+  if (cfg.incremental.enabled && incrementalCache && !cfg.dryRun && !cfg.fresh) {
+    const preflight = await incrementalCache.preflightRun(
+      cfg.query,
+      cfg.location,
+      cfg.incremental.listFreshnessDays,
+    );
+    if (preflight.skip) {
+      logger.info('Phase 2.12 — run-level cache HIT — skipping browser launch', {
+        query: cfg.query,
+        location: cfg.location,
+        businessCount: preflight.businessCount,
+        ageDays: Number(preflight.ageDays.toFixed(2)),
+        listFreshnessDays: cfg.incremental.listFreshnessDays,
+        hint: 'Loading businesses from DB. Use --fresh to force a full re-scrape.',
+      });
+      const cachedBusinesses = await incrementalCache.loadBusinessesForRun(cfg.query, cfg.location);
+      cacheStats.recordPreflightSkip(cachedBusinesses.length, preflight.ageDays);
+      incrementalPreflightSkip = true;
+      // Synthesize a minimal `result` object so the downstream export / banner
+      // code works without a browser. scrollResult / extractStats / detailStats
+      // are placeholders; the banner shows "served from cache" for these.
+      result = {
+        businesses: cachedBusinesses,
+        extractionRates: null,
+        scrollResult: { finalCount: cachedBusinesses.length, reason: 'incremental-cache-hit', elapsedMs: 0 },
+        detailStats: null,
+        extractStats: { total: cachedBusinesses.length, succeeded: cachedBusinesses.length, failed: 0 },
+        recovery: { resumed: false, existingCount: 0, newCount: cachedBusinesses.length, skipped: 0 },
+        incrementalPreflightSkip: true,
+      };
+    } else if (preflight.businessCount > 0) {
+      logger.info('Phase 2.12 — run-level cache MISS — proceeding with full scrape', {
+        businessCount: preflight.businessCount,
+        ageDays: preflight.ageDays !== null ? Number(preflight.ageDays.toFixed(2)) : null,
+        listFreshnessDays: cfg.incremental.listFreshnessDays,
+      });
+    }
+  }
+
   // Phase 2.11 — startup extraction-rate health check. Loads a known-good
   // HTML fixture (captured in Phase 2.0) into a throwaway browser, runs
   // extractBusinesses, and aborts the run if any core field (name, rating,
@@ -1798,11 +1900,13 @@ async function main() {
   //   - --skipHealthCheck is set (emergency runs)
   //   - the fixture file is missing (fresh clone — warn but continue)
   //   - --dryRun is set (smoke test — no point aborting)
+  //   - Phase 2.12 incremental pre-flight already skipped the browser
+  //     (no scrape → no need to validate selectors)
   //
   // The health check uses a SEPARATE browser instance (launched + closed
   // here) so it doesn't interfere with the main pipeline's browser state.
   // Overhead: ~15s for browser launch + fixture load + extraction.
-  if (!cfg.selectors.skipHealthCheck && !cfg.dryRun) {
+  if (!incrementalPreflightSkip && !cfg.selectors.skipHealthCheck && !cfg.dryRun) {
     const fixturePath = cfg.selectors.healthCheckFixture;
     if (!fs.existsSync(fixturePath)) {
       logger.warn('Phase 2.11 — startup health check skipped (fixture not found)', {
@@ -1892,6 +1996,10 @@ async function main() {
     };
   }
 
+  // Phase 2.12 — skip the browser scrape entirely when the incremental pre-
+  // flight was a cache HIT (result already populated from the DB). The else
+  // branch runs the full scrape (queue / pool / sequential).
+  if (!incrementalPreflightSkip) {
   try {
     // Phase 2.9 — queue path. --queue on submits the search-task as a BullMQ
     // job (persisted in Redis, crash-resilient, priority-ordered); a worker
@@ -2033,6 +2141,122 @@ async function main() {
         permanentlyClosed: allBusinesses.filter((b) => b.business_status === 'permanently_closed').length,
         temporarilyClosed: allBusinesses.filter((b) => b.business_status === 'temporarily_closed').length,
       });
+
+      // Phase 2.12 — per-business incremental detail-cache check. For each
+      // freshly-extracted business, look up its existing DB row (one batched
+      // query) and decide:
+      //   1. fresh + change_hash match → SKIP detail-scrape entirely (reuse
+      //      cached detail fields). Stats: listSkippedFresh++.
+      //   2. fresh + change_hash differs → list changed; conditionally re-
+      //      scrape details (subject to detail-cache TTL + review delta).
+      //   3. stale or new → full scrape.
+      // For cases 2+3, the detail-cache TTL decides whether to deep-scrape
+      // or reuse the cached detail (within TTL + no review delta → reuse).
+      // Businesses that reuse cached detail get detail_scraped=true set so
+      // deepScrapeAll skips them. Skipped for dry runs (no DB) and when
+      // --incremental is off (Phase 1.5 behavior preserved).
+      if (cfg.incremental.enabled && incrementalCache && !cfg.dryRun) {
+        const placeIds = allBusinesses.map((b) => b && b.place_id).filter((p) => p);
+        const existingMap = await incrementalCache.lookupBusinesses(placeIds);
+        const now = Date.now();
+        let skippedFresh = 0;
+        let detailCacheHits = 0;
+        let detailForced = 0;
+        let detailMisses = 0;
+        let detailNoCache = 0;
+        for (let i = 0; i < allBusinesses.length; i++) {
+          const b = allBusinesses[i];
+          if (!b || !b.place_id) continue;
+          // Already detail-scraped (from checkpoint) — leave it.
+          if (b.detail_scraped === true) continue;
+          const existing = existingMap.get(b.place_id) || null;
+          const listDecision = classifyListFreshness(existing, {
+            now,
+            listFreshnessDays: cfg.incremental.listFreshnessDays,
+          });
+          const incomingChangeHash = computeChangeHash(b);
+
+          // Case 1: fresh + change_hash match → skip detail entirely.
+          if (
+            listDecision.action === 'fresh' &&
+            existing &&
+            existing.change_hash === incomingChangeHash
+          ) {
+            allBusinesses[i] = mergeCachedDetail(b, existing);
+            cacheStats.recordList('fresh_unchanged');
+            skippedFresh++;
+            logger.debug('Phase 2.12 — skipping business (fresh, unchanged)', {
+              place_id: b.place_id,
+              name: b.name,
+              ageDays: listDecision.ageDays !== null ? Number(listDecision.ageDays.toFixed(2)) : null,
+            });
+            continue;
+          }
+
+          // Cases 2+3: need to (re)scrape. Record the list action.
+          if (listDecision.action === 'new') {
+            cacheStats.recordList('new');
+          } else if (listDecision.action === 'stale') {
+            cacheStats.recordList('stale');
+          } else {
+            // fresh but change_hash differed
+            cacheStats.recordList('fresh_changed');
+          }
+
+          // Detail-cache decision (only relevant when deepScrape is on; if
+          // deepScrape is off, there's no detail work to skip).
+          if (cfg.deepScrape) {
+            const detailDecision = decideDetailScrape(existing, { reviews_count: b.reviews_count }, {
+              now,
+              detailCacheTtlDays: cfg.incremental.detailCacheTtlDays,
+              detailRefreshOnReviewDelta: cfg.incremental.detailRefreshOnReviewDelta,
+              noDetailCache: cfg.incremental.noDetailCache,
+            });
+            if (!detailDecision.shouldScrape && detailDecision.reason === 'cache_hit') {
+              // Reuse cached detail data (within TTL + no review delta).
+              allBusinesses[i] = mergeCachedDetail(b, existing);
+              cacheStats.recordDetail('cache_hit');
+              detailCacheHits++;
+              logger.debug('Phase 2.12 — detail cache hit (skipping deep-scrape)', {
+                place_id: b.place_id,
+                name: b.name,
+                ageDays: detailDecision.ageDays !== null ? Number(detailDecision.ageDays.toFixed(2)) : null,
+                ttlDays: cfg.incremental.detailCacheTtlDays,
+              });
+            } else if (detailDecision.reason === 'forced_refresh') {
+              cacheStats.recordDetail('forced_refresh');
+              detailForced++;
+              logger.info('Phase 2.12 — detail refresh forced (review-count delta)', {
+                place_id: b.place_id,
+                name: b.name,
+                reviewDeltaPct: Number(detailDecision.reviewDeltaPct.toFixed(1)),
+                threshold: cfg.incremental.detailRefreshOnReviewDelta,
+                ageDays: detailDecision.ageDays !== null ? Number(detailDecision.ageDays.toFixed(2)) : null,
+              });
+              // Leave for deepScrapeAll (detail_scraped still false).
+            } else if (detailDecision.reason === 'cache_miss') {
+              cacheStats.recordDetail('cache_miss');
+              detailMisses++;
+            } else {
+              // no_cache (--noDetailCache or first scrape)
+              cacheStats.recordDetail('no_cache');
+              detailNoCache++;
+            }
+          }
+        }
+        logger.info('Phase 2.12 — incremental detail-cache decisions', {
+          total: allBusinesses.length,
+          skippedFresh,
+          detailCacheHits,
+          detailForced,
+          detailMisses,
+          detailNoCache,
+        });
+      } else if (cfg.incremental.enabled && cfg.dryRun) {
+        // Dry run with incremental — no DB lookups, but record that detail
+        // work would have been done. Keeps the banner honest.
+        cacheStats.recordDetailDisabled(allBusinesses.length);
+      }
 
       // Phase 1.5 — optional detail-page deep scrape. Adds hours, popular
       // times, top reviews, photos, reservation/menu/social links per business.
@@ -2322,6 +2546,7 @@ async function main() {
       }
     }
   }
+  } // end if (!incrementalPreflightSkip)
 
   const durationMs = Date.now() - startedAt;
 
@@ -2399,9 +2624,15 @@ async function main() {
   // (keyed by place_id) in a single transaction, writes the run summary, and
   // closes the pool. A DB failure is logged + reflected in the exit code but
   // does NOT discard the file outputs already written above.
+  //
+  // Phase 2.12 — when --incremental is on, reuse the shared `dbPool` created
+  // earlier (the incremental cache already uses it for preflight + lookups).
+  // Pass `incremental: true` so unchanged businesses get a freshness-timestamp
+  // refresh (advancing last_list_scraped without a full data update).
   let dbResult = null;
   if (!cfg.dryRun && wantsDb) {
-    const pool = createPool(cfg.databaseUrl);
+    // Reuse the incremental pool when available; otherwise create a fresh one.
+    const pool = dbPool || createPool(cfg.databaseUrl);
     if (!pool) {
       logger.error('DB output requested but DATABASE_URL is unset', {
         hint: 'Set DATABASE_URL in .env (see .env.example → Phase 2.1).',
@@ -2413,6 +2644,7 @@ async function main() {
         businesses: result.businesses,
         summary: { ...summary, exitCode: null, logPath: logger.getLogFile ? logger.getLogFile() : null },
         logger,
+        incremental: cfg.incremental.enabled,
       });
     } catch (err) {
       logger.error('DB persistence failed', {
@@ -2423,7 +2655,10 @@ async function main() {
       });
       dbResult = { failed: true, message: err.message };
     } finally {
-      await closePool(pool);
+      // Only close the pool if we created it here (not the shared incremental one).
+      if (!dbPool) {
+        await closePool(pool);
+      }
     }
   }
 
@@ -2553,6 +2788,17 @@ async function main() {
       `Queue:    ${qs.completed} done, ${qs.active} active, ${qs.waiting} waiting${delayedTag}${failedTag} (BullMQ + Redis)`,
     );
   }
+  // Phase 2.12 — incremental cache stats. Multi-line block (matches the
+  // execution plan's format). Omitted entirely when --incremental is off
+  // (no stats collected → formatCacheStatsSummary returns null for an empty
+  // accumulator with no decisions recorded).
+  const incrementalLines = [];
+  if (cfg.incremental.enabled) {
+    const block = formatCacheStatsSummary(cacheStats);
+    if (block) {
+      for (const line of block.split('\n')) incrementalLines.push(line);
+    }
+  }
   const banner = [
     '========================================',
     'Run complete',
@@ -2568,6 +2814,7 @@ async function main() {
     ...sessionLines,
     ...poolLines,
     ...queueLines,
+    ...incrementalLines,
     ...(logLine ? [logLine] : []),
     '========================================',
   ].join('\n');
@@ -2607,10 +2854,24 @@ async function main() {
       : dbResult && dbResult.failed
         ? { failed: true, message: dbResult.message }
         : null,
+    // Phase 2.12 — incremental cache stats (null when --incremental is off).
+    incremental: cfg.incremental.enabled ? cacheStats.toJSON() : null,
     log: logFile,
   });
 
   clearTimeout(globalTimer);
+
+  // Phase 2.12 — close the shared incremental DB pool (best-effort). This is
+  // the same pool used by persistRunResults when --incremental is on; closing
+  // it here ensures no dangling pg connections. Skipped in endless mode (the
+  // process stays alive; the pool is reused for subsequent queue jobs).
+  if (dbPool && !(cfg.health.endless && cfg.queue.enabled)) {
+    try {
+      await closePool(dbPool);
+    } catch {
+      /* best-effort */
+    }
+  }
 
   // Phase 2.10 — endless mode. When --endless is on (requires --queue on),
   // the scraper does NOT exit after the initial run. Instead it keeps the

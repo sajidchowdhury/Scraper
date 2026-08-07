@@ -201,3 +201,76 @@ BEGIN
     ALTER TABLE scrape_runs ADD COLUMN changes_detected INTEGER;
   END IF;
 END $$;
+
+-- ===========================================================================
+-- Phase 2.12 — Incremental Scraping & Detail Caching
+-- ===========================================================================
+-- Three new columns on `businesses` turn re-scrapes into cheap incremental
+-- runs:
+--   last_list_scraped   — when the list-view fields were last verified.
+--                         Compared against --listFreshnessDays (default 1) to
+--                         decide whether a business is "fresh" (skip) or
+--                         "stale" (re-scrape). NULL on the first run.
+--   last_detail_scraped — when the detail fields were last verified. Compared
+--                         against --detailCacheTtlDays (default 7) to decide
+--                         whether to skip the detail-panel deep-scrape and
+--                         reuse the cached hours/reviews/photos. NULL until
+--                         the first successful detail scrape.
+--   change_hash         — SHA-256 hex of the LIST-VIEW fields only (name,
+--                         rating, reviews_count, ..., query, location). This
+--                         is DISTINCT from the Phase 2.1 `data_hash`, which
+--                         hashes the full row (including detail JSONB). When
+--                         a re-scrape finds `change_hash` unchanged AND
+--                         `last_list_scraped` is within freshness, the
+--                         business is "fresh + unchanged" → we skip the
+--                         detail-scrape entirely and reuse the cached detail
+--                         fields. Computed in JS (src/incremental.js →
+--                         computeChangeHash) so the logic is unit-testable
+--                         without a live database.
+--
+-- All three columns are added via ALTER + IF NOT EXISTS guards so the
+-- migration is re-runnable against Phase 2.1/2.2 databases. NULL defaults
+-- preserve Phase 2.1 behavior on the first run after upgrading (every
+-- business is treated as "new").
+-- ---------------------------------------------------------------------------
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'businesses' AND column_name = 'last_list_scraped'
+  ) THEN
+    ALTER TABLE businesses ADD COLUMN last_list_scraped TIMESTAMPTZ;
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'businesses' AND column_name = 'last_detail_scraped'
+  ) THEN
+    ALTER TABLE businesses ADD COLUMN last_detail_scraped TIMESTAMPTZ;
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'businesses' AND column_name = 'change_hash'
+  ) THEN
+    ALTER TABLE businesses ADD COLUMN change_hash TEXT;
+  END IF;
+END $$;
+
+-- Indexes to support the incremental lookups:
+--   1. (query, location, last_list_scraped) — the run-level pre-flight check
+--      "is there a recent scrape for this query/location?" scans this index.
+--   2. (place_id, last_detail_scraped) — the per-business detail-cache TTL
+--      check. place_id is already unique, but the composite lets the planner
+--      answer "is this place_id's detail cache fresh?" from the index alone.
+CREATE INDEX IF NOT EXISTS idx_businesses_query_loc_list_fresh
+  ON businesses (query, location, last_list_scraped);
+CREATE INDEX IF NOT EXISTS idx_businesses_place_detail_fresh
+  ON businesses (place_id, last_detail_scraped);
