@@ -167,6 +167,23 @@ function parseArgs(argv) {
     else if (a === '--healthPort') out.healthPort = argv[++i];
     else if (a === '--healthHost') out.healthHost = argv[++i];
     else if (a === '--noHealthServer') out.noHealthServer = true;
+    // Phase 2.11 — self-healing selectors & health checks. These flags
+    // control the startup selector health check, heuristic field auto-
+    // discovery, DOM-snippet debug dumps, and selector-set age warnings.
+    //   --skipHealthCheck       — don't run the pre-scrape extraction-rate
+    //                             health check (emergency runs only).
+    //   --autoDiscover on|off   — heuristic field discovery when selectors
+    //                             fail (default: on).
+    //   --selectorDebugDump on|off — write DOM snippets for low-rate fields
+    //                             to data/selector-debug/ (default: on).
+    //   --maxSelectorAge N      — warn when selector sets are older than N
+    //                             days (default: 30).
+    //   --selectorDebugDir <p>  — override the dump directory.
+    else if (a === '--skipHealthCheck') out.skipHealthCheck = true;
+    else if (a === '--autoDiscover') out.autoDiscover = argv[++i];
+    else if (a === '--selectorDebugDump') out.selectorDebugDump = argv[++i];
+    else if (a === '--maxSelectorAge') out.maxSelectorAge = argv[++i];
+    else if (a === '--selectorDebugDir') out.selectorDebugDir = argv[++i];
   }
   return out;
 }
@@ -559,6 +576,23 @@ function validate(cfg) {
         'BullMQ queue; without a queue there is nothing to pull). See .env.example → Phase 2.10.',
     );
   }
+  // Phase 2.11 — self-healing selector validation.
+  if (cfg.selectors.autoDiscover !== true && cfg.selectors.autoDiscover !== false) {
+    errors.push(
+      `autoDiscover must be one of on, off (got "${cfg.selectors.autoDiscover}"). Use --autoDiscover on|off.`,
+    );
+  }
+  if (cfg.selectors.selectorDebugDump !== true && cfg.selectors.selectorDebugDump !== false) {
+    errors.push(
+      `selectorDebugDump must be one of on, off (got "${cfg.selectors.selectorDebugDump}"). Use --selectorDebugDump on|off.`,
+    );
+  }
+  if (cfg.selectors.maxSelectorAge < 1 || cfg.selectors.maxSelectorAge > 365) {
+    errors.push(
+      `maxSelectorAge must be between 1 and 365 days (got ${cfg.selectors.maxSelectorAge}). ` +
+        'Warn when selector sets are older than this (default 30).',
+    );
+  }
   return errors;
 }
 
@@ -898,6 +932,41 @@ function loadConfig(argv = process.argv.slice(2)) {
       resolved: null,
     },
 
+    // Phase 2.11 — self-healing selectors & health checks.
+    //   --skipHealthCheck          — don't run the pre-scrape extraction-rate
+    //                                health check (emergency runs only).
+    //   --autoDiscover on|off      — heuristic field discovery when selectors
+    //                                fail (default: on). When a discoverable
+    //                                field (phone, website, rating,
+    //                                reviews_count) is null on a card, scan
+    //                                the card DOM for a pattern match.
+    //   --selectorDebugDump on|off — write DOM snippets for low-rate fields
+    //                                to data/selector-debug/ (default: on).
+    //   --maxSelectorAge N         — warn when selector sets are older than N
+    //                                days (default: 30).
+    //   --selectorDebugDir <path>  — override the dump directory (default:
+    //                                ./data/selector-debug).
+    selectors: {
+      skipHealthCheck:
+        !!cli.skipHealthCheck || process.env.SKIP_HEALTH_CHECK === 'true' ||
+        process.env.HEALTH_CHECK === 'off',
+      autoDiscover:
+        (cli.autoDiscover || process.env.AUTO_DISCOVER || 'on') === 'on',
+      selectorDebugDump:
+        (cli.selectorDebugDump || process.env.SELECTOR_DEBUG_DUMP || 'on') === 'on',
+      maxSelectorAge:
+        toIntOrNull(cli.maxSelectorAge ?? process.env.MAX_SELECTOR_AGE) ?? 30,
+      debugDumpDir: cli.selectorDebugDir || process.env.SELECTOR_DEBUG_DIR || './data/selector-debug',
+      // Path to the HTML fixture used by the startup health check. When set,
+      // the health check loads this fixture instead of doing a live search.
+      // Defaults to tests/fixtures/Cafe_Berlin_feed.html (captured in Phase 2.0).
+      healthCheckFixture:
+        process.env.HEALTH_CHECK_FIXTURE ||
+        path.join(process.cwd(), 'tests', 'fixtures', 'Cafe_Berlin_feed.html'),
+      // Resolved at runtime in index.js into { ran, ok, rates }.
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -1065,6 +1134,32 @@ Optional:
                              this port (default: off; auto-on when --endless).
   --healthHost <host>        Phase 2.10 — /health bind host (default 127.0.0.1).
   --noHealthServer           Phase 2.10 — force-disable the HTTP /health endpoint.
+
+  --skipHealthCheck          Phase 2.11 — skip the pre-scrape extraction-rate
+                             health check (emergency runs only). The check
+                             loads a fixture, runs extraction, and aborts if
+                             core fields (name, rating, reviews_count,
+                             address) are below 50% — likely a DOM change.
+  --autoDiscover on|off      Phase 2.11 — heuristic field auto-discovery when
+                             selectors fail (default: on). When a discoverable
+                             field (phone, website, rating, reviews_count) is
+                             null on a card, scan the card DOM for a pattern
+                             match (phone regex, non-Google <a href>, aria-
+                             label containing "stars", etc.). Logs the
+                             suggested selector for the operator to add to
+                             src/extract.js.
+  --selectorDebugDump on|off Phase 2.11 — write DOM snippets for low-rate
+                             fields to data/selector-debug/ (default: on).
+                             When a field's extraction rate drops below 80%,
+                             the first 500 chars of each card's innerHTML is
+                             written to {field}_{timestamp}.html — gives the
+                             developer a sample to craft a new selector.
+  --maxSelectorAge <days>    Phase 2.11 — warn when selector sets are older
+                             than this many days (default: 30). Bump the
+                             version + lastVerifiedDate in src/selectors/
+                             version.js when you re-verify against a fixture.
+  --selectorDebugDir <path>  Phase 2.11 — override the debug-dump directory
+                             (default: ./data/selector-debug).
 
   --version                  Print version and exit
   --help, -h                 Show this help

@@ -264,3 +264,213 @@ Every field parser has unit tests in `tests/extract.test.js` (67 tests) and
 HTML fixture cards that match the live Maps DOM. When you add a new
 selector, add a fixture card that exercises it — this catches regressions
 when Google changes the DOM again.
+
+## Self-healing selectors (Phase 2.11)
+
+Phase 2.11 adds a self-healing layer on top of the fallback-chain pattern:
+when all selectors for a field miss, the scraper falls back to pattern-based
+discovery, and when extraction rates drop below a threshold, it aborts early
++ dumps the DOM for the operator to craft a fix. This section documents the
+four layers of defense and how to use them.
+
+### Layer 1 — Selector versioning (`src/selectors/version.js`)
+
+Every selector set (list-view, detail-panel, search-feed, scroll-markers)
+has a `version` and `lastVerifiedDate` in `src/selectors/version.js`. On
+startup the scraper logs the active version:
+
+```
+[selectors] Selectors list v3 (last verified 2026-08-07, 12 days ago)
+[selectors] Selectors detail v2 (last verified 2026-08-07, 12 days ago)
+```
+
+If a set is older than `--maxSelectorAge` (default: 30 days), a warning is
+logged:
+
+```
+[selectors] WARN: Selectors last verified 45 days ago (list v3) — consider
+re-running the fixture test (bun test tests/selectors-fixture.test.js) and
+bumping the version in src/selectors/version.js if the DOM changed.
+```
+
+**When you re-verify selectors against a new fixture**, bump the version
+number and update `lastVerifiedDate` to today's date in
+`src/selectors/version.js`. This is the single source of truth that the
+staleness warning reads from.
+
+### Layer 2 — Startup health check (`src/selectors/health-check.js`)
+
+Before the main scrape, the scraper loads a known-good HTML fixture
+(default: `tests/fixtures/Cafe_Berlin_feed.html`), runs `extractBusinesses`,
+and checks the extraction rates:
+
+- **Core fields** (name, rating, reviews_count, address) must extract at
+  ≥ 50%. If any is below, the run is **aborted** with exit code 3 and a
+  clear error message.
+- **Secondary fields** (phone, website, plus_code, etc.) below 30% log a
+  warning but the run continues.
+
+The check takes ~15s (browser launch + fixture load + extraction). Skip it
+with `--skipHealthCheck` for emergency runs.
+
+```
+[selectors] Running extraction-rate health check
+[selectors] Health check passed (total=14, coreRates={name:100%, rating:93%, ...})
+```
+
+On failure:
+
+```
+[selectors] ERROR: Health check FAILED — aborting run
+  failingCore: ['rating', 'reviews_count']
+  coreRates: {name:100%, rating:42%, reviews_count:35%, address:100%}
+  reason: Extraction rates critically low (rating=42%, reviews_count=35%) —
+          likely a DOM change. Run scripts/capture-fixtures.js and update
+          selectors. Use --skipHealthCheck to force.
+  hint: Run `npm run capture-fixtures` to refresh fixtures, then
+        `bun test tests/selectors-fixture.test.js`. Use --skipHealthCheck
+        to bypass for an emergency run.
+```
+
+### Layer 3 — First-batch abort (in `src/extract.js`)
+
+After the first 10 businesses of a real scrape, `extractBusinesses` checks
+the extraction rates. If any core field is below 50%, it throws a
+`SELECTOR_FAILURE` error with `exitCode=3`. This catches a DOM change that
+the startup check missed (e.g. the fixture was stale but the live page moved
+further). The error is caught in `src/index.js`, which exits with code 3
+and logs the failing fields + a hint to run `scripts/capture-fixtures.js`.
+
+```
+[extract] WARN: Secondary fields below threshold (continuing)
+  failingSecondary: ['phone', 'website']
+  secondaryRates: {phone:25%, website:20%, ...}
+```
+
+On critical failure (propagates to `src/index.js`):
+
+```
+ERROR: Run aborted — selector failure (extraction rates critically low)
+  failingCore: ['rating']
+  coreRates: {name:100%, rating:30%, reviews_count:95%, address:100%}
+  reason: Extraction rates critically low (rating=30%) — likely a DOM change.
+  hint: Run `npm run capture-fixtures` to refresh fixtures, then
+        `bun test tests/selectors-fixture.test.js`. Inspect
+        data/selector-debug/ for DOM snippets. Use --skipHealthCheck to
+        bypass for an emergency run.
+```
+
+### Layer 4 — Heuristic auto-discovery (`src/selectors/auto-discover.js`)
+
+When all selectors for a discoverable field miss on a card, the scraper
+falls back to pattern-based discovery. Discoverable fields:
+
+| Field | Pattern |
+|---|---|
+| `phone` | element with `aria-label*="phone"` + phone regex, OR `a[href^="tel:"]`, OR `[data-item-id*="phone"]`, OR any element whose text matches `^[+]?[\d\s\-()]{7,}$` |
+| `website` | `<a href^="http">` whose host is NOT `google.com` / `maps.google.*` |
+| `rating` | element with `aria-label` containing "rated" or "stars", OR `[role="img"]` with aria-label matching a number |
+| `reviews_count` | element whose text matches `^\(\d[\d,]*\)$` or `^\d[\d,]*\s+reviews?$` |
+
+Discovery is a **fallback, not a primary strategy** — it's slow (one pass per
+missing field per card) and produces a less reliable value. The intent is to
+keep extraction alive (non-null fields) when Google changes the DOM, until a
+human can craft a new selector. Every successful discovery is logged so the
+operator can copy the suggested selector:
+
+```
+[extract] Auto-discovered phone field (selector: span[aria-label*="Phone"])
+  — add to SELECTORS.js
+  cardIndex: 5, field: phone, value: +49 123 4567890
+```
+
+Disable with `--autoDiscover off` (discovery is on by default).
+
+### Layer 5 — Selector debug dumps (`src/selectors/debug-dump.js`)
+
+When a field's extraction rate drops below 80% (the dump threshold), the
+scraper writes the first 500 chars of each card's innerHTML to
+`data/selector-debug/{field}_{timestamp}.html`. This gives the developer a
+sample of the actual DOM that's failing the selector, so they can craft a
+new selector without re-running the scrape.
+
+```
+[extract] WARN: Selector debug dump written for low-rate field: phone
+  field: phone, rate: 25%, threshold: 80%, missingCount: 15
+  path: data/selector-debug/phone_2026-08-07T12-00-00-000Z.html
+  hint: Inspect the dump to craft a new selector, then add it to
+        src/extract.js SELECTORS.phone
+```
+
+Disable with `--selectorDebugDump off` (dumps are on by default). Override
+the directory with `--selectorDebugDir <path>`.
+
+### Fixture-based regression test (`tests/selectors-fixture.test.js`)
+
+Run `bun test tests/selectors-fixture.test.js` to verify the selectors
+against the captured HTML fixtures. The test loads each fixture in
+`tests/fixtures/*_feed.html`, runs `extractBusinesses`, and asserts:
+
+- Core fields extract at ≥ 70% (catches selector breakage; allows for
+  legitimate nulls on real fixtures).
+- Secondary fields extract at ≥ 15% (catches total breakage; allows for
+  sparse fields like phone/website that are often detail-panel-only).
+
+When this test fails, it means Google changed the DOM and a selector needs
+updating. The failure message includes the field name, rate, and a hint to
+run `scripts/capture-fixtures.js` + inspect `data/selector-debug/`.
+
+### Config flags summary
+
+| Flag | Default | Description |
+|---|---|---|
+| `--skipHealthCheck` | off | Skip the startup extraction-rate health check (emergency runs) |
+| `--autoDiscover on\|off` | on | Heuristic field auto-discovery when selectors fail |
+| `--selectorDebugDump on\|off` | on | Write DOM snippets for low-rate fields to `data/selector-debug/` |
+| `--maxSelectorAge <days>` | 30 | Warn when selector sets are older than this |
+| `--selectorDebugDir <path>` | `./data/selector-debug` | Override the debug-dump directory |
+
+### How to update selectors when the DOM changes
+
+1. **Run the fixture test** to identify which fields broke:
+   ```bash
+   bun test tests/selectors-fixture.test.js
+   ```
+
+2. **Inspect the debug dumps** for the broken field:
+   ```bash
+   ls data/selector-debug/
+   # phone_2026-08-07T12-00-00-000Z.html  rating_2026-08-07T12-00-00-000Z.html
+   ```
+   The dump contains the first 500 chars of each card's innerHTML — enough
+   to identify the new DOM structure.
+
+3. **Add the new selector** at the TOP of the field's array in
+   `src/extract.js` (keep the old ones as fallbacks):
+   ```js
+   rating: [
+     'YOUR_NEW_SELECTOR_HERE',                                // ← add here
+     '.fontBodyMedium > span[aria-label*="stars"]',
+     'span[aria-label$="stars"]',
+     // ...
+   ],
+   ```
+
+4. **Bump the version + lastVerifiedDate** in `src/selectors/version.js`:
+   ```js
+   list: {
+     version: 4,                                    // ← bump
+     lastVerifiedDate: '2026-09-15',                // ← today's date
+     // ...
+   },
+   ```
+
+5. **Re-run the fixture test** to confirm the fix:
+   ```bash
+   bun test tests/selectors-fixture.test.js
+   ```
+
+6. **Re-capture fixtures** if the DOM has changed significantly:
+   ```bash
+   npm run capture-fixtures -- --query "Cafe" --location "Berlin"
+   ```

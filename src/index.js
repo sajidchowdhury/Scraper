@@ -142,6 +142,18 @@ const {
   createHealthServer,
 } = require('./health');
 
+// Phase 2.11 — self-healing selectors & health checks. The selectors module
+// wires together: selector versioning (with staleness warning), a startup
+// extraction-rate health check (loads a fixture, aborts if core fields are
+// below 50%), heuristic field auto-discovery (pattern-based fallback when
+// selectors fail), and DOM-snippet debug dumps for low-rate fields.
+const fs = require('fs');
+const {
+  logSelectorVersion,
+  healthCheck,
+  SELECTOR_FAILURE_EXIT_CODE,
+} = require('./selectors');
+
 async function main() {
   const cfg = loadConfig(process.argv.slice(2));
 
@@ -196,7 +208,20 @@ async function main() {
       provider: cfg.proxy.provider,
       healthCheck: cfg.proxy.healthCheck,
     },
+    selectors: {
+      skipHealthCheck: cfg.selectors.skipHealthCheck,
+      autoDiscover: cfg.selectors.autoDiscover,
+      selectorDebugDump: cfg.selectors.selectorDebugDump,
+      maxSelectorAge: cfg.selectors.maxSelectorAge,
+    },
   });
+
+  // Phase 2.11 — log the active selector versions + emit a staleness warning
+  // for any set older than --maxSelectorAge (default 30 days). This is the
+  // first line of defense against silent selector rot: if the selectors
+  // were last verified 60 days ago, the operator is warned to re-run the
+  // fixture test before trusting the extraction rates.
+  logSelectorVersion(logger, { maxAgeDays: cfg.selectors.maxSelectorAge });
 
   // Phase 1.8 — construct the rate limiter once and attach to cfg so every
   // module that makes Google-bound requests (search, detail) can acquire.
@@ -881,6 +906,12 @@ async function main() {
                 location: task.location || cfg.location,
                 logger: wlogger,
                 retry: wcfg.retry,
+                selectors: {
+                  autoDiscover: cfg.selectors.autoDiscover,
+                  abortCheck: true,
+                  debugDump: cfg.selectors.selectorDebugDump,
+                  debugDumpDir: cfg.selectors.debugDumpDir,
+                },
               });
             return { businesses: freshBusinesses, scrollResult, extractionRates, extractStats };
           },
@@ -1304,6 +1335,12 @@ async function main() {
                 location: task.location || cfg.location,
                 logger: wlogger,
                 retry: wcfg.retry,
+                selectors: {
+                  autoDiscover: cfg.selectors.autoDiscover,
+                  abortCheck: true,
+                  debugDump: cfg.selectors.selectorDebugDump,
+                  debugDumpDir: cfg.selectors.debugDumpDir,
+                },
               });
             return { businesses: freshBusinesses, scrollResult, extractionRates, extractStats };
           },
@@ -1751,6 +1788,110 @@ async function main() {
   const startedAt = Date.now();
   let result;
 
+  // Phase 2.11 — startup extraction-rate health check. Loads a known-good
+  // HTML fixture (captured in Phase 2.0) into a throwaway browser, runs
+  // extractBusinesses, and aborts the run if any core field (name, rating,
+  // reviews_count, address) extracts below 50%. This catches a DOM change
+  // BEFORE the run spends time + proxy budget on a broken scrape.
+  //
+  // Skipped when:
+  //   - --skipHealthCheck is set (emergency runs)
+  //   - the fixture file is missing (fresh clone — warn but continue)
+  //   - --dryRun is set (smoke test — no point aborting)
+  //
+  // The health check uses a SEPARATE browser instance (launched + closed
+  // here) so it doesn't interfere with the main pipeline's browser state.
+  // Overhead: ~15s for browser launch + fixture load + extraction.
+  if (!cfg.selectors.skipHealthCheck && !cfg.dryRun) {
+    const fixturePath = cfg.selectors.healthCheckFixture;
+    if (!fs.existsSync(fixturePath)) {
+      logger.warn('Phase 2.11 — startup health check skipped (fixture not found)', {
+        fixturePath,
+        hint: 'Run `npm run capture-fixtures` to capture fixtures, or set HEALTH_CHECK_FIXTURE to a captured HTML file. Use --skipHealthCheck to silence this warning.',
+      });
+      cfg.selectors.resolved = { ran: false, ok: true, reason: 'fixture not found' };
+    } else {
+      logger.info('Phase 2.11 — running startup extraction-rate health check', {
+        fixturePath,
+        autoDiscover: cfg.selectors.autoDiscover,
+        hint: 'Loads a fixture, runs extraction, aborts if core fields < 50%',
+      });
+      const hcStartedAt = Date.now();
+      try {
+        // Use a minimal browser config for the health check — no fingerprint,
+        // no stealth, no proxy. The fixture is a static HTML file; we just
+        // need a DOM to extract from. This keeps the check fast (~15s).
+        const hcCfg = {
+          ...cfg,
+          headless: true,
+          fingerprint: { ...cfg.fingerprint, profile: 'off', resolved: null },
+          stealth: { ...cfg.stealth, profile: 'off', resolved: { enabled: false, debug: false } },
+          proxy: { ...cfg.proxy, enabled: false },
+        };
+        await withBrowser(hcCfg, async ({ page }) => {
+          const fixtureHtml = fs.readFileSync(fixturePath, 'utf8');
+          await page.setContent(fixtureHtml, { waitUntil: 'domcontentloaded' });
+          const { ok, health } = await healthCheck(page, {
+            logger,
+            autoDiscover: cfg.selectors.autoDiscover,
+            minSampleSize: 3,
+            coreThreshold: 50,
+            secondaryThreshold: 30,
+          });
+          const elapsedMs = Date.now() - hcStartedAt;
+          cfg.selectors.resolved = {
+            ran: true,
+            ok,
+            rates: health.coreRates,
+            elapsedMs,
+            failingCore: health.failingCore,
+            failingSecondary: health.failingSecondary,
+          };
+          if (!ok) {
+            logger.error('Phase 2.11 — startup health check FAILED — aborting run', {
+              elapsedMs,
+              failingCore: health.failingCore,
+              failingSecondary: health.failingSecondary,
+              coreRates: health.coreRates,
+              reason: health.reason,
+              hint: 'Run `npm run capture-fixtures` to refresh fixtures, then `bun test tests/selectors-fixture.test.js`. Use --skipHealthCheck to bypass for an emergency run.',
+            });
+            const err = new Error(health.reason || 'Selector health check failed');
+            err.code = 'SELECTOR_FAILURE';
+            err.exitCode = SELECTOR_FAILURE_EXIT_CODE;
+            err.health = health;
+            throw err;
+          }
+          logger.info('Phase 2.11 — startup health check passed', {
+            elapsedMs,
+            total: health.total,
+            coreRates: health.coreRates,
+            failingSecondary: health.failingSecondary,
+          });
+        });
+      } catch (err) {
+        if (err.code === 'SELECTOR_FAILURE') {
+          // Re-throw to the outer catch, which handles exit code 3.
+          throw err;
+        }
+        // Non-selector errors (browser launch failure, fixture parse error,
+        // etc.) are non-fatal — warn and continue. The main scrape might
+        // still work; the first-batch abort check is the backstop.
+        logger.warn('Phase 2.11 — startup health check errored (non-fatal — continuing)', {
+          error: err.message,
+          hint: 'The main scrape will proceed; the first-batch abort check is the backstop',
+        });
+        cfg.selectors.resolved = { ran: true, ok: true, error: err.message };
+      }
+    }
+  } else {
+    cfg.selectors.resolved = {
+      ran: false,
+      ok: true,
+      reason: cfg.selectors.skipHealthCheck ? '--skipHealthCheck' : '--dryRun',
+    };
+  }
+
   try {
     // Phase 2.9 — queue path. --queue on submits the search-task as a BullMQ
     // job (persisted in Redis, crash-resilient, priority-ordered); a worker
@@ -1849,6 +1990,12 @@ async function main() {
           location: cfg.location,
           logger,
           retry: cfg.retry,
+          selectors: {
+            autoDiscover: cfg.selectors.autoDiscover,
+            abortCheck: true,
+            debugDump: cfg.selectors.selectorDebugDump,
+            debugDumpDir: cfg.selectors.debugDumpDir,
+          },
         });
 
       logExtractionRates(extractionRates, logger);
@@ -2135,7 +2282,23 @@ async function main() {
     }
     } // end Phase 2.8 else (sequential single-browser path)
   } catch (err) {
-    if (err && err.code === 'CAPTCHA_DETECTED') {
+    if (err && err.code === 'SELECTOR_FAILURE') {
+      // Phase 2.11 — extraction-rate abort. Core fields dropped below 50%,
+      // almost certainly because Google changed the DOM. Don't waste the
+      // run budget — exit with code 3 (selector failure) and tell the
+      // operator exactly which fields failed + how to fix.
+      logger.error('Run aborted — selector failure (extraction rates critically low)', {
+        failingCore: err.failingCore,
+        failingSecondary: err.failingSecondary,
+        coreRates: err.health ? err.health.coreRates : null,
+        reason: err.message,
+        hint: 'Run `npm run capture-fixtures` to refresh fixtures, then `bun test tests/selectors-fixture.test.js`. Inspect data/selector-debug/ for DOM snippets. Use --skipHealthCheck to bypass for an emergency run.',
+      });
+      clearTimeout(globalTimer);
+      process.removeListener('SIGINT', onSigInt);
+      logger.close();
+      process.exit(SELECTOR_FAILURE_EXIT_CODE);
+    } else if (err && err.code === 'CAPTCHA_DETECTED') {
       logger.error('Run aborted — CAPTCHA detected', {
         indicator: err.captchaIndicator,
         hint: 'Wait for the block to clear, then rerun with --resume',
@@ -2200,6 +2363,9 @@ async function main() {
     // Phase 2.8 — worker pool stats (per-worker counts + aggregate). Null when
     // --workers 1 (Phase 1 sequential behavior — no pool constructed).
     pool: result.pool || null,
+    // Phase 2.11 — self-healing selector stats: startup health check result +
+    // extraction-rate abort status + auto-discovery + debug-dump counts.
+    selectors: cfg.selectors.resolved || { ran: false, ok: true },
   };
 
   // Phase 2.1 — output dispatch. cfg.output is a normalized array of targets

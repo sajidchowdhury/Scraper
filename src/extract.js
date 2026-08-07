@@ -35,9 +35,211 @@
  *   - Per-field DEBUG logs: at --logLevel debug, every normalized record emits
  *     a line listing each canonical field's value (or null) so an operator
  *     can diagnose which selectors are missing for which businesses.
+ *
+ * Phase 2.11 additions — self-healing selectors:
+ *   - Heuristic auto-discovery: when all selectors for a discoverable field
+ *     (phone, website, rating, reviews_count) miss on a card, fall back to
+ *     pattern-based discovery (regex + aria-label proximity). Fills in the
+ *     field + logs the suggested selector for the operator to add to SELECTORS.
+ *   - First-batch abort: after extracting >= 10 businesses, if any core field
+ *     (name, rating, reviews_count, address) is below 50%, throws a
+ *     SelectorFailureError with exitCode=3 — saves the run budget when the
+ *     DOM has changed. Gated by ctx.selectors.abortCheck (default off in
+ *     tests, on in production via index.js).
+ *   - Selector debug dumps: when a field's rate drops below 80%, write the
+ *     first 500 chars of each card's innerHTML to data/selector-debug/. Gives
+ *     the developer a sample to craft a new selector without re-running.
+ *     Gated by ctx.selectors.debugDump (default on).
  */
 
 const { withRetry } = require('./retry');
+const {
+  discoverMissingFields,
+  applyDiscoveryResults,
+  buildDiscoveryRequests,
+} = require('./selectors/auto-discover');
+const {
+  dumpSelectorDebug,
+  shouldDumpForField,
+  DEFAULT_DUMP_THRESHOLD_PCT,
+} = require('./selectors/debug-dump');
+
+// ---------------------------------------------------------------------------
+// Phase 2.11 — self-healing selector constants + pure helpers
+// ---------------------------------------------------------------------------
+// These live HERE (not in src/selectors/health-check.js) to avoid a circular
+// require: extract.js needs checkExtractionRatesForAbort, and health-check.js
+// needs extractBusinesses. health-check.js imports from extract.js (one-way).
+
+/** Exit code for selector-failure aborts (per the Phase 2.11 spec). */
+const SELECTOR_FAILURE_EXIT_CODE = 3;
+
+/**
+ * Core fields — the "money fields" the scraper MUST extract for the run to
+ * be useful. If any drops below CORE_THRESHOLD_PCT, the run is aborted.
+ * Per the Phase 2.11 spec: name, rating, reviews_count, address.
+ */
+const CORE_FIELDS = ['name', 'rating', 'reviews_count', 'address'];
+
+/**
+ * Secondary fields — important but not run-aborting. Below
+ * SECONDARY_THRESHOLD_PCT a warning is logged but the run continues.
+ */
+const SECONDARY_FIELDS = [
+  'price_level',
+  'category',
+  'phone',
+  'website',
+  'plus_code',
+  'open_now',
+  'business_status',
+  'is_sponsored',
+];
+
+const CORE_THRESHOLD_PCT = 50;
+const SECONDARY_THRESHOLD_PCT = 30;
+const DEFAULT_MIN_SAMPLE_SIZE = 10;
+
+/**
+ * Evaluate extraction rates against the health thresholds.
+ * Returns a structured result; does NOT throw.
+ *
+ * @param {object} rates — output of computeExtractionRates()
+ * @param {object} [opts]
+ * @param {number} [opts.minSampleSize=10] — skip if total < minSampleSize
+ * @param {number} [opts.coreThreshold=50]
+ * @param {number} [opts.secondaryThreshold=30]
+ * @returns {object} — { ok, total, failingCore, failingSecondary, coreRates, secondaryRates, reason }
+ */
+function evaluateHealth(rates, opts = {}) {
+  const minSampleSize = opts.minSampleSize ?? DEFAULT_MIN_SAMPLE_SIZE;
+  const coreThreshold = opts.coreThreshold ?? CORE_THRESHOLD_PCT;
+  const secondaryThreshold = opts.secondaryThreshold ?? SECONDARY_THRESHOLD_PCT;
+
+  const total = rates && rates.name ? rates.name.total : 0;
+  const coreRates = {};
+  const secondaryRates = {};
+  for (const f of CORE_FIELDS) {
+    if (rates && rates[f]) coreRates[f] = rates[f].rate;
+  }
+  for (const f of SECONDARY_FIELDS) {
+    if (rates && rates[f]) secondaryRates[f] = rates[f].rate;
+  }
+
+  if (total < minSampleSize) {
+    return {
+      ok: true,
+      total,
+      failingCore: [],
+      failingSecondary: [],
+      coreRates,
+      secondaryRates,
+      reason: `sample size ${total} < minSampleSize ${minSampleSize} — health check skipped`,
+    };
+  }
+
+  const failingCore = CORE_FIELDS.filter(
+    (f) => rates && rates[f] && rates[f].rate < coreThreshold,
+  );
+  const failingSecondary = SECONDARY_FIELDS.filter(
+    (f) => rates && rates[f] && rates[f].rate < secondaryThreshold,
+  );
+
+  if (failingCore.length > 0) {
+    const detail = failingCore.map((f) => `${f}=${rates[f].rate}%`).join(', ');
+    return {
+      ok: false,
+      total,
+      failingCore,
+      failingSecondary,
+      coreRates,
+      secondaryRates,
+      reason: `Extraction rates critically low (${detail}) — likely a DOM change. Run scripts/capture-fixtures.js and update selectors. Use --skipHealthCheck to force.`,
+    };
+  }
+
+  return {
+    ok: true,
+    total,
+    failingCore,
+    failingSecondary,
+    coreRates,
+    secondaryRates,
+    reason: null,
+  };
+}
+
+function isCriticalFailure(healthResult) {
+  return !!(healthResult && healthResult.ok === false && healthResult.failingCore.length > 0);
+}
+
+function buildSelectorFailureError(healthResult) {
+  const err = new Error(healthResult.reason || 'Selector failure');
+  err.code = 'SELECTOR_FAILURE';
+  err.exitCode = SELECTOR_FAILURE_EXIT_CODE;
+  err.health = healthResult;
+  err.failingCore = healthResult.failingCore;
+  err.failingSecondary = healthResult.failingSecondary;
+  return err;
+}
+
+/**
+ * First-batch abort check. Throws a SelectorFailureError (with exitCode=3)
+ * if core-field rates are critically low. Returns the health result
+ * otherwise (so the caller can log warnings for secondary failures).
+ *
+ * @param {object} rates — output of computeExtractionRates()
+ * @param {object} [opts]
+ * @returns {object} — the health result (when not throwing)
+ * @throws {Error} — SelectorFailureError when core rates are critical
+ */
+function checkExtractionRatesForAbort(rates, opts = {}) {
+  const result = evaluateHealth(rates, opts);
+  if (isCriticalFailure(result)) {
+    throw buildSelectorFailureError(result);
+  }
+  return result;
+}
+
+/**
+ * Fetch the innerHTML snippet (first N chars) for the cards at the given
+ * indexes. Used by the debug-dump path to capture DOM context for fields
+ * with low extraction rates. Returns an array of strings (one per index,
+ * null if the card wasn't found).
+ *
+ * @param {import('playwright').Page} page
+ * @param {number[]} indexes
+ * @param {object} [opts]
+ * @param {number} [opts.limit=500]
+ * @returns {Promise<Array<(string|null)>>}
+ */
+async function getCardSnippets(page, indexes, opts = {}) {
+  const limit = opts.limit || 500;
+  if (!indexes || indexes.length === 0) return [];
+  return page.evaluate((payload) => {
+    const idxs = payload.idxs;
+    const lim = payload.lim;
+    const anchors = [];
+    const seen = Object.create(null);
+    const all = document.querySelectorAll('a[href*="/maps/place/"]');
+    for (const a of all) {
+      const href = a.getAttribute('href') || '';
+      if (!href || seen[href]) continue;
+      seen[href] = true;
+      anchors.push(a);
+    }
+    return idxs.map((idx) => {
+      const anchor = anchors[idx];
+      if (!anchor) return null;
+      const card = anchor.closest('[role="article"]') || anchor;
+      try {
+        return (card.innerHTML || '').slice(0, lim);
+      } catch (e) {
+        return '';
+      }
+    });
+  }, { idxs: indexes, lim: limit });
+}
 
 // ---------------------------------------------------------------------------
 // Canonical schema (exported for CSV column order in Phase 1.6)
@@ -597,6 +799,23 @@ async function extractBusinesses(page, ctx) {
     ? { attempts: ctx.retry.attempts || 3, baseMs: ctx.retry.baseMs || 1000, logger: log }
     : { attempts: 1, baseMs: 0, logger: log };
 
+  // Phase 2.11 — self-healing selector options. All default to non-fatal
+  // behavior so existing tests (which don't pass ctx.selectors) keep working:
+  //   - autoDiscover: ON — runs pattern-based discovery for missing fields.
+  //     No-op when there are no missing fields. Wrapped in try/catch so a
+  //     discovery bug never crashes extraction.
+  //   - abortCheck: OFF — first-batch abort throws when core rates < 50%.
+  //     Opt-in (production sets it via index.js). Tests that don't pass it
+  //     never throw.
+  //   - debugDump: ON — writes DOM snippets for fields below 80%. No-op
+  //     when all rates are healthy. Wrapped in try/catch.
+  const selectorsOpts = ctx.selectors || {};
+  const autoDiscoverEnabled = selectorsOpts.autoDiscover !== false;
+  const abortCheckEnabled = selectorsOpts.abortCheck === true;
+  const debugDumpEnabled = selectorsOpts.debugDump !== false;
+  const debugDumpDir = selectorsOpts.debugDumpDir || './data/selector-debug';
+  const debugDumpThreshold = selectorsOpts.debugDumpThreshold ?? DEFAULT_DUMP_THRESHOLD_PCT;
+
   log.info('Extracting business records from feed');
   const rawExtract = () => extractRawFromPage(page);
   const rawRecords = hasRetry
@@ -651,17 +870,65 @@ async function extractBusinesses(page, ctx) {
     }
   }
 
-  const extractionRates = computeExtractionRates(businesses);
+  // Phase 2.11 — heuristic auto-discovery. For each card with a missing
+  // discoverable field (phone, website, rating, reviews_count), run pattern-
+  // based discovery in the browser. Fills in the field + logs the suggested
+  // selector. No-op when there are no missing fields. Wrapped in try/catch
+  // so a discovery bug never crashes extraction — the run continues with
+  // whatever was extracted, and the abort check below decides if rates are
+  // too low to proceed.
+  let finalBusinesses = businesses;
+  let discoveryStats = { requested: 0, discovered: 0 };
+  if (autoDiscoverEnabled && businesses.length > 0) {
+    const requests = buildDiscoveryRequests(businesses);
+    discoveryStats.requested = requests.length;
+    if (requests.length > 0) {
+      try {
+        const results = await discoverMissingFields(page, requests, { logger: log });
+        // Discovery returns raw values (aria-label text, href, innerText).
+        // Pass the field parsers so applyDiscoveryResults can convert raw →
+        // canonical type (rating: float, reviews_count: int, phone: clean, etc.).
+        const discoveredNormalizers = {
+          rating: parseRating,
+          reviews_count: parseReviewsCount,
+          phone: cleanPhone,
+          website: cleanWebsite,
+        };
+        finalBusinesses = applyDiscoveryResults(businesses, results, {
+          normalizers: discoveredNormalizers,
+        });
+        for (const r of results) {
+          discoveryStats.discovered += Object.keys(r.discovered || {}).length;
+        }
+        if (discoveryStats.discovered > 0) {
+          log.info('Auto-discovery filled in missing fields', {
+            cardsWithMissing: requests.length,
+            fieldsDiscovered: discoveryStats.discovered,
+          });
+        }
+      } catch (err) {
+        log.warn('Auto-discovery failed (non-fatal — continuing with extracted values)', {
+          error: err.message,
+        });
+      }
+    }
+  }
+
+  // Recompute rates after auto-discovery (discovery may have filled in
+  // previously-null fields, raising the rates).
+  const extractionRates = computeExtractionRates(finalBusinesses);
   const stats = {
     total: rawRecords.length,
-    succeeded: businesses.length,
+    succeeded: finalBusinesses.length,
     failed: failures.length,
     failures,
+    discovery: discoveryStats,
   };
   log.info('Extraction batch complete', {
     total: stats.total,
     succeeded: stats.succeeded,
     failed: stats.failed,
+    autoDiscovered: discoveryStats.discovered,
   });
   if (failures.length > 0) {
     log.warn('Extraction completed with failures', {
@@ -670,7 +937,75 @@ async function extractBusinesses(page, ctx) {
       failed: stats.failed,
     });
   }
-  return { businesses, extractionRates, stats };
+
+  // Phase 2.11 — first-batch abort. After extracting >= minSampleSize
+  // businesses, if any core field is below 50% the run is aborted with
+  // exitCode=3. This catches a DOM change that the startup health check
+  // missed. The throw propagates up to index.js, which exits with code 3.
+  if (abortCheckEnabled) {
+    const health = checkExtractionRatesForAbort(extractionRates, {
+      minSampleSize: DEFAULT_MIN_SAMPLE_SIZE,
+      coreThreshold: CORE_THRESHOLD_PCT,
+      secondaryThreshold: SECONDARY_THRESHOLD_PCT,
+    });
+    if (health.failingSecondary.length > 0) {
+      log.warn('Secondary fields below threshold (continuing)', {
+        failingSecondary: health.failingSecondary,
+        secondaryRates: health.secondaryRates,
+      });
+    }
+  }
+
+  // Phase 2.11 — selector debug dumps. For each field below the dump
+  // threshold (default 80%), fetch the card innerHTML snippets and write
+  // them to data/selector-debug/{field}_{timestamp}.html. This gives the
+  // developer a sample to craft a new selector without re-running the scrape.
+  // No-op when all rates are healthy. Wrapped in try/catch so a filesystem
+  // error never crashes extraction.
+  if (debugDumpEnabled && finalBusinesses.length > 0) {
+    const dumpableFields = [...CORE_FIELDS, ...SECONDARY_FIELDS];
+    for (const field of dumpableFields) {
+      const r = extractionRates[field];
+      if (!r) continue;
+      if (!shouldDumpForField(field, r.rate, { thresholdPct: debugDumpThreshold })) continue;
+      // Collect the indexes of cards where this field is null/empty.
+      const missingIndexes = [];
+      for (let i = 0; i < finalBusinesses.length; i++) {
+        const v = finalBusinesses[i][field];
+        if (v === null || v === undefined || v === '') missingIndexes.push(i);
+      }
+      if (missingIndexes.length === 0) continue;
+      try {
+        const snippets = await getCardSnippets(page, missingIndexes);
+        const cards = snippets.map((snippet, i) => ({
+          index: missingIndexes[i],
+          snippet: snippet || '',
+        }));
+        const dumpPath = dumpSelectorDebug(field, cards, {
+          dir: debugDumpDir,
+          rate: r.rate,
+          logger: log,
+        });
+        if (dumpPath) {
+          log.warn(`Selector debug dump written for low-rate field: ${field}`, {
+            field,
+            rate: r.rate,
+            threshold: debugDumpThreshold,
+            missingCount: missingIndexes.length,
+            path: dumpPath,
+            hint: 'Inspect the dump to craft a new selector, then add it to src/extract.js SELECTORS.' + field,
+          });
+        }
+      } catch (err) {
+        log.warn(`Selector debug dump failed for field: ${field}`, {
+          field,
+          error: err.message,
+        });
+      }
+    }
+  }
+
+  return { businesses: finalBusinesses, extractionRates, stats };
 }
 
 // ---------------------------------------------------------------------------
@@ -748,6 +1083,18 @@ module.exports = {
   normalizeRecord,
   computeExtractionRates,
   logExtractionRates,
+  // Phase 2.11 — self-healing selector helpers (pure)
+  CORE_FIELDS,
+  SECONDARY_FIELDS,
+  SELECTOR_FAILURE_EXIT_CODE,
+  CORE_THRESHOLD_PCT,
+  SECONDARY_THRESHOLD_PCT,
+  DEFAULT_MIN_SAMPLE_SIZE,
+  evaluateHealth,
+  isCriticalFailure,
+  buildSelectorFailureError,
+  checkExtractionRatesForAbort,
+  getCardSnippets,
   // Field parsers (exported for unit testing)
   parseRating,
   parseReviewsCount,

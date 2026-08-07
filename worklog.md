@@ -152,3 +152,123 @@ Stage Summary:
   verified via mock rollback machinery; identical re-scrape produces zero snapshots/changes).
 - Critical path remaining (per plan): 2.3 (Proxy Management) next on the stealth/scale track;
   2.12 (Incremental Scraping) next on the data track (builds on 2.2's change_hash).
+
+---
+Task ID: 2.11
+Agent: main (Z.ai Code)
+Task: Implement Phase 2.11 — Self-Healing Selectors & Health Checks (per PHASE2_EXECUTION_PLAN.md §2.11)
+
+Work Log:
+- Read Phase 2.11 spec from PHASE2_EXECUTION_PLAN.md (lines 893-954): selector versioning,
+  startup health check, heuristic auto-discovery, extraction-rate-based abort, selector
+  debug dumps, fixture-based regression test, config flags, unit tests.
+- Confirmed baseline: Phase 2.10 complete (commit 9ec3dc4), 1190 tests / 7720 assertions
+  passing, working tree clean on phase2 branch.
+- Created src/selectors/ directory with 5 modules:
+  - version.js: SELECTOR_VERSIONS registry (list/detail/search/scroll sets, each with
+    version + lastVerifiedDate + source + fields), parseDate (with rollover rejection),
+    getSelectorAgeDays, isSelectorSetStale, getSelectorStatus, logSelectorVersion (logs
+    one INFO per set + one WARN per stale set with actionable hint).
+  - auto-discover.js: DISCOVERABLE_FIELDS (phone/website/rating/reviews_count),
+    buildDiscoveryRequests (pure — returns [{cardIndex, fields}] for cards with missing
+    discoverable fields), applyDiscoveryResults (pure — fills in missing fields with
+    optional normalizers for raw→canonical conversion + optional tagDiscovered flag),
+    DISCOVERY_SCRIPT (browser-side function source inlined into page.evaluate via
+    new Function()), discoverInCard with 4 strategies per field (phone: aria-label*="phone"
+    + regex, a[href^="tel:"], data-item-id*="phone", text regex with +/parens/10+digit
+    guard; website: non-Google <a href^="http">; rating: aria-label containing rated|stars,
+    role="img" with number aria-label; reviews_count: text matching (1,234) or "1,234 reviews"),
+    describeSelector (builds a CSS selector for the discovered element), discoverField
+    (single-field wrapper), discoverMissingFields (batch discovery in one page.evaluate
+    round-trip, logs each success).
+  - health-check.js: healthCheck (page-bound wrapper that runs extractBusinesses on a
+    pre-set-up page, optional auto-discover pass, evaluateHealth, logs pass/fail with
+    coreRates + failingCore + hint). Re-exports pure helpers from extract.js to avoid
+    circular require.
+  - debug-dump.js: DEFAULT_DUMP_THRESHOLD_PCT=80, shouldDumpForField (pure, respects
+    enabled flag + threshold), buildDumpPath (sanitizes field name + ISO timestamp),
+    buildDumpContent (HTML comment header + 500-char card snippets), dumpSelectorDebug
+    (mkdirSync recursive + writeFileSync, returns path or null).
+  - index.js: barrel export for all 5 modules.
+- Modified src/extract.js: added CORE_FIELDS (name/rating/reviews_count/address),
+  SECONDARY_FIELDS, SELECTOR_FAILURE_EXIT_CODE=3, CORE_THRESHOLD_PCT=50,
+  SECONDARY_THRESHOLD_PCT=30, DEFAULT_MIN_SAMPLE_SIZE=10, evaluateHealth (pure,
+  skips when sample < minSampleSize), isCriticalFailure, buildSelectorFailureError
+  (sets code=SELECTOR_FAILURE + exitCode=3 + health), checkExtractionRatesForAbort
+  (throws on critical failure), getCardSnippets (page.evaluate fetching innerHTML
+  for specific card indexes). Wired extractBusinesses with ctx.selectors — autoDiscover
+  (default on, try/catch non-fatal, passes normalizers for raw→canonical conversion),
+  abortCheck (default off, opt-in via index.js), debugDump (default on, iterates
+  CORE+SECONDARY fields, dumps when rate < threshold via getCardSnippets + dumpSelectorDebug).
+- Modified src/config.js: added --skipHealthCheck, --autoDiscover on|off,
+  --selectorDebugDump on|off, --maxSelectorAge N, --selectorDebugDir <path> CLI flags
+  + SKIP_HEALTH_CHECK/AUTO_DISCOVER/SELECTOR_DEBUG_DUMP/MAX_SELECTOR_AGE/SELECTOR_DEBUG_DIR/
+  HEALTH_CHECK_FIXTURE env vars. Added cfg.selectors section with skipHealthCheck/
+  autoDiscover/selectorDebugDump/maxSelectorAge/debugDumpDir/healthCheckFixture/resolved.
+  Added validation (autoDiscover/selectorDebugDump must be boolean, maxSelectorAge 1-365).
+  Updated HELP_TEXT with Phase 2.11 section.
+- Modified src/index.js: added fs + selectors imports. logSelectorVersion at startup
+  with maxAgeDays=cfg.selectors.maxSelectorAge. Startup health check in separate
+  withBrowser call before main pipeline — loads fixture, runs healthCheck, throws
+  SELECTOR_FAILURE on !ok, non-fatal on browser/fixture errors. cfg.selectors.resolved
+  = {ran, ok, rates, elapsedMs, failingCore, failingSecondary}. SELECTOR_FAILURE catch
+  branch in outer try/catch — exits with SELECTOR_FAILURE_EXIT_CODE [3] + logs failing
+  fields + hint. ctx.selectors passed to all 3 extractBusinesses calls (sequential +
+  pool + queue) with autoDiscover/abortCheck:true/debugDump/debugDumpDir. Selectors
+  stats in run summary.
+- Wrote tests/selectors-health.test.js (69 tests / 210 assertions):
+  - version.js (11 tests): SELECTOR_VERSIONS shape, parseDate valid/invalid, getSelectorAgeDays
+    today/N-days/unknown/future, isSelectorSetStale fresh/old, getSelectorStatus,
+    logSelectorVersion with/without .phase() + stale warning.
+  - auto-discover.js pure (9 tests): DISCOVERABLE_FIELDS, buildDiscoveryRequests
+    empty/populated/non-discoverable, applyDiscoveryResults fill/override/empty/non-
+    canonical-tags/tagDiscovered/out-of-range.
+  - auto-discover.js page-bound (9 tests): discoverField phone/website/rating/
+    reviews_count/non-discoverable/out-of-range, discoverMissingFields empty/batch/logging.
+  - health-check.js pure (11 tests): CORE_FIELDS/SECONDARY_FIELDS/exit code/thresholds,
+    evaluateHealth high/low/small-sample/secondary, isCriticalFailure, buildSelectorFailureError,
+    checkExtractionRatesForAbort throw/no-throw/small-sample.
+  - health-check.js page-bound (4 tests): healthCheck passes on healthy fixture, fails on
+    broken fixture, fails when core rates low, runs auto-discover.
+  - debug-dump.js (9 tests): threshold, shouldDumpForField true/false/disabled/null,
+    buildDumpPath timestamp/sanitize, buildDumpContent fields/truncate, dumpSelectorDebug
+    writes/empty/filesystem-error.
+  - extract.js re-exports (5 tests): exports, evaluateHealth matches, getCardSnippets
+    indexes/empty/out-of-range.
+  - extractBusinesses integration (4 tests): fills via auto-discover, skips when disabled,
+    throws on critical rates, writes debug dumps.
+- Wrote tests/selectors-fixture.test.js (45 tests / 120 assertions): 3 fixtures × 15
+  assertions each — fixture loads + extracts ≥1, stats include discovery, 4 core fields
+  ≥70%, 8 secondary fields ≥15% (with sparse overrides for plus_code/price_level/phone/
+  website/open_now), full rate summary logged. Catches selector breakage before production.
+- Added 22 Phase 2.11 config tests to tests/config.test.js: cfg.selectors section exists,
+  defaults, --skipHealthCheck, --autoDiscover on/off, --selectorDebugDump off, --maxSelectorAge,
+  --selectorDebugDir, healthCheckFixture, env vars (AUTO_DISCOVER/SKIP_HEALTH_CHECK/
+  HEALTH_CHECK/MAX_SELECTOR_AGE), validation (0/366/365 boundary), HELP_TEXT coverage.
+- Updated .env.example: expanded Phase 2.11 section (HEALTH_CHECK, AUTO_DISCOVER,
+  SELECTOR_DEBUG_DUMP, MAX_SELECTOR_AGE, SELECTOR_DEBUG_DIR, HEALTH_CHECK_FIXTURE,
+  SKIP_HEALTH_CHECK) with explanatory comments.
+- Updated SELECTORS.md: added "Self-healing selectors (Phase 2.11)" section documenting
+  the 5 layers (versioning, startup health check, first-batch abort, auto-discovery,
+  debug dumps), config flags table, and how-to-update-selectors guide.
+- Updated package.json: version 1.0.0-phase2.10 → 1.0.0-phase2.11, syntax script includes
+  src/selectors/*.js, deduplicated the two syntax keys (was a bug from a previous phase).
+- Updated PHASE2_EXECUTION_PLAN.md: status summary (12 of 13 shipped), Phase 2.11 row
+  marked ✅ DONE with full Shipped block, task checklist + acceptance criteria all [x].
+
+Stage Summary:
+- Phase 2.11 fully implemented. 1326 tests / 8079 assertions passing (was 1190/7720).
+- 136 new tests (69 selectors-health + 45 selectors-fixture + 22 config).
+- 5-layer self-healing selector defense: version registry + staleness warning (30d default),
+  startup health check (loads fixture, aborts if core <50%), first-batch abort (after 10
+  businesses, exit code 3), heuristic auto-discovery (phone/website/rating/reviews_count
+  via pattern + aria-label proximity, raw→canonical normalization), debug dumps (500-char
+  card innerHTML to data/selector-debug/{field}_{timestamp}.html when rate <80%).
+- Architecture: pure helpers (evaluateHealth, checkExtractionRatesForAbort, CORE_FIELDS,
+  SECONDARY_FIELDS) live in extract.js to avoid circular require with health-check.js.
+  health-check.js re-exports them + adds the page-bound healthCheck wrapper.
+  auto-discover.js is self-contained (DISCOVERY_SCRIPT inlined into page.evaluate via
+  new Function()). debug-dump.js is pure + filesystem.
+- All 8 task-checklist items shipped + all 6 acceptance criteria met.
+- Only Phase 2.12 (Incremental Scraping & Detail Caching) and Phase 2.13 (Final
+  Integration, Docs & Handoff) remain.
