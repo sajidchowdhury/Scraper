@@ -4,15 +4,21 @@ node_modules/
 # Environment variables
 .env
 .env.*
+!.env.example
 
-# Logs
-logs/
+# Output data (keep the directory, ignore its contents)
+data/*
+!data/.gitkeep
+
+# Logs (keep the directory, ignore its contents)
+logs/*
+!logs/.gitkeep
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Output files
+# Other generated artifacts
 output/
 downloads/
 screenshots/
@@ -30,6 +36,7 @@ test-results/
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Temporary files
 *.tmp

@@ -1,13 +1,25 @@
 {
   "name": "googlemapsscraper",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "A Google Maps business scraper that exports CSVs of business data.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
+    "start": "node src/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "scraper",
+    "google-maps",
+    "playwright",
+    "csv",
+    "lead-generation",
+    "business-data"
+  ],
+  "author": "sajid",
   "license": "ISC",
   "dependencies": {
     "axios": "^1.19.0",
