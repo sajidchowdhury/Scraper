@@ -1,0 +1,877 @@
+'use strict';
+
+/**
+ * src/detail.js — Phase 1.5 — Detail-Page Deep Scrape (Optional)
+ *
+ * Clicks into each business's detail panel to fetch fields not visible in the
+ * list view, then returns to the results list. Toggleable via cfg.deepScrape.
+ *
+ * Detail fields (added to each business record when deepScrape is on):
+ *   full_hours       — structured per-day opening hours [{day, hours}, ...]
+ *   popular_times    — busyness histogram [{day, busy:[0..23]}, ...]  (noisy)
+ *   top_reviews      — top N reviews [{author, rating, text, date}, ...]
+ *   photos           — first N photo URLs [url, ...]
+ *   reservation_url  — reservation link (OpenTable / Resy / etc.) | null
+ *   menu_url         — menu link (restaurants) | null
+ *   social_profiles  — [{platform, url}, ...]  (Instagram / Facebook / etc.)
+ *   detail_scraped   — boolean (true if detail load succeeded)
+ *
+ * Design rules (per Phase 1.5 spec):
+ *   - Toggleable: --deepScrape true|false, default false (keep runs fast)
+ *   - Per-detail randomized delay (1-3s default) to avoid hammering Google
+ *   - Per-business failure isolation: a failed detail load logs + continues;
+ *     that business keeps its list-view fields with null detail fields
+ *   - Detail-scrape success rate tracked + logged
+ *   - Adds ~2-4s per business (measurable in logs)
+ *
+ * Functions accept injectable openFn/extractFn/backFn for unit testing
+ * without a real browser (DI pattern, matching src/scroll.js).
+ */
+
+// ---------------------------------------------------------------------------
+// Detail field schema (exported for CSV column order in Phase 1.6)
+// ---------------------------------------------------------------------------
+
+const DETAIL_FIELDS = [
+  'full_hours',
+  'popular_times',
+  'top_reviews',
+  'photos',
+  'reservation_url',
+  'menu_url',
+  'social_profiles',
+  'detail_scraped',
+];
+
+// Fields a business record has when deepScrape is OFF — all null/false so the
+// CSV column order is stable whether or not detail scraping ran.
+const EMPTY_DETAIL = {
+  full_hours: null,
+  popular_times: null,
+  top_reviews: [],
+  photos: [],
+  reservation_url: null,
+  menu_url: null,
+  social_profiles: [],
+  detail_scraped: false,
+};
+
+// ---------------------------------------------------------------------------
+// In-browser selector list. Google changes the DOM often, so each field has
+// 2-4 candidate selectors tried in order.
+// ---------------------------------------------------------------------------
+
+const DETAIL_SELECTORS = {
+  // The detail panel container. Modern Maps uses an aria-label="Place info"
+  // or a div[role="region"] that wraps the place details.
+  panel: [
+    'div[role="region"][aria-label*="info"]',
+    'div[aria-label*="Place"]',
+    'div.bAPzgb',
+    '[role="main"] [role="region"]',
+  ],
+  // Hours table — Google renders a <table> with rows per day, OR a set of
+  // div rows. We support both.
+  hoursTable: [
+    'table[aria-label*="Hours"]',
+    'table.y0bXy',
+    'div[aria-label*="Hours table"]',
+  ],
+  hoursRow: [
+    'table[aria-label*="Hours"] tr',
+    'table.y0Xkzf tr',
+    'div[role="row"]',
+  ],
+  // Popular times — the busyness bar chart. Each bar has aria-label like
+  // "Currently not busy" / "Usually busy at 3 PM" / a day-name header.
+  popularTimesBar: [
+    'div[role="img"][aria-label*="busy"]',
+    'div[aria-label*="Popular times"] div[role="img"]',
+    'div.HFt63e', // legacy class
+  ],
+  popularTimesDay: [
+    'div[aria-label*="Popular times"] button',
+  ],
+  // Reviews
+  reviewBlock: [
+    'div[data-review-id]',
+    'div.jJc9Ad', // modern review container class
+    'div[jsaction*="review"]',
+  ],
+  // Photos — thumbnails in the photo carousel/grid
+  photoImg: [
+    'button[jsaction*="photo"] img',
+    'div[jsaction*="photo"] img',
+    'img[data-src]',
+    'img.KmsPWd',
+  ],
+  // Reservation / menu / order links — Maps renders these as action buttons
+  // with data-item-id containing the action type.
+  reservationLink: [
+    'a[data-item-id*="reservation"]',
+    'a[aria-label*="Reserve"]',
+    'a[aria-label*="reservation"]',
+    'a[href*="opentable.com"], a[href*="resy.com"], a[href*="booking.com"]',
+  ],
+  menuLink: [
+    'a[data-item-id*="menu"]',
+    'a[aria-label*="Menu"]',
+    'button[aria-label*="Menu"]',
+  ],
+  // Social profiles — Instagram / Facebook / X / etc. links in the action bar
+  socialLinks: [
+    'a[data-item-id*="authority"]', // generic website authority
+    'a[href*="instagram.com"]',
+    'a[href*="facebook.com"]',
+    'a[href*="twitter.com"], a[href*="x.com"]',
+    'a[href*="linkedin.com"]',
+    'a[href*="youtube.com"]',
+  ],
+};
+
+// ---------------------------------------------------------------------------
+// Small DOM helpers (in-browser)
+// ---------------------------------------------------------------------------
+
+function pick(scope, list) {
+  for (const s of list) {
+    try {
+      const el = scope.querySelector(s);
+      if (el) return el;
+    } catch {
+      /* invalid selector for this scope — try next */
+    }
+  }
+  return null;
+}
+
+function textOrEmpty(el) {
+  if (!el) return '';
+  return (el.innerText || el.textContent || '').trim();
+}
+
+// ---------------------------------------------------------------------------
+// Field parsers (pure functions — exported for unit testing)
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a 7-day hours table into structured form.
+ * Input: array of { day: string, text: string } rows extracted from DOM.
+ * Output: [{ day, hours }, ...] with hours normalized.
+ *   - "Closed" stays "Closed"
+ *   - "9:00 AM – 5:00 PM" stays as-is
+ *   - Empty → null
+ *
+ * Google's day labels are localized; we normalize the English ones and pass
+ * others through verbatim (Phase 3 will add full i18n).
+ */
+const DAY_ALIASES = {
+  monday: 'Monday',
+  mon: 'Monday',
+  tuesday: 'Tuesday',
+  tue: 'Tuesday',
+  tues: 'Tuesday',
+  wednesday: 'Wednesday',
+  wed: 'Wednesday',
+  weds: 'Wednesday',
+  thursday: 'Thursday',
+  thu: 'Thursday',
+  thur: 'Thursday',
+  thurs: 'Thursday',
+  friday: 'Friday',
+  fri: 'Friday',
+  saturday: 'Saturday',
+  sat: 'Saturday',
+  sunday: 'Sunday',
+  sun: 'Sunday',
+};
+
+function normalizeDay(raw) {
+  if (!raw) return null;
+  const lower = String(raw).trim().toLowerCase().replace(/\.+$/, '');
+  return DAY_ALIASES[lower] || String(raw).trim();
+}
+
+function parseHoursTable(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const out = [];
+  for (const { day, text } of rows) {
+    if (!day && !text) continue;
+    const hours = text ? String(text).trim() : null;
+    if (!hours) continue;
+    out.push({ day: normalizeDay(day) || day, hours });
+  }
+  return out.length > 0 ? out : null;
+}
+
+/**
+ * Parse popular-times bars into a per-day busyness histogram.
+ * Input: array of { day, bars: [{ label, hour }] }
+ *   - label: aria-label text like "Usually busy at 3 PM" or "Not busy"
+ *   - hour: inferred hour 0-23 (parsed from label, or index)
+ * Output: [{ day, busy: [{hour, level}, ...] }, ...]
+ *   - level: 0-4 (not busy → very busy), parsed from label keywords
+ *
+ * This is inherently noisy — Google's popular-times labels are freeform text.
+ * We extract a best-effort 0-4 busyness level per hour.
+ */
+const BUSY_KEYWORDS = [
+  { re: /(usually|currently)?\s*(very|extremely)\s*(busy|busy)/i, level: 4 },
+  { re: /(usually|currently)\s*busy/i, level: 3 },
+  { re: /(usually|currently)\s*(a little|slightly)\s*busy/i, level: 2 },
+  { re: /(usually|currently)\s*not\s*(as|too)\s*busy/i, level: 2 },
+  { re: /(usually|currently)\s*not\s*busy/i, level: 1 },
+  { re: /not\s*busy/i, level: 1 },
+];
+
+function parseBusyLevel(label) {
+  if (!label) return 0;
+  const s = String(label);
+  for (const { re, level } of BUSY_KEYWORDS) {
+    if (re.test(s)) return level;
+  }
+  return 0;
+}
+
+function parseHourFromLabel(label) {
+  if (!label) return null;
+  const m = String(label).match(/(\d{1,2})\s*(AM|PM)/i);
+  if (!m) return null;
+  let h = parseInt(m[1], 10);
+  const meridiem = m[2].toUpperCase();
+  if (meridiem === 'PM' && h !== 12) h += 12;
+  if (meridiem === 'AM' && h === 12) h = 0;
+  return h;
+}
+
+function parsePopularTimes(dayEntries) {
+  if (!Array.isArray(dayEntries) || dayEntries.length === 0) return null;
+  const out = [];
+  for (const { day, bars } of dayEntries) {
+    if (!bars || bars.length === 0) continue;
+    const nd = normalizeDay(day) || day;
+    // For each bar, prefer an explicit hour; otherwise parse the hour from the
+    // bar's aria-label (e.g. "Usually busy at 9 AM" → 9); fall back to the
+    // bar's positional index so we always have a sortable 0-23 value.
+    const busy = bars.map((b, i) => {
+      const parsedHour = parseHourFromLabel(b.label);
+      return {
+        hour: b.hour != null ? b.hour : parsedHour != null ? parsedHour : i,
+        level: parseBusyLevel(b.label),
+        label: b.label || null,
+      };
+    });
+    out.push({ day: nd, busy });
+  }
+  return out.length > 0 ? out : null;
+}
+
+/**
+ * Parse a raw review DOM extraction into a normalized review object.
+ * Input: { author, ratingRaw, text, dateRaw }
+ * Output: { author, rating, text, date } with rating as float|null
+ */
+function parseReview(raw) {
+  if (!raw) return null;
+  let rating = null;
+  if (raw.ratingRaw) {
+    const m = String(raw.ratingRaw).match(/(\d+(?:\.\d+)?)/);
+    if (m) {
+      const v = parseFloat(m[1]);
+      if (Number.isFinite(v) && v >= 0 && v <= 5) rating = v;
+    }
+  }
+  const text = raw.text ? String(raw.text).trim() : null;
+  const author = raw.author ? String(raw.author).trim() : null;
+  const date = raw.dateRaw ? String(raw.dateRaw).trim() : null;
+  // Drop reviews with no text AND no author (essentially empty)
+  if (!text && !author && rating === null) return null;
+  return { author, rating, text, date };
+}
+
+/**
+ * Classify a social-profile URL into a platform name.
+ * Returns 'instagram' | 'facebook' | 'twitter' | 'linkedin' | 'youtube' |
+ *         'website' | 'other'.
+ */
+function classifySocialUrl(url) {
+  if (!url) return 'other';
+  const u = String(url).toLowerCase();
+  if (u.includes('instagram.com')) return 'instagram';
+  if (u.includes('facebook.com') || u.includes('fb.com')) return 'facebook';
+  if (u.includes('twitter.com') || u.includes('x.com')) return 'twitter';
+  if (u.includes('linkedin.com')) return 'linkedin';
+  if (u.includes('youtube.com') || u.includes('youtu.be')) return 'youtube';
+  return 'other';
+}
+
+function parseSocialProfiles(urls, opts = {}) {
+  if (!Array.isArray(urls)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const url of urls) {
+    if (!url) continue;
+    let clean = url;
+    try {
+      const u = new URL(url);
+      ['utm_source', 'utm_medium', 'utm_campaign', 'gclid', 'fbclid'].forEach((k) =>
+        u.searchParams.delete(k),
+      );
+      clean = u.toString();
+    } catch {
+      /* keep raw */
+    }
+    if (seen.has(clean)) continue;
+    seen.add(clean);
+    out.push({ platform: classifySocialUrl(clean), url: clean });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// In-browser raw extractor. Runs as page.evaluate to avoid round-trips.
+// Returns the raw detail fields; normalization happens in Node afterwards.
+// ---------------------------------------------------------------------------
+
+async function extractDetailFromPage(page, opts = {}) {
+  const maxReviews = opts.maxReviews ?? 5;
+  const maxPhotos = opts.maxPhotos ?? 5;
+
+  return page.evaluate(
+    (args) => {
+      const { selectorsJson, maxReviews, maxPhotos } = args;
+      const SEL = JSON.parse(selectorsJson);
+
+      function pickScope(scope, list) {
+        for (const s of list) {
+          try {
+            const el = scope.querySelector(s);
+            if (el) return el;
+          } catch {
+            /* try next */
+          }
+        }
+        return null;
+      }
+
+      // Detail panel is the main content region. Fall back to document.
+      const panel =
+        pickScope(document, SEL.panel) || document.querySelector('[role="main"]') || document;
+
+      // --- Hours table ---------------------------------------------------
+      let hoursRows = [];
+      const hoursTable = pickScope(panel, SEL.hoursTable);
+      const rowCandidates = hoursTable
+        ? Array.from(hoursTable.querySelectorAll('tr'))
+        : Array.from(panel.querySelectorAll(SEL.hoursRow.join(',')));
+      for (const tr of rowCandidates) {
+        const cells = Array.from(tr.querySelectorAll('td, th, div'));
+        if (cells.length < 2) continue;
+        const day = (cells[0].innerText || '').trim();
+        const text = (cells[1].innerText || '').trim();
+        if (day) hoursRows.push({ day, text });
+      }
+      // Some layouts hide hours behind a "Hours" button — skip those; the
+      // visible table is what we want.
+
+      // --- Popular times -------------------------------------------------
+      let popularDayEntries = [];
+      // Google renders popular times as a row of bars per day. The whole chart
+      // is often under one container; bars carry aria-labels like
+      // "Usually busy at 3 PM". We bucket by day header if present.
+      const ptContainer = panel.querySelector('[aria-label*="Popular times"], div.HFt63e');
+      if (ptContainer) {
+        // Try per-day buttons (newer layout): each <button> = one day column
+        const dayButtons = Array.from(ptContainer.querySelectorAll('button'));
+        if (dayButtons.length > 0) {
+          for (const btn of dayButtons) {
+            const dayLabel = (btn.getAttribute('aria-label') || '').trim();
+            const bars = Array.from(btn.querySelectorAll('div[role="img"], div[aria-label]'))
+              .map((b) => ({
+                label: b.getAttribute('aria-label') || b.getAttribute('title') || '',
+              }))
+              .filter((b) => b.label);
+            if (bars.length) {
+              popularDayEntries.push({ day: dayLabel, bars });
+            }
+          }
+        } else {
+          // Single-day "currently" chart: bars directly under container
+          const bars = Array.from(ptContainer.querySelectorAll('div[role="img"], div[aria-label]'))
+            .map((b) => ({
+              label: b.getAttribute('aria-label') || b.getAttribute('title') || '',
+            }))
+            .filter((b) => b.label);
+          if (bars.length) {
+            popularDayEntries.push({ day: 'Today', bars });
+          }
+        }
+      }
+
+      // --- Reviews -------------------------------------------------------
+      const reviewEls = Array.from(panel.querySelectorAll(SEL.reviewBlock.join(',')));
+      const topReviews = reviewEls.slice(0, maxReviews).map((el) => {
+        // Author: typically a span/button with the reviewer's name
+        const authorEl =
+          el.querySelector('[class*="d2r"] button, .d4r55') ||
+          el.querySelector('button[data-href*="contrib"]') ||
+          el.querySelector('a[href*="contrib"]');
+        const author = authorEl ? (authorEl.innerText || authorEl.textContent || '').trim() : null;
+
+        // Rating: aria-label like "4 stars" or a star icon
+        const ratingEl = el.querySelector('[role="img"][aria-label*="star"], span[aria-label*="star"]');
+        const ratingRaw = ratingEl ? ratingEl.getAttribute('aria-label') || '' : '';
+
+        // Text: the review body — Google uses a <span> with class containing "wiI7pd"
+        const textEl =
+          el.querySelector('span.wiI7pd, [class*="review-text"], div[jsaction*="review"] span') ||
+          el.querySelector('span');
+        const text = textEl ? (textEl.innerText || '').trim() : null;
+
+        // Date: usually a span with class "rsqaWe" or similar
+        const dateEl = el.querySelector('span.rsqaWe, [class*="date"], span:last-of-type');
+        const dateRaw = dateEl ? (dateEl.innerText || '').trim() : null;
+
+        return { author, ratingRaw, text, dateRaw };
+      });
+
+      // --- Photos --------------------------------------------------------
+      const photoEls = Array.from(panel.querySelectorAll(SEL.photoImg.join(',')));
+      const photos = photoEls
+        .slice(0, maxPhotos)
+        .map((img) => img.getAttribute('src') || img.getAttribute('data-src') || '')
+        .filter(Boolean);
+
+      // --- Reservation / Menu -------------------------------------------
+      const resEl = pickScope(panel, SEL.reservationLink);
+      const reservation_url = resEl ? resEl.getAttribute('href') : null;
+
+      const menuEl = pickScope(panel, SEL.menuLink);
+      const menu_url = menuEl
+        ? menuEl.getAttribute('href') ||
+          menuEl.getAttribute('data-url') ||
+          (menuEl.tagName === 'BUTTON' ? null : null)
+        : null;
+
+      // --- Social profiles ----------------------------------------------
+      // Collect all candidate social/website link hrefs, dedupe by URL.
+      const socialHrefs = [];
+      const seenHref = new Set();
+      for (const sel of SEL.socialLinks) {
+        try {
+          const els = panel.querySelectorAll(sel);
+          for (const a of els) {
+            const href = a.getAttribute('href');
+            if (!href || seenHref.has(href)) continue;
+            seenHref.add(href);
+            socialHrefs.push(href);
+          }
+        } catch {
+          /* invalid selector */
+        }
+      }
+
+      return {
+        hoursRows,
+        popularDayEntries,
+        topReviews,
+        photos,
+        reservation_url,
+        menu_url,
+        socialHrefs,
+      };
+    },
+    { selectorsJson: JSON.stringify(DETAIL_SELECTORS), maxReviews, maxPhotos },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Normalize raw detail extraction into canonical detail-field shape
+// ---------------------------------------------------------------------------
+
+function normalizeDetail(raw, opts = {}) {
+  // normalizeDetail is the SUCCESS-path normalizer — if we're calling it, the
+  // detail panel loaded and we extracted *something* (even if all fields are
+  // empty). The failure path in deepScrapeDetails returns EMPTY_DETAIL
+  // (detail_scraped: false) directly without calling this function.
+  if (!raw) return { ...EMPTY_DETAIL, detail_scraped: true };
+  return {
+    full_hours: parseHoursTable(raw.hoursRows),
+    popular_times: parsePopularTimes(raw.popularDayEntries),
+    top_reviews: (raw.topReviews || [])
+      .map(parseReview)
+      .filter((r) => r !== null),
+    photos: Array.isArray(raw.photos) ? raw.photos.slice(0, opts.maxPhotos ?? 5) : [],
+    reservation_url: raw.reservation_url || null,
+    menu_url: raw.menu_url || null,
+    social_profiles: parseSocialProfiles(raw.socialHrefs, opts),
+    detail_scraped: true,
+  };
+}
+
+/**
+ * Merge detail fields into a list-view business record.
+ * Returns a NEW object (does not mutate input).
+ */
+function mergeDetailFields(business, detail) {
+  const safeDetail = detail || EMPTY_DETAIL;
+  return {
+    ...business,
+    full_hours: safeDetail.full_hours ?? null,
+    popular_times: safeDetail.popular_times ?? null,
+    top_reviews: safeDetail.top_reviews ?? [],
+    photos: safeDetail.photos ?? [],
+    reservation_url: safeDetail.reservation_url ?? null,
+    menu_url: safeDetail.menu_url ?? null,
+    social_profiles: safeDetail.social_profiles ?? [],
+    detail_scraped: !!safeDetail.detail_scraped,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Core deep-scrape loop — DI version (testable without a real browser)
+// ---------------------------------------------------------------------------
+
+/**
+ * Deep-scrape a single business's detail panel.
+ *
+ * @param {object} opts
+ * @param {object} opts.business          - the list-view record (needs maps_url or href)
+ * @param {() => Promise<boolean>} opts.openFn  - open the detail panel; resolve false if open failed
+ * @param {() => Promise<object>} opts.extractFn - extract raw detail fields from the now-loaded panel
+ * @param {() => Promise<void>} opts.backFn    - return to the results list
+ * @param {number} opts.delayMinMs        - min randomized delay after open
+ * @param {number} opts.delayMaxMs        - max randomized delay after open
+ * @param {number} opts.timeoutMs         - hard cap for the whole detail scrape of one business
+ * @param {object} opts.logger
+ * @returns {Promise<{ detail, ok, elapsedMs, error }>}
+ */
+async function deepScrapeDetails({
+  business,
+  openFn,
+  extractFn,
+  backFn,
+  delayMinMs = 1000,
+  delayMaxMs = 3000,
+  timeoutMs = 15000,
+  logger = { info() {}, debug() {}, warn() {}, error() {} },
+}) {
+  const startedAt = Date.now();
+  const name = business && business.name ? business.name : '(unknown)';
+
+  // Race the whole detail scrape against a hard timeout. If we hit it, we
+  // still try to go back so the next business isn't stranded on a bad panel.
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+  }, timeoutMs);
+
+  try {
+    logger.debug('Opening detail panel', { business: name });
+    const opened = await openFn();
+    if (timedOut) throw new Error(`detail-scrape timeout (${timeoutMs}ms) before open completed`);
+    if (!opened) {
+      logger.warn('Detail panel did not open', { business: name });
+      return {
+        detail: { ...EMPTY_DETAIL },
+        ok: false,
+        elapsedMs: Date.now() - startedAt,
+        error: 'open_failed',
+      };
+    }
+
+    // Randomized inter-detail delay — avoids a metronomic request pattern
+    const delay = delayMinMs + Math.floor(Math.random() * Math.max(0, delayMaxMs - delayMinMs));
+    await sleep(delay);
+
+    if (timedOut) throw new Error(`detail-scrape timeout (${timeoutMs}ms) during delay`);
+    const raw = await extractFn();
+    if (timedOut) throw new Error(`detail-scrape timeout (${timeoutMs}ms) during extract`);
+
+    const detail = normalizeDetail(raw);
+    logger.debug('Detail panel scraped', {
+      business: name,
+      reviews: (detail.top_reviews || []).length,
+      photos: (detail.photos || []).length,
+      hours: detail.full_hours ? detail.full_hours.length : 0,
+      elapsedMs: Date.now() - startedAt,
+    });
+
+    return {
+      detail,
+      ok: true,
+      elapsedMs: Date.now() - startedAt,
+      error: null,
+    };
+  } catch (err) {
+    logger.warn('Detail scrape failed for business — continuing', {
+      business: name,
+      error: err.message,
+    });
+    return {
+      detail: { ...EMPTY_DETAIL },
+      ok: false,
+      elapsedMs: Date.now() - startedAt,
+      error: err.message || 'unknown',
+    };
+  } finally {
+    clearTimeout(timer);
+    // Always attempt to return to the list, even on failure. Swallow errors
+    // here — a stranded panel on one business must not crash the run.
+    if (backFn) {
+      try {
+        await backFn();
+      } catch (err) {
+        logger.debug('backFn failed (non-fatal)', { business: name, error: err.message });
+      }
+    }
+  }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Production wrapper: wires real page-based open/extract/back functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Open the detail panel for a business by clicking its place link in the
+ * results list. The place link is identified by href matching the business's
+ * maps_url (or the first place anchor if no match).
+ *
+ * @returns {Promise<boolean>} true if a panel-open signal was detected
+ */
+async function openDetailPanelOnPage(page, business, { logger }) {
+  const targetHref = business && business.maps_url ? business.maps_url : null;
+
+  // Find the matching place anchor in the current results list
+  const anchorSelector = targetHref
+    ? `a[href*="${cssEscapeHref(targetHref)}"]`
+    : 'a[href*="/maps/place/"]';
+
+  let anchor;
+  try {
+    anchor = await page.$(anchorSelector).catch(() => null);
+  } catch {
+    anchor = null;
+  }
+  if (!anchor) {
+    // Fallback: any place anchor
+    anchor = await page.$('a[href*="/maps/place/"]').catch(() => null);
+  }
+  if (!anchor) {
+    return false;
+  }
+
+  try {
+    await anchor.click({ timeout: 8000 });
+  } catch (err) {
+    logger.debug('click on place anchor failed', { error: err.message });
+    return false;
+  }
+
+  // Wait for the detail panel to appear. The panel region replaces or
+  // supplements the list. We look for either the region element or a
+  // secondary place-title heading.
+  try {
+    await page.waitForSelector(
+      [
+        'div[role="region"][aria-label*="info"]',
+        'div[aria-label*="Place"]',
+        'h1[data-attrid="title"]',
+        'button[aria-label*="Back"]',
+      ].join(', '),
+      { timeout: 12000 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Return to the results list from an open detail panel.
+ * Strategy: click the browser-style Back button if present, else hit the
+ * browser back navigation. Swallow all errors — caller also has a try/catch.
+ */
+async function backToListOnPage(page, { logger }) {
+  // Try the in-Maps Back button first
+  try {
+    const backBtn = await page
+      .$('button[aria-label*="Back"], button[jsaction*="backToList"]')
+      .catch(() => null);
+    if (backBtn) {
+      await backBtn.click({ timeout: 5000 });
+      // Give the list a moment to restore
+      await sleep(400);
+      return;
+    }
+  } catch (err) {
+    logger.debug('in-Maps back button failed, falling back to nav.back', {
+      error: err.message,
+    });
+  }
+  // Fallback: browser back
+  try {
+    await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 });
+  } catch (err) {
+    logger.debug('page.goBack failed', { error: err.message });
+  }
+}
+
+/**
+ * Production wrapper for deepScrapeDetails using a real Playwright page.
+ */
+async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
+  const detailCfg = (cfg && cfg.detail) || {};
+  return deepScrapeDetails({
+    business,
+    openFn: () => openDetailPanelOnPage(page, business, { logger }),
+    extractFn: () =>
+      extractDetailFromPage(page, {
+        maxReviews: detailCfg.maxReviews ?? 5,
+        maxPhotos: detailCfg.maxPhotos ?? 5,
+      }),
+    backFn: () => backToListOnPage(page, { logger }),
+    delayMinMs: detailCfg.delayMinMs ?? 1000,
+    delayMaxMs: detailCfg.delayMaxMs ?? 3000,
+    timeoutMs: detailCfg.timeoutMs ?? 15000,
+    logger,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Batch deep-scrape over all businesses with success-rate tracking
+// ---------------------------------------------------------------------------
+
+/**
+ * Deep-scrape every business in `businesses`, merging detail fields in place.
+ *
+ * @param {import('playwright').Page} page
+ * @param {Array} businesses    - list-view records (mutated: detail fields merged in)
+ * @param {object} cfg          - runtime config (uses cfg.detail + cfg.deepScrapeSampleStep)
+ * @param {object} logger
+ * @returns {Promise<{ successRate, attempted, succeeded, failed, durations }>}
+ */
+async function deepScrapeAll(page, businesses, cfg, logger) {
+  const detailCfg = (cfg && cfg.detail) || {};
+  const sampleStep = detailCfg.sampleStep ?? 1; // 1 = every business; 5 = every 5th (QA mode)
+
+  let attempted = 0;
+  let succeeded = 0;
+  let failed = 0;
+  const durations = [];
+  const errors = {};
+
+  logger.info('Deep-scrape started', {
+    total: businesses.length,
+    sampleStep,
+    delayRangeMs: [detailCfg.delayMinMs ?? 1000, detailCfg.delayMaxMs ?? 3000],
+  });
+
+  for (let i = 0; i < businesses.length; i++) {
+    if (sampleStep > 1 && i % sampleStep !== 0) {
+      // Not in sample — leave EMPTY_DETAIL on this record
+      businesses[i] = mergeDetailFields(businesses[i], EMPTY_DETAIL);
+      continue;
+    }
+    attempted++;
+    const b = businesses[i];
+    const res = await deepScrapeDetailsOnPage(page, b, cfg, logger);
+    durations.push(res.elapsedMs);
+    businesses[i] = mergeDetailFields(b, res.detail);
+    if (res.ok) {
+      succeeded++;
+    } else {
+      failed++;
+      const errKey = res.error || 'unknown';
+      errors[errKey] = (errors[errKey] || 0) + 1;
+    }
+
+    // Progress log every 10 details
+    if (attempted % 10 === 0) {
+      logger.info('Deep-scrape progress', {
+        attempted,
+        succeeded,
+        failed,
+        remaining: businesses.length - i - 1,
+      });
+    }
+  }
+
+  const successRate = attempted === 0 ? 0 : Math.round((succeeded / attempted) * 1000) / 10;
+  const avgMs = durations.length === 0 ? 0 : Math.round(durations.reduce((a, b) => a + b, 0) / durations.length);
+  const maxMs = durations.length === 0 ? 0 : Math.max(...durations);
+  const minMs = durations.length === 0 ? 0 : Math.min(...durations);
+
+  logger.info('Deep-scrape complete', {
+    attempted,
+    succeeded,
+    failed,
+    successRate: `${successRate}%`,
+    avgMs,
+    minMs,
+    maxMs,
+    errors,
+  });
+
+  if (successRate < 80) {
+    logger.warn('Deep-scrape success rate below 80% threshold', { successRate: `${successRate}%` });
+  }
+
+  return {
+    successRate,
+    attempted,
+    succeeded,
+    failed,
+    durations,
+    avgMs,
+    minMs,
+    maxMs,
+    errors,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Escape a URL/href so it's safe to embed inside a CSS attribute selector.
+ * CSS attribute values are quoted; we escape quotes and backslashes.
+ */
+function cssEscapeHref(href) {
+  return String(href || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+// ---------------------------------------------------------------------------
+// Exports
+// ---------------------------------------------------------------------------
+
+module.exports = {
+  DETAIL_FIELDS,
+  EMPTY_DETAIL,
+  DETAIL_SELECTORS,
+  // Parsers (exported for unit testing)
+  normalizeDay,
+  parseHoursTable,
+  parsePopularTimes,
+  parseBusyLevel,
+  parseHourFromLabel,
+  parseReview,
+  parseSocialProfiles,
+  classifySocialUrl,
+  // Core extractor
+  extractDetailFromPage,
+  normalizeDetail,
+  mergeDetailFields,
+  // DI loop + production wrappers
+  deepScrapeDetails,
+  deepScrapeDetailsOnPage,
+  deepScrapeAll,
+  openDetailPanelOnPage,
+  backToListOnPage,
+  sleep,
+};

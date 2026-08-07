@@ -60,6 +60,15 @@ function parseArgs(argv) {
     else if (a === '--help' || a === '-h') out.help = true;
     else if (a === '--version') out.version = true;
     else if (a === '--dryRun') out.dryRun = true;
+    // Phase 1.5 — detail-page deep scrape toggle
+    else if (a === '--deepScrape') {
+      const v = argv[++i];
+      out.deepScrape = v === 'true' || v === '1' || v === 'yes';
+    } else if (a === '--noDeepScrape') {
+      out.deepScrape = false;
+    } else if (a === '--deepScrapeSampleStep') {
+      out.deepScrapeSampleStep = argv[++i];
+    }
   }
   return out;
 }
@@ -143,6 +152,22 @@ function loadConfig(argv = process.argv.slice(2)) {
       fieldWarnThreshold: toIntOrNull(process.env.EXTRACT_FIELD_WARN_THRESHOLD) ?? 80,
     },
 
+    // Detail-page deep scrape (Phase 1.5) — toggleable, default off for speed
+    deepScrape:
+      cli.deepScrape !== undefined
+        ? cli.deepScrape
+        : process.env.DEEP_SCRAPE === 'true',
+    detail: {
+      delayMinMs: toIntOrNull(process.env.DEEP_SCRAPE_DELAY_MIN_MS) ?? 1000,
+      delayMaxMs: toIntOrNull(process.env.DEEP_SCRAPE_DELAY_MAX_MS) ?? 3000,
+      timeoutMs: toIntOrNull(process.env.DEEP_SCRAPE_TIMEOUT_MS) ?? 15000,
+      maxReviews: toIntOrNull(process.env.DEEP_SCRAPE_MAX_REVIEWS) ?? 5,
+      maxPhotos: toIntOrNull(process.env.DEEP_SCRAPE_MAX_PHOTOS) ?? 5,
+      // Sample step: scrape every Nth business (1 = all, 5 = QA mode). Useful
+      // for fast smoke-tests against large result sets.
+      sampleStep: toIntOrNull(cli.deepScrapeSampleStep ?? process.env.DEEP_SCRAPE_SAMPLE_STEP) ?? 1,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -173,12 +198,20 @@ Optional:
   --logLevel <level>         debug | info | warn | error (default: info)
   --verbose                  Alias for --logLevel debug
   --dryRun                   Run pipeline but skip writing output files
+
+  --deepScrape true|false    Phase 1.5 — open each detail panel to fetch
+                             hours, popular times, top reviews, photos,
+                             reservation/menu/social links (default: false)
+  --deepScrapeSampleStep <n> Scrape every Nth business (1 = all, 5 = QA mode)
+  --noDeepScrape             Force --deepScrape false (overrides .env)
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
 Examples:
   npm start -- --query "Cafe" --location "Berlin" --maxResults 50
   npm start -- --query "Plumber" --location "Dhaka, Bangladesh" --headed --verbose
+  npm start -- --query "Restaurant" --location "Toronto" --deepScrape true --deepScrapeSampleStep 5
 `;
 
 module.exports = { loadConfig, parseArgs, validate, HELP_TEXT };
