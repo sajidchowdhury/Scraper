@@ -332,6 +332,146 @@ Phase 1 is tagged `v1.0.0-phase1` — the `-phase1` suffix marks the milestone
 
 ---
 
+### Phase 2.8 — Worker Pool & Concurrency
+
+#### Added
+- **`src/worker.js`** — an isolated scrape worker abstraction with full DI:
+  - `createWorker({ id, cfg, proxy, fingerprint, sessionManager, rateLimiter, runTask, crashLimit, crashWindowMs, cooldownMs, clock, sleepFn, logger })` — returns a worker object. `runTask` is injected (DI) so the worker is fully unit-testable with mocks and decoupled from the Playwright pipeline.
+  - `worker.run(task)` — executes a task via `runTask(worker, task)`; tracks `tasksAttempted`/`tasksCompleted`/`businessesScraped` (accumulated from `{businesses}`/`{count}`/array result shapes); handles block + crash signals.
+  - State machine: `idle` → `busy` → (`idle` | `cooldown` | `retired`).
+  - **Block signal** — `runTask` throws `{ code: 'WORKER_BLOCKED' }` → `markBlocked()` (state=`cooldown`, `cooldownUntil = now + cooldownMs`), `blocked++`, re-throw tagged so the pool re-queues.
+  - **Crash** — any other thrown error → `markCrashed(err)` (records a sliding-window crash timestamp; `errors++`/`crashes++`); after `crashLimit` (default 3) crashes in 10 min → `state='retired'` (worker removed from the active pool permanently).
+  - `worker.isHealthy()` / `worker.isAvailable()` — `isAvailable` lazy-revives a cooldown worker once the clock passes `cooldownUntil`.
+  - `worker.rotateIdentity({ proxy, fingerprint, sessionManager })` — swaps the worker's identity after a block/crash so the NEXT task launches a fresh browser with a new proxy + fingerprint + session (the "restart").
+  - `worker.stats()` — `{ workerId, state, retired, proxyId, fingerprint, tasksAttempted, tasksCompleted, businessesScraped, errors, blocked, crashes, consecutiveErrors, crashCountInWindow, crashLimit, cooldownRemainingMs, lastError, ... }`.
+  - `worker.shutdown()` — releases the session manager, logs final stats, sets `state='retired'`.
+  - `WorkerError` with `code` (`WORKER_CONFIG`/`WORKER_RETIRED`/`WORKER_BUSY`/`WORKER_COOLDOWN`/`WORKER_BLOCKED`/`WORKER_CRASHED`).
+- **Task descriptors** (serializable for the Phase 2.9 job queue):
+  - `createSearchTask({ query, location, maxResults, opts })` — search + scroll + extract for one query/location.
+  - `createDetailTask({ businesses, opts })` — deep-scrape a batch of businesses (default 20).
+  - `createResumeTask({ checkpoint, opts })` — resume a crashed search-task from checkpoint.
+  - `validateTask(task)` — validates type/id/fields + JSON-serializability; returns error array.
+- **`src/pool.js`** — a worker pool scheduler + self-healer with full DI:
+  - `createPool({ size, cfg, createWorker, getIdentity, loadBalancer, crashLimit, crashWindowMs, cooldownMs, taskRetries, clock, sleepFn, pollIntervalMs, logger })`.
+  - `pool.dispatch(task)` — acquires an available worker (race-free under single-threaded JS via a sync `busy` Set claim), runs the task, and **re-queues on failure**: a block → `rotateIdentity` + cooldown + re-queue to another worker; a crash → `markCrashed` (retire if over limit) + `rotateIdentity` + re-queue. Resolves when the task eventually completes (or rejects after `taskRetries` / pool exhaustion).
+  - `pool.dispatchBatch(tasks)` — `Promise.all`-style; preserves order; pool gates concurrency to `size`.
+  - `pool.dispatchBatchSettled(tasks)` — never rejects; returns `{ results, fulfilled, rejected, total }` for partial-failure detail-batch runs.
+  - `pool.stats()` — aggregate `{ size, activeSize, retiredCount, loadBalancer, dispatchCount, requeueCount, totals, perWorker }`.
+  - `pool.shutdown()` — graceful: drains in-flight tasks (60s deadline), then shuts down every worker.
+  - **Load balancers:** `round-robin` (default; cycles the available set) and `least-busy` (fewest `tasksCompleted`, ties by lowest id).
+  - `acquireWorker()` polls on an injectable `sleepFn` (default 25ms — negligible for scrape-length tasks, instant under test's no-op sleep); throws `PoolError('POOL_EXHAUSTED')` when every worker is retired.
+  - `getIdentity` is DI: in production it acquires a proxy from the proxy pool + generates a fingerprint + builds a per-worker session manager + rate limiter; in tests it's a mock.
+- **`src/config.js`** — 7 new CLI flags + env vars + validation + help:
+  - `--workers N` (default 1 = Phase 1 sequential behavior preserved byte-for-byte).
+  - `--workerProxyStrategy shared|isolated` (default `isolated`).
+  - `--workerCrashLimit N` (default 3).
+  - `--workerCooldownMs <ms>` (default 300000 = 5 min).
+  - `--workerLoadBalancer round-robin|least-busy` (default `round-robin`).
+  - `--workerDetailBatchSize N` (default 20).
+  - `--workerTaskRetries N` (default = workers size).
+  - Matching `WORKERS` / `WORKER_PROXY_STRATEGY` / `WORKER_CRASH_LIMIT` / `WORKER_COOLDOWN_MS` / `WORKER_LOAD_BALANCER` / `WORKER_DETAIL_BATCH_SIZE` / `WORKER_TASK_RETRIES` env vars.
+- **`src/index.js`** — `runWithPool()` multi-worker pipeline:
+  - `getIdentity()` acquires a proxy (fallback to direct on pool exhaustion), generates a per-worker fingerprint, and builds a per-worker session manager + `RateLimiter`.
+  - `runTask(worker, task)` handles `search-task` (warmup → search → scroll → extract) and `detail-task` (warmup → search → scroll → `deepScrapeAll` on the batch) via `withBrowser` with the worker's identity.
+  - Dispatches one `search-task` → dedups against checkpoint → splits businesses into `detail-task` batches (size `--workerDetailBatchSize`) → `dispatchBatchSettled` across the pool → merges detail fields back into the master array by index → aggregates `detailStats`.
+  - Aggregates per-worker session stats; includes `pool.stats()` in the run summary + a `Pool:` line in the end-of-run banner.
+  - `--workers 1` skips the pool entirely — the existing single-browser pipeline runs unchanged (Phase 1 behavior preserved exactly).
+- **`.env.example`** — Phase 2.8 section expanded with all 7 env vars + comments.
+
+#### Tests
+- **`tests/worker.test.js`** (29 tests / 108 assertions) — createWorker DI + validation; run success path (result-shape accumulation, consecutiveErrors reset, state transitions); block signal (cooldown, lazy revival via injectable clock); crash + retirement (crashLimit window pruning, WORKER_RETIRED); rotateIdentity; stats; shutdown; task helpers (search/detail/resume, JSON-serializability, unique ids).
+- **`tests/pool.test.js`** (17 tests / 39 assertions) — construction; dispatch; round-robin distribution (3 workers → 3 distinct); least-busy; **parallelism** (3 tasks on 3 workers ≈ 1× duration with overlapping execution windows); **no race conditions** (5 tasks on 2 workers: max concurrency ≤ 2, all 5 run); block re-queue + identity rotation; crash re-queue + retirement (active size drops); pool exhaustion (`POOL_EXHAUSTED`); `dispatchBatchSettled` partial failure; shutdown.
+- **`tests/config.test.js`** Phase 2.8 section (21 tests) — CLI flag parsing, env var fallbacks, CLI-overrides-env, validation (range + enum), HELP_TEXT, `--workers 1` produces no worker-pool errors.
+
+**Test count:** 1016 tests / 7280 assertions (was 949 / 7125).
+
+---
+
+### Phase 2.9 — Job Queue & Orchestration
+
+#### Added
+- **`src/queue/index.js`** — a BullMQ-backed job queue adapter with full DI:
+  - `createQueue({ redisUrl, name, logger, backend?, defaultPriority?, defaultAttempts?, concurrency? })` — returns a queue adapter. Production uses real BullMQ + Redis (lazy `require('bullmq')` so the dep only loads when a queue is actually constructed); tests inject `{ Queue: MockQueue, Worker: MockWorker }` (DI seam — NO real Redis required for unit tests, an explicit acceptance criterion).
+  - `queue.add(type, payload, { priority, delay, attempts })` — submits a job. Validates via `JOB_TYPES[type].validate` FIRST (fail-fast on bad payloads — never persist garbage to Redis); then delegates to the backend. Returns `{ id }`.
+  - `queue.addBatch(jobs)` — submits multiple jobs; returns per-job `{ id } | { error }` so a bad row in a CSV doesn't tank the whole batch.
+  - `queue.process(processor)` — registers the worker function. The adapter converts the job payload → task via `JOB_TYPES[type].toTask`, stamps it with `_queue = { jobId, type, attemptsMade }`, then calls `processor(task, job)`. In production the processor calls `pool.dispatch(task)`. Only one processor per queue (BullMQ limitation).
+  - `queue.getStatus(jobId)` — returns `{ id, type, data, state, progress, result, error, attemptsMade, timestamp, processedOn, finishedOn }`; null for missing jobs.
+  - `queue.getStats()` — returns `{ waiting, active, completed, failed, delayed, total }`.
+  - `queue.getActive({ limit })`, `queue.pause()`, `queue.resume()` — introspection + flow control.
+  - `queue.deadLetter` — callable (returns the list, spec parity) AND an object with `.list({ limit, offset })` / `.get(id)` / `.retry(id)` / `.retryAll({ limit })` / `.remove(id)` / `.clear()` / `.count()` (rich API).
+  - `queue.retryDeadLetter(jobId)` — spec-parity top-level method.
+  - `queue.shutdown()` — graceful: stops accepting new adds, finishes in-flight jobs, closes the worker + queue. Best-effort — never throws. Idempotent.
+  - `QueueError` with `code` (`QUEUE_NO_REDIS`/`QUEUE_NO_BACKEND`/`QUEUE_INVALID`/`QUEUE_UNKNOWN_TYPE`/`QUEUE_SHUTDOWN`/`QUEUE_PROCESSOR_EXISTS`/`QUEUE_CONFIG`).
+- **`src/queue/job-types.js`** — job-type registry + schema validators (pure, no deps):
+  - `JOB_TYPES` registry — `search`, `detail-batch`, `enrich`. Each has `name` / `validate(payload)` / `toTask(payload)` / `priority`.
+  - `search` — `{ query, location, maxResults?, deepScrape? }` → `search-task`.
+  - `detail-batch` — `{ businessIds?: string[], businesses?: object[], deepScrape? }` → `detail-task`. Two payload shapes: `businessIds` (Phase 3 re-scrape-by-id, needs DB lookup) OR `businesses` (Phase 2.9 main flow, no lookup needed).
+  - `enrich` — (Phase 3 placeholder) `{ businessId, source? }` → `enrich-task`.
+  - `validateJobRequest({ type, payload, priority?, attempts?, delay? })` — fail-fast validation; returns error array (empty = valid).
+  - `resolvePriority(p)` — clamps to BullMQ's range (1 to 2^31-1); negative/non-finite → normal.
+  - `PRIORITY_HIGH=1` / `PRIORITY_NORMAL=5` / `PRIORITY_LOW=10` bands.
+- **`src/queue/mock-backend.js`** — a pure in-memory implementation of the BullMQ API subset the adapter depends on (the test seam):
+  - `MockQueue` — `add` / `getJob` / `getJobCounts` / `getFailed` / `getJobs(state)` / `pause` / `resume` / `close` / `disconnect`. Priority queue with stable sort (priority asc, timestamp asc). Delayed jobs promoted lazily on `getJobCounts` / `_pull` (matches BullMQ).
+  - `MockWorker(name, processor, { concurrency, clock, sleepFn, logger })` — polls the MockQueue; processes up to `concurrency` jobs in parallel. Retry with exponential backoff CALCULATION (logged for parity; the mock doesn't actually sleep — tests don't want to wait). Dead-letters after `attempts` failures. `close()` awaits `_pollDonePromise` so in-flight jobs finish before the worker exits.
+  - `MockJob` — `id` / `name` / `data` / `opts` / `progress` / `returnvalue` / `failedReason` / `attemptsMade` / `timestamp` / `processedOn` / `finishedOn` / `getState()` / `updateProgress(value)` / `waitUntilFinished()` / `retry()` / `remove()`. `retry()` resets `attemptsMade` to 0 (fresh set of attempts, matches BullMQ) AND removes the job from the `_failed` / `_completed` sets so `getFailed()` no longer returns it.
+  - `setImmediate`-based poll loop (NOT `Promise.resolve()`) so the event loop isn't starved — a microtask-only yield would deadlock any test using real timers.
+  - `_resetRegistry()` test helper — clears the shared MockQueue↔MockWorker registry between tests.
+- **`src/queue/dead-letter.js`** — dead-letter helper (DI on the backend queue):
+  - `createDeadLetter({ queue, logger })` — returns `{ list, get, retry, retryAll, remove, clear, count }`.
+  - `list({ limit=100, offset=0 })` — paginated failed-jobs listing + total count.
+  - `retry(jobId)` — returns `{ ok: true } | { ok: false, error }` (never throws).
+  - `retryAll({ limit=1000 })` — retries every dead-lettered job; returns `{ retried, failed, total, errors }`.
+  - `remove(jobId)` / `clear()` / `count()` — manual dead-letter management.
+  - `serializeJob(job)` — JSON-safe plain-object snapshot for CLI / API output.
+- **`src/config.js`** — 5 new CLI flags + env vars + validation + help:
+  - `--queue on|off` (default `off` = Phase 2.8 in-process dispatch — no Redis required).
+  - `--redisUrl <url>` (default `redis://localhost:6379`; required when `--queue on`).
+  - `--queuePriority N` (default 5; range 1-100).
+  - `--queueAttempts N` (default 3; range 1-50).
+  - `--queueConcurrency N` (default 1; range 1-64; should be ≤ `--workers`).
+  - Validation: `--queue on` requires `REDIS_URL` (fail-fast before any browser launches).
+  - HELP_TEXT expanded with Phase 2.9 flags + examples (batch + queue:status).
+- **`src/index.js`** — `runWithQueue` pipeline path (gated on `cfg.queue.enabled`):
+  - Builds the same worker pool as `runWithPool` (getIdentity + runTask + createWorkerPool) — a Phase 2.13 refactor will extract this into a shared `buildPool()` helper.
+  - Builds the queue adapter + registers a processor that calls `pool.dispatch(task)`.
+  - Submits the search job → awaits `job.waitUntilFinished()` → dedup against checkpoint → stamp `EMPTY_DETAIL`.
+  - If `--deepScrape true`, splits businesses into detail-batch jobs (each carrying the FULL business objects — no DB lookup needed in the main flow), submits them via `addBatch`, awaits each, and merges results back by index. Failed batches are reported + counted as dead-lettered.
+  - Aggregates per-worker session stats + queue stats into the same `result` shape as `runWithPool` so the downstream export / summary / banner logic is shared.
+  - Graceful shutdown: queue first (stop accepting jobs, finish in-flight), then pool (workers finish, release proxies).
+  - `--queue off` (default) falls through to Phase 2.8 / sequential unchanged.
+- **`src/banner.js`** — two new startup-banner rows:
+  - `Workers` — pool size + load balancer + crash limit when `--workers N > 1`, or "1 (Phase 1 sequential)".
+  - `Queue` — "on (BullMQ + Redis, priority N, M attempts, C concurrency)" or "off (Phase 2.8 in-process)".
+- **`src/index.js`** end-of-run banner — `Queue:` line showing completed/active/waiting/failed/delayed counts (omitted when `--queue off`).
+- **`scripts/batch.js`** — batch submission CLI (`npm run batch -- --file queries.csv`):
+  - Hand-rolled CSV parser (no external dep) — handles double-quoted fields with escaped quotes (`""`), commas inside quotes, `#` comments, blank lines.
+  - Columns: `query, location, maxResults, deepScrape, priority` (only `query` + `location` required; others optional).
+  - Per-row validation; invalid rows are reported but don't tank the batch.
+  - `--dryRun` parses + prints without submitting.
+  - Submits via `queue.addBatch`; prints per-job `{ id }` or `{ error }`; prints a monitoring hint.
+- **`scripts/queue-status.js`** — live status CLI (`npm run queue:status`):
+  - Live top-style view — refreshes every 2s, Ctrl-C to exit.
+  - Prints: waiting / active / completed / failed / delayed / total counts.
+  - Prints: active jobs (id, type, progress, attemptsMade, elapsed, data summary).
+  - Prints: recently-failed (dead-letter) jobs (id, type, reason, attemptsMade).
+  - Modes: `--once` (single snapshot), `--job <id>` (inspect one job), `--deadLetter` (full list), `--retry <id>` (retry one), `--retryAll` (retry all).
+  - ANSI screen clear in TTY mode; plain output when piped (CI-friendly).
+- **`queries.example.csv`** — sample batch input (5 rows demonstrating query/location/maxResults/deepScrape/priority, including a quoted "Dhaka, Bangladesh" with a comma).
+- **`.env.example`** — Phase 2.9 section expanded with `REDIS_URL` + `QUEUE_CONCURRENCY` + detailed comments.
+- **`package.json`** — version bumped to `1.0.0-phase2.9`; new scripts `batch` + `queue:status`; `syntax` script extended to cover the new `src/queue/` files + the two new scripts.
+
+#### Tests
+- **`tests/queue.test.js`** (96 tests / 231 assertions) — comprehensive coverage:
+  - `job-types.js` validators: search/detail-batch/enrich (valid + invalid payloads), validateJobRequest (unknown type, invalid payload, negative priority, attempts < 1 / > 50, negative delay, non-object request), resolvePriority (undefined/null → normal, valid pass-through with floor, negative → normal, non-finite → normal, huge clamp), PRIORITY band ordering.
+  - `mock-backend.js` lifecycle: MockQueue construction (requires name), add returns job with id + data, getJob by id, getJobCounts reflects state, add throws when closed, delayed jobs go into delayed state (with injectable clock), MockWorker processes end-to-end, FIFO within same priority, processor can report progress, MockWorker requires processor + registered queue, priority ordering (high runs before low submitted after), equal-priority FIFO, retry (fail N times then succeed), dead-letter (fail N times → failed state + attemptsMade = N), getFailed returns dead-lettered jobs, job.retry() resets attemptsMade + removes from _failed set, retry on completed job, pause stops processing, resume restarts, close stops new adds, worker.close() waits for in-flight jobs.
+  - `dead-letter.js`: list with limit/offset (paginated, no overlap), get (single, null for missing/null), retry (ok:true on success, ok:false for nonexistent), retryAll (retries all, returns summary), count, remove, clear, serializeJob (JSON-safe).
+  - `queue/index.js` adapter: add (valid returns {id}, unknown type throws, invalid payload throws, post-shutdown throws), addBatch (per-job results, invalid row → {error}), process (registers + converts payload → task via toTask, stamps _queue metadata, throws if already registered, throws if not a function), getStatus (null for missing/null, full for completed), getStats (queue-wide counts), priority ordering (high runs before low), retry (fail 3× → dead-lettered, fail 2× then succeed → completed), deadLetter() callable returns list, deadLetter.list() method, deadLetter.count(), retryDeadLetter(id), deadLetter.retryAll(), pause/resume, shutdown (stops adds + idempotent), default priority/attempts from opts, enrich job type end-to-end, detail-batch with businesses payload, detail-batch with businessIds payload, getActive, concurrency 3 parallelism (maxActive 2-3), real BullMQ backend throws when redisUrl missing.
+  - DI: every test injects `{ Queue: MockQueue, Worker: MockWorker }` — NO real Redis required (an explicit acceptance criterion).
+
+**Test count:** 1112 tests / 7534 assertions (was 1016 / 7280).
+
+---
+
 ## [Unreleased] — post-v1.0.0-phase1 hotfixes
 
 ### Fixed

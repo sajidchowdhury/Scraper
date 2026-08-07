@@ -126,6 +126,31 @@ function buildStartupBanner(cfg, opts = {}) {
         ? `${cfg.captcha.provider} (budget $${cfg.captcha.budget.toFixed(2)}${cfg.captcha.fallbackProvider ? ` +fallback ${cfg.captcha.fallbackProvider}` : ''})`
         : 'none (pause+alert)',
     ],
+    // Phase 2.7 — session rotation summary. Shows the rotation triggers + warmup
+    // state. Each new context gets fresh cookies (Playwright isolation).
+    [
+      'Session',
+      cfg.session
+        ? `${cfg.session.maxRequests} req / ${Math.round(cfg.session.maxAgeMs / 1000)}s${cfg.session.warmup ? ` +warmup (${cfg.session.warmupDurationMs}ms)` : ' (no warmup)'}${cfg.session.accountWarmup ? ' +account' : ''}`
+        : 'disabled',
+    ],
+    // Phase 2.8 — worker pool summary. Shows pool size + load balancer when
+    // enabled, or "disabled" when --workers 1 (Phase 1 sequential behavior).
+    [
+      'Workers',
+      cfg.workers && cfg.workers.size > 1
+        ? `${cfg.workers.size} workers (${cfg.workers.loadBalancer}, crashLimit ${cfg.workers.crashLimit})`
+        : '1 (Phase 1 sequential)',
+    ],
+    // Phase 2.9 — job queue summary. Shows queue + Redis URL + priority +
+    // attempts when enabled, or "disabled" when --queue off (Phase 2.8
+    // in-process behavior — no Redis required).
+    [
+      'Queue',
+      cfg.queue && cfg.queue.enabled
+        ? `on (BullMQ + Redis, priority ${cfg.queue.priority}, ${cfg.queue.attempts} attempts, ${cfg.queue.concurrency} concurrency)`
+        : 'off (Phase 2.8 in-process)',
+    ],
   ];
 
   const width = rows.reduce((m, [k]) => Math.max(m, k.length), 0);

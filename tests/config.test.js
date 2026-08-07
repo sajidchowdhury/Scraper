@@ -457,3 +457,165 @@ describe('Phase 2.5 — HELP_TEXT', () => {
     expect(HELP_TEXT).toContain('--noStealth   # disable stealth');
   });
 });
+
+// ===========================================================================
+// Phase 2.8 — Worker pool & concurrency
+// ===========================================================================
+
+describe('Phase 2.8 — worker pool CLI flag parsing', () => {
+  beforeEach(() => {
+    delete process.env.WORKERS;
+    delete process.env.WORKER_PROXY_STRATEGY;
+    delete process.env.WORKER_CRASH_LIMIT;
+    delete process.env.WORKER_COOLDOWN_MS;
+    delete process.env.WORKER_LOAD_BALANCER;
+    delete process.env.WORKER_DETAIL_BATCH_SIZE;
+    delete process.env.WORKER_TASK_RETRIES;
+  });
+
+  test('defaults: size=1, isolated, crashLimit=3, cooldown=300000, round-robin, batch=20', () => {
+    const cfg = loadConfig(['--query', 'Cafe', '--location', 'Berlin']);
+    expect(cfg.workers.size).toBe(1);
+    expect(cfg.workers.proxyStrategy).toBe('isolated');
+    expect(cfg.workers.crashLimit).toBe(3);
+    expect(cfg.workers.cooldownMs).toBe(300000);
+    expect(cfg.workers.loadBalancer).toBe('round-robin');
+    expect(cfg.workers.detailBatchSize).toBe(20);
+    expect(cfg.workers.taskRetries).toBeNull(); // null = derive from size
+    expect(cfg.workers.resolved).toBeNull(); // resolved at runtime in index.js
+  });
+
+  test('--workers N sets size', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--workers', '4']);
+    expect(cfg.workers.size).toBe(4);
+  });
+
+  test('--workerProxyStrategy shared', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--workerProxyStrategy', 'shared']);
+    expect(cfg.workers.proxyStrategy).toBe('shared');
+  });
+
+  test('--workerCrashLimit + --workerCooldownMs', () => {
+    const cfg = loadConfig([
+      '--query', 'C', '--location', 'B',
+      '--workerCrashLimit', '5',
+      '--workerCooldownMs', '120000',
+    ]);
+    expect(cfg.workers.crashLimit).toBe(5);
+    expect(cfg.workers.cooldownMs).toBe(120000);
+  });
+
+  test('--workerLoadBalancer least-busy', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--workerLoadBalancer', 'least-busy']);
+    expect(cfg.workers.loadBalancer).toBe('least-busy');
+  });
+
+  test('--workerDetailBatchSize + --workerTaskRetries', () => {
+    const cfg = loadConfig([
+      '--query', 'C', '--location', 'B',
+      '--workerDetailBatchSize', '50',
+      '--workerTaskRetries', '8',
+    ]);
+    expect(cfg.workers.detailBatchSize).toBe(50);
+    expect(cfg.workers.taskRetries).toBe(8);
+  });
+
+  test('env var fallbacks (WORKERS, WORKER_PROXY_STRATEGY, ...)', () => {
+    process.env.WORKERS = '6';
+    process.env.WORKER_PROXY_STRATEGY = 'shared';
+    process.env.WORKER_CRASH_LIMIT = '4';
+    process.env.WORKER_COOLDOWN_MS = '60000';
+    process.env.WORKER_LOAD_BALANCER = 'least-busy';
+    process.env.WORKER_DETAIL_BATCH_SIZE = '15';
+    process.env.WORKER_TASK_RETRIES = '3';
+    const cfg = loadConfig(['--query', 'C', '--location', 'B']);
+    expect(cfg.workers.size).toBe(6);
+    expect(cfg.workers.proxyStrategy).toBe('shared');
+    expect(cfg.workers.crashLimit).toBe(4);
+    expect(cfg.workers.cooldownMs).toBe(60000);
+    expect(cfg.workers.loadBalancer).toBe('least-busy');
+    expect(cfg.workers.detailBatchSize).toBe(15);
+    expect(cfg.workers.taskRetries).toBe(3);
+  });
+
+  test('CLI flags override env vars', () => {
+    process.env.WORKERS = '6';
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--workers', '2']);
+    expect(cfg.workers.size).toBe(2);
+  });
+});
+
+describe('Phase 2.8 — worker pool validation', () => {
+  beforeEach(() => {
+    delete process.env.WORKERS;
+    delete process.env.WORKER_PROXY_STRATEGY;
+    delete process.env.WORKER_CRASH_LIMIT;
+    delete process.env.WORKER_COOLDOWN_MS;
+    delete process.env.WORKER_LOAD_BALANCER;
+    delete process.env.WORKER_DETAIL_BATCH_SIZE;
+    delete process.env.WORKER_TASK_RETRIES;
+  });
+
+  test('workers < 1 → error', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--workers', '0']);
+    expect(cfg.errors.join('\n')).toMatch(/workers must be between 1 and 64/);
+  });
+
+  test('workers > 64 → error', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--workers', '65']);
+    expect(cfg.errors.join('\n')).toMatch(/workers must be between 1 and 64/);
+  });
+
+  test('bad proxyStrategy → error', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--workerProxyStrategy', 'bogus']);
+    expect(cfg.errors.join('\n')).toMatch(/workerProxyStrategy must be one of shared, isolated/);
+  });
+
+  test('bad loadBalancer → error', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--workerLoadBalancer', 'random']);
+    expect(cfg.errors.join('\n')).toMatch(/workerLoadBalancer must be one of round-robin, least-busy/);
+  });
+
+  test('crashLimit out of range → error', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--workerCrashLimit', '0']);
+    expect(cfg.errors.join('\n')).toMatch(/workerCrashLimit must be between 1 and 50/);
+  });
+
+  test('cooldownMs out of range → error', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--workerCooldownMs', '999999999']);
+    expect(cfg.errors.join('\n')).toMatch(/workerCooldownMs must be between 0 and 86400000/);
+  });
+
+  test('detailBatchSize out of range → error', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B', '--workerDetailBatchSize', '0']);
+    expect(cfg.errors.join('\n')).toMatch(/workerDetailBatchSize must be between 1 and 500/);
+  });
+
+  test('--workers 1 (default) produces no worker-pool errors (Phase 1 behavior preserved)', () => {
+    const cfg = loadConfig(['--query', 'C', '--location', 'B']);
+    expect(cfg.errors.join('\n')).not.toMatch(/worker/);
+  });
+});
+
+describe('Phase 2.8 — HELP_TEXT', () => {
+  test('includes --workers', () => {
+    expect(HELP_TEXT).toContain('--workers <n>');
+    expect(HELP_TEXT).toContain('parallel browser workers');
+  });
+  test('includes --workerProxyStrategy', () => {
+    expect(HELP_TEXT).toContain('--workerProxyStrategy');
+    expect(HELP_TEXT).toContain('shared | isolated');
+  });
+  test('includes --workerCrashLimit + --workerCooldownMs', () => {
+    expect(HELP_TEXT).toContain('--workerCrashLimit');
+    expect(HELP_TEXT).toContain('--workerCooldownMs');
+  });
+  test('includes --workerLoadBalancer', () => {
+    expect(HELP_TEXT).toContain('--workerLoadBalancer');
+    expect(HELP_TEXT).toContain('round-robin (default) | least-busy');
+  });
+  test('includes Phase 2.8 examples', () => {
+    expect(HELP_TEXT).toContain('Phase 2.8 — worker pool & concurrency');
+    expect(HELP_TEXT).toContain('--workers 3   # 3 parallel workers');
+  });
+});

@@ -109,6 +109,38 @@ function parseArgs(argv) {
     else if (a === '--captchaBudget') out.captchaBudget = argv[++i];
     else if (a === '--captchaFallbackProvider') out.captchaFallbackProvider = argv[++i];
     else if (a === '--noCaptchaSolve') out.noCaptchaSolve = true;
+    // Phase 2.7 — session & cookie rotation. NOTE: --sessionLength is already
+    // taken by Phase 2.3 (proxy sticky rotation), so we use --sessionMaxRequests
+    // for the browser-context rotation trigger to avoid a flag collision.
+    else if (a === '--sessionMaxRequests') out.sessionMaxRequests = argv[++i];
+    else if (a === '--sessionMaxAgeMs') out.sessionMaxAgeMs = argv[++i];
+    else if (a === '--warmup') out.warmup = argv[++i];
+    else if (a === '--warmupDurationMs') out.warmupDurationMs = argv[++i];
+    else if (a === '--noWarmup') out.noWarmup = true;
+    else if (a === '--accountWarmup') out.accountWarmup = argv[++i];
+    else if (a === '--accountsFile') out.accountsFile = argv[++i];
+    // Phase 2.8 — worker pool & concurrency. --workers N spawns N parallel
+    // browser workers (default: 1 = Phase 1 sequential behavior preserved
+    // exactly). Each worker gets its own proxy + fingerprint + session + rate
+    // limiter. --workers 1 skips the pool entirely (no overhead).
+    else if (a === '--workers') out.workers = argv[++i];
+    else if (a === '--workerProxyStrategy') out.workerProxyStrategy = argv[++i];
+    else if (a === '--workerCrashLimit') out.workerCrashLimit = argv[++i];
+    else if (a === '--workerCooldownMs') out.workerCooldownMs = argv[++i];
+    else if (a === '--workerLoadBalancer') out.workerLoadBalancer = argv[++i];
+    else if (a === '--workerDetailBatchSize') out.workerDetailBatchSize = argv[++i];
+    else if (a === '--workerTaskRetries') out.workerTaskRetries = argv[++i];
+    // Phase 2.9 — job queue & orchestration. --queue on switches from the
+    // Phase 2.8 in-process pool.dispatch to a BullMQ-backed queue: jobs are
+    // submitted to Redis, a worker pulls them off, and the pool dispatches
+    // each one. This decouples submission from execution (batch CLI, crash
+    // recovery, priorities). --queue off (default) preserves Phase 2.8
+    // behavior exactly (no Redis required).
+    else if (a === '--queue') out.queue = argv[++i];
+    else if (a === '--redisUrl') out.redisUrl = argv[++i];
+    else if (a === '--queuePriority') out.queuePriority = argv[++i];
+    else if (a === '--queueAttempts') out.queueAttempts = argv[++i];
+    else if (a === '--queueConcurrency') out.queueConcurrency = argv[++i];
   }
   return out;
 }
@@ -341,6 +373,115 @@ function validate(cfg) {
       `captchaFallbackProvider=${cfg.captcha.fallbackProvider} also requires --captchaApiKey <key>.`,
     );
   }
+  // Phase 2.7 — session rotation validation.
+  if (cfg.session.maxRequests < 1 || cfg.session.maxRequests > 100000) {
+    errors.push(
+      `sessionMaxRequests must be between 1 and 100000 (got ${cfg.session.maxRequests}). Use --sessionMaxRequests <n>.`,
+    );
+  }
+  if (cfg.session.maxAgeMs < 1000 || cfg.session.maxAgeMs > 24 * 60 * 60 * 1000) {
+    errors.push(
+      `sessionMaxAgeMs must be between 1000 and 86400000 (got ${cfg.session.maxAgeMs}). Use --sessionMaxAgeMs <ms>.`,
+    );
+  }
+  if (cfg.session.warmupDurationMs < 0 || cfg.session.warmupDurationMs > 300000) {
+    errors.push(
+      `warmupDurationMs must be between 0 and 300000 (got ${cfg.session.warmupDurationMs}). Use --warmupDurationMs <ms>.`,
+    );
+  }
+  // accountWarmup requires an accounts file. We check existence here (fail-fast)
+  // so the operator knows before any browser launches. A missing file is a
+  // config error, not a runtime one.
+  if (cfg.session.accountWarmup) {
+    if (!cfg.session.accountsFile) {
+      errors.push(
+        'accountWarmup=on requires --accountsFile <path> (a JSON array of {email, password}). ' +
+          'Set ACCOUNTS_FILE in .env or pass --accountsFile. The file MUST be gitignored + chmod 600.',
+      );
+    } else if (!fs.existsSync(cfg.session.accountsFile)) {
+      errors.push(
+        `--accountsFile not found: ${cfg.session.accountsFile} (set ACCOUNTS_FILE in .env or pass --accountsFile <path>)`,
+      );
+    }
+  }
+  // Phase 2.8 — worker pool validation.
+  if (cfg.workers.size < 1 || cfg.workers.size > 64) {
+    errors.push(
+      `workers must be between 1 and 64 (got ${cfg.workers.size}). --workers 1 = Phase 1 sequential behavior.`,
+    );
+  }
+  if (!['shared', 'isolated'].includes(cfg.workers.proxyStrategy)) {
+    errors.push(
+      `workerProxyStrategy must be one of shared, isolated (got "${cfg.workers.proxyStrategy}"). ` +
+        'isolated = each worker gets its own proxy (default); shared = all workers draw from the pool.',
+    );
+  }
+  if (cfg.workers.crashLimit < 1 || cfg.workers.crashLimit > 50) {
+    errors.push(
+      `workerCrashLimit must be between 1 and 50 (got ${cfg.workers.crashLimit}). ` +
+        'Worker is retired after this many crashes in the 10-min window.',
+    );
+  }
+  if (cfg.workers.cooldownMs < 0 || cfg.workers.cooldownMs > 24 * 60 * 60 * 1000) {
+    errors.push(
+      `workerCooldownMs must be between 0 and 86400000 (got ${cfg.workers.cooldownMs}). ` +
+        'How long a blocked worker stays out before revival (default 300000 = 5 min).',
+    );
+  }
+  if (!['round-robin', 'least-busy'].includes(cfg.workers.loadBalancer)) {
+    errors.push(
+      `workerLoadBalancer must be one of round-robin, least-busy (got "${cfg.workers.loadBalancer}").`,
+    );
+  }
+  if (cfg.workers.detailBatchSize < 1 || cfg.workers.detailBatchSize > 500) {
+    errors.push(
+      `workerDetailBatchSize must be between 1 and 500 (got ${cfg.workers.detailBatchSize}). ` +
+        'Number of businesses per detail-task (default 20).',
+    );
+  }
+  if (cfg.workers.taskRetries < 0 || cfg.workers.taskRetries > 64) {
+    errors.push(
+      `workerTaskRetries must be between 0 and 64 (got ${cfg.workers.taskRetries}). ` +
+        'Max re-queues per task across workers (default = workers size).',
+    );
+  }
+  // Phase 2.9 — job queue validation. --queue on|off is normalized to a
+  // boolean in loadConfig; here we validate the dependent fields.
+  if (typeof cfg.queue.enabled !== 'boolean') {
+    errors.push(
+      `queue must be one of on, off (got "${cfg.queue.enabled}"). Use --queue on|off.`,
+    );
+  }
+  if (cfg.queue.priority < 1 || cfg.queue.priority > 100) {
+    errors.push(
+      `queuePriority must be between 1 and 100 (got ${cfg.queue.priority}). ` +
+        '1 = highest priority (paid jobs), 10 = low (background re-scrape), 5 = normal.',
+    );
+  }
+  if (cfg.queue.attempts < 1 || cfg.queue.attempts > 50) {
+    errors.push(
+      `queueAttempts must be between 1 and 50 (got ${cfg.queue.attempts}). ` +
+        'BullMQ retries failed jobs up to this many times with exponential backoff.',
+    );
+  }
+  if (cfg.queue.concurrency < 1 || cfg.queue.concurrency > 64) {
+    errors.push(
+      `queueConcurrency must be between 1 and 64 (got ${cfg.queue.concurrency}). ` +
+        'How many jobs the worker pulls off the queue in parallel.',
+    );
+  }
+  // --queue on requires REDIS_URL (BullMQ needs a Redis connection). We fail
+  // fast here so the operator sees the error before any browser launches.
+  if (cfg.queue.enabled === 'on' && !cfg.queue.redisUrl) {
+    errors.push(
+      '--queue on requires REDIS_URL (set in .env or pass --redisUrl <url>). ' +
+        'See .env.example → Phase 2.9 section.',
+    );
+  }
+  // --queue on implicitly requires --workers > 1 (the queue feeds the pool;
+  // a single-worker pool can still process queue jobs but with no concurrency
+  // benefit). We WARN (not error) — a single worker + queue is a valid config
+  // for low-throughput crash-resilient runs.
   return errors;
 }
 
@@ -531,6 +672,104 @@ function loadConfig(argv = process.argv.slice(2)) {
       resolved: null,
     },
 
+    // Phase 2.7 — session & cookie rotation.
+    //   --sessionMaxRequests N   — rotate the browser context every N Maps
+    //                              requests (default 50). NOTE: this is distinct
+    //                              from Phase 2.3's --sessionLength (proxy sticky
+    //                              rotation). The two coexist: proxies rotate per
+    //                              request, contexts rotate per N requests.
+    //   --sessionMaxAgeMs <ms>   — rotate the context after this many ms,
+    //                              regardless of request count (default 600000 = 10min).
+    //                              Whichever trigger fires first wins.
+    //   --warmup on|off          — visit benign pages (google.com, etc.) before
+    //                              the first Maps request in each new context
+    //                              (default: on). Defeats "zero-history session
+    //                              hitting Maps" heuristics.
+    //   --noWarmup               — alias for --warmup off (Phase 1 behavior).
+    //   --warmupDurationMs <ms>  — total warmup time budget (default 10000).
+    //   --accountWarmup on|off   — opt-in Google account login per session
+    //                              (default: off — account-burn risk). Requires
+    //                              --accountsFile.
+    //   --accountsFile <path>    — JSON array of {email, password}. MUST be
+    //                              gitignored + chmod 600. Credentials are never
+    //                              logged (email redacted to prefix***@domain).
+    session: {
+      maxRequests: toIntOrNull(cli.sessionMaxRequests ?? process.env.SESSION_MAX_REQUESTS) ?? 50,
+      maxAgeMs: toIntOrNull(cli.sessionMaxAgeMs ?? process.env.SESSION_MAX_AGE_MS) ?? 600_000,
+      warmup: cli.noWarmup || process.env.WARMUP === 'off'
+        ? false
+        : (cli.warmup || process.env.WARMUP || 'on') === 'on',
+      warmupDurationMs: toIntOrNull(cli.warmupDurationMs ?? process.env.WARMUP_DURATION_MS) ?? 10_000,
+      accountWarmup: (cli.accountWarmup || process.env.ACCOUNT_WARMUP || 'off') === 'on',
+      accountsFile: cli.accountsFile || process.env.ACCOUNTS_FILE || null,
+      // Resolved at runtime in index.js into { manager }.
+      resolved: null,
+    },
+
+    // Phase 2.8 — worker pool & concurrency.
+    //   --workers N                  — parallel browser workers (default: 1 =
+    //                                  Phase 1 sequential behavior preserved).
+    //                                  Each worker gets its own proxy +
+    //                                  fingerprint + session + rate limiter.
+    //   --workerProxyStrategy shared|isolated — isolated = each worker gets its
+    //                                  own proxy (default); shared = all workers
+    //                                  draw from the proxy pool (more IPs used).
+    //   --workerCrashLimit N         — retire a worker after N crashes in 10 min
+    //                                  (default 3). Retired workers drop the
+    //                                  effective pool size.
+    //   --workerCooldownMs <ms>      — block cooldown (default 300000 = 5 min).
+    //                                  A blocked worker sits out this long
+    //                                  before revival with a fresh identity.
+    //   --workerLoadBalancer <s>     — round-robin (default) | least-busy.
+    //   --workerDetailBatchSize N    — businesses per detail-task (default 20).
+    //                                  With --workers N --deepScrape true, the
+    //                                  detail work is split into batches of N
+    //                                  and run in parallel across the pool.
+    //   --workerTaskRetries N        — max re-queues per task (default = workers
+    //                                  size). A task is re-tried on another
+    //                                  worker after a block/crash.
+    workers: {
+      size: toIntOrNull(cli.workers ?? process.env.WORKERS) ?? 1,
+      proxyStrategy:
+        cli.workerProxyStrategy || process.env.WORKER_PROXY_STRATEGY || 'isolated',
+      crashLimit: toIntOrNull(cli.workerCrashLimit ?? process.env.WORKER_CRASH_LIMIT) ?? 3,
+      cooldownMs:
+        toIntOrNull(cli.workerCooldownMs ?? process.env.WORKER_COOLDOWN_MS) ?? 5 * 60 * 1000,
+      loadBalancer:
+        cli.workerLoadBalancer || process.env.WORKER_LOAD_BALANCER || 'round-robin',
+      detailBatchSize:
+        toIntOrNull(cli.workerDetailBatchSize ?? process.env.WORKER_DETAIL_BATCH_SIZE) ?? 20,
+      taskRetries:
+        toIntOrNull(cli.workerTaskRetries ?? process.env.WORKER_TASK_RETRIES) ?? null,
+      // Resolved at runtime in index.js into { pool } (null when size === 1).
+      resolved: null,
+    },
+
+    // Phase 2.9 — job queue & orchestration (BullMQ + Redis).
+    //   --queue on|off              — on = submit jobs to a BullMQ queue (Redis-
+    //                                 backed); a worker pulls them off and feeds
+    //                                 the pool. off (default) = Phase 2.8
+    //                                 in-process dispatch (no Redis required).
+    //   --redisUrl <url>            — Redis connection URL (required when
+    //                                 --queue on). Default redis://localhost:6379.
+    //   --queuePriority N           — default priority for submitted jobs
+    //                                 (1=high, 5=normal, 10=low; default 5).
+    //   --queueAttempts N           — BullMQ retry attempts per job (default 3).
+    //                                 After this many failures the job is dead-
+    //                                 lettered for manual inspection.
+    //   --queueConcurrency N        — worker concurrency (how many jobs the
+    //                                 worker pulls off the queue in parallel;
+    //                                 default 1). Should be <= --workers.
+    queue: {
+      enabled: (cli.queue || process.env.QUEUE || 'off') === 'on',
+      redisUrl: cli.redisUrl || process.env.REDIS_URL || 'redis://localhost:6379',
+      priority: toIntOrNull(cli.queuePriority ?? process.env.QUEUE_PRIORITY) ?? 5,
+      attempts: toIntOrNull(cli.queueAttempts ?? process.env.QUEUE_ATTEMPTS) ?? 3,
+      concurrency: toIntOrNull(cli.queueConcurrency ?? process.env.QUEUE_CONCURRENCY) ?? 1,
+      // Resolved at runtime in index.js into { adapter } (null when disabled).
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -628,6 +867,57 @@ Optional:
   --noCaptchaSolve           Phase 2.6 — force pause-and-alert (overrides
                              --captchaProvider). Preserves Phase 1.8 behavior.
 
+  --sessionMaxRequests <n>   Phase 2.7 — rotate the browser context every N Maps
+                             requests (default: 50). Each new context gets fresh
+                             cookies + (optionally) a warmup visit. NOTE: distinct
+                             from Phase 2.3's --sessionLength (proxy sticky rotation).
+  --sessionMaxAgeMs <ms>     Phase 2.7 — rotate the context after this many ms,
+                             regardless of request count (default: 600000 = 10min).
+                             Whichever trigger (count OR age) fires first wins.
+  --warmup on|off            Phase 2.7 — visit benign pages (google.com, etc.)
+                             before the first Maps request in each new context
+                             (default: on). Defeats zero-history-session detection.
+  --noWarmup                 Phase 2.7 — alias for --warmup off (Phase 1 behavior).
+  --warmupDurationMs <ms>    Phase 2.7 — total warmup time budget (default: 10000).
+  --accountWarmup on|off     Phase 2.7 — opt-in Google account login per session
+                             (default: off — account-burn risk). Requires --accountsFile.
+                             Logged-in sessions get more data + fewer CAPTCHAs.
+  --accountsFile <path>      Phase 2.7 — JSON array of {email, password}. MUST be
+                             gitignored + chmod 600. Credentials are never logged
+                             (email redacted to prefix***@domain).
+
+  --workers <n>              Phase 2.8 — parallel browser workers (default: 1 =
+                             Phase 1 sequential behavior). Each worker gets its
+                             own proxy + fingerprint + session + rate limiter.
+                             With --workers N --deepScrape true, detail-scrape
+                             batches run in parallel across the pool (~N× faster).
+  --workerProxyStrategy <s>  Phase 2.8 — shared | isolated (default: isolated).
+                             isolated = each worker pins its own proxy; shared =
+                             all workers draw from the proxy pool on each task.
+  --workerCrashLimit <n>     Phase 2.8 — retire a worker after N crashes in 10 min
+                             (default: 3). Retired workers drop the pool size.
+  --workerCooldownMs <ms>    Phase 2.8 — block cooldown (default: 300000 = 5 min).
+                             A blocked worker sits out, rotates its identity, then
+                             revives. Its task is re-queued to another worker.
+  --workerLoadBalancer <s>   Phase 2.8 — round-robin (default) | least-busy.
+  --workerDetailBatchSize <n> Phase 2.8 — businesses per detail-task (default: 20).
+  --workerTaskRetries <n>    Phase 2.8 — max re-queues per task (default = workers).
+
+  --queue on|off             Phase 2.9 — on = submit jobs to a BullMQ-backed
+                             Redis queue (decouples submission from execution).
+                             A worker pulls jobs off the queue and feeds the
+                             pool. off (default) = Phase 2.8 in-process dispatch
+                             (no Redis required).
+  --redisUrl <url>           Phase 2.9 — Redis connection URL (required when
+                             --queue on). Default redis://localhost:6379.
+  --queuePriority <n>        Phase 2.9 — default job priority (1=high, 5=normal,
+                             10=low; default 5). BullMQ: lower = higher priority.
+  --queueAttempts <n>        Phase 2.9 — BullMQ retry attempts per job (default 3).
+                             After this many failures the job is dead-lettered.
+  --queueConcurrency <n>     Phase 2.9 — worker concurrency (how many jobs the
+                             worker pulls off the queue in parallel; default 1).
+                             Should be <= --workers.
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
@@ -667,6 +957,30 @@ Examples:
   npm start -- --query "Cafe" --location "Berlin" \
     --captchaProvider 2captcha --captchaApiKey $KEY --captchaBudget 5.00
   npm start -- --query "Cafe" --location "Berlin" --noCaptchaSolve   # force pause-and-alert
+
+  # Phase 2.7 — session & cookie rotation (default: rotate every 50 req / 10 min + warmup)
+  npm start -- --query "Cafe" --location "Berlin"               # default session rotation + warmup
+  npm start -- --query "Cafe" --location "Berlin" --sessionMaxRequests 10   # rotate every 10 requests
+  npm start -- --query "Cafe" --location "Berlin" --noWarmup    # skip warmup (Phase 1 behavior)
+  npm start -- --query "Cafe" --location "Berlin" --accountWarmup on --accountsFile ./accounts.json
+
+  # Phase 2.8 — worker pool & concurrency (default: 1 = Phase 1 sequential)
+  npm start -- --query "Cafe" --location "Berlin"               # 1 worker (Phase 1 behavior, unchanged)
+  npm start -- --query "Cafe" --location "Berlin" --workers 3   # 3 parallel workers
+  npm start -- --query "Restaurant" --location "Toronto" --workers 5 --deepScrape true   # 5× parallel detail-scrape
+  npm start -- --query "Cafe" --location "Berlin" --workers 4 --workerLoadBalancer least-busy
+  npm start -- --query "Cafe" --location "Berlin" --workers 3 --workerCrashLimit 5 --workerCooldownMs 120000
+
+  # Phase 2.9 — job queue & orchestration (default: off = Phase 2.8 in-process)
+  #   Requires Redis running (docker-compose up redis). --queue on submits the
+  #   search-task to a BullMQ queue; a worker pulls it off and feeds the pool.
+  #   For batch submission use: npm run batch -- --file queries.csv (one job
+  #   per row) and monitor with: npm run queue:status (live, refreshes 2s).
+  npm start -- --query "Cafe" --location "Berlin" --workers 3 --queue on   # queue + 3 workers
+  npm start -- --query "Cafe" --location "Berlin" --queue on --queuePriority 1   # high-priority job
+  npm start -- --query "Cafe" --location "Berlin" --queue on --queueAttempts 5   # more retries
+  npm run batch -- --file queries.csv --workers 5 --queue on   # batch submit + process
+  npm run queue:status                                         # live status (top-style, 2s refresh)
 
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun

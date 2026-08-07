@@ -1,0 +1,11 @@
+# Sample batch submission CSV for `npm run batch -- --file queries.csv`.
+# One search job per row. Required columns: query, location.
+# Optional columns: maxResults, deepScrape, priority.
+# Lines starting with # are comments. Blank lines are skipped.
+# Quoted values with commas are supported (standard CSV).
+query,location,maxResults,deepScrape,priority
+Cafe,Berlin,50,true,5
+Restaurant,Toronto,100,false,5
+Plumber,"Dhaka, Bangladesh",,true,1
+Dentist,New York,25,false,10
+Pharmacy,London,,false,5

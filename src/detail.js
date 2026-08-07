@@ -930,6 +930,12 @@ async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
  *        a CAPTCHA, the run pauses + alerts the operator, then aborts.
  * @param {number} [hooks.captchaWaitMs]
  *        Phase 1.8 — how long to pause when a CAPTCHA is detected (default 300000).
+ * @param {() => Promise<{rotated: boolean, page?: object, reason?: string|null}>} [hooks.sessionCheck]
+ *        Phase 2.7 — async function checked after each business; if it reports
+ *        `{ rotated: true, page }`, the loop swaps to the new page (the old
+ *        context was closed + a new one created by the session manager). The
+ *        hook is responsible for re-navigating the new page to the Maps search
+ *        so the feed is loaded for subsequent detail-panel clicks.
  * @returns {Promise<{ successRate, attempted, succeeded, failed, durations }>}
  */
 async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
@@ -941,6 +947,7 @@ async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
   const onProgress = hooks.onProgress || (() => {});
   const captchaCheck = hooks.captchaCheck || null;
   const captchaWaitMs = hooks.captchaWaitMs ?? ab.captchaWaitMs ?? 300_000;
+  const sessionCheck = hooks.sessionCheck || null;
 
   let attempted = 0;
   let succeeded = 0;
@@ -1008,6 +1015,29 @@ async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
 
     // Phase 1.7 — notify caller after each scrape so it can checkpoint.
     onProgress({ index: i, attempted, succeeded, failed });
+
+    // Phase 2.7 — session rotation check after each business. If the session
+    // manager rotated the context (maxRequests or maxAge hit), swap to the new
+    // page. The hook is responsible for closing the old context + creating +
+    // warming up the new one + re-navigating to the Maps search so the feed is
+    // loaded for the next business's detail-panel click.
+    if (sessionCheck) {
+      let sr;
+      try {
+        sr = await sessionCheck({ index: i, attempted, succeeded, failed });
+      } catch (err) {
+        log.debug('sessionCheck hook threw (non-fatal)', { error: err.message });
+        sr = { rotated: false };
+      }
+      if (sr && sr.rotated && sr.page) {
+        log.info('Session rotated during deep-scrape — swapped to new page', {
+          reason: sr.reason || 'manual',
+          attemptedSoFar: attempted,
+          nextBusiness: businesses[i + 1] && businesses[i + 1].name ? businesses[i + 1].name : '(unknown)',
+        });
+        page = sr.page;
+      }
+    }
 
     // Phase 1.8 — CAPTCHA check after each business. If Google throttled us,
     // pause + alert the operator, then abort the deep-scrape phase (auto-solve
