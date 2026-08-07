@@ -707,7 +707,11 @@ failures and polite to Google. The master roadmap in
     keyed by `place_id`, change-hash no-op detection, batched writes,
     transaction rollback), `schema.sql`, `npm run db:migrate`, `--output
     csv|json|db|all` flag. 475 tests / 1169 assertions.
-  - 2.2–2.13 — change tracking, proxies, fingerprints, stealth, CAPTCHA,
+  - **2.2 — Change Tracking & History** ✅ — `business_snapshots` +
+    `field_changes` tables, `src/db/deltas.js` (pure `computeChanges` /
+    `numericDelta`), snapshot-on-update, `changes_detected` on `scrape_runs`,
+    `npm run db:history` CLI, change-breakdown banner. 551 tests / 1407 assertions.
+  - 2.3–2.13 — proxies, fingerprints, stealth, CAPTCHA,
     sessions, worker pool, job queue, memory mgmt, self-healing selectors,
     incremental scraping, final integration *(not started)*.
 - **Phase 3 — Data Quality & Enrichment:** phone/email normalization &
@@ -763,28 +767,96 @@ but skips JSON.
 
 ### Schema
 
-Two tables (see `src/db/schema.sql`):
+Four tables (see `src/db/schema.sql`):
 
 - **`businesses`** — one row per scraped business, keyed by `place_id` (UNIQUE).
   All 25 scraped fields (17 canonical list-view + 8 detail-scrape) plus
   `data_hash`, `run_id` (FK → `scrape_runs`), `updated_at`. Indexes on
   `place_id`, `(query, location)`, `scraped_at`, `business_status`, `updated_at`.
 - **`scrape_runs`** — one row per pipeline invocation: query, location, timing,
-  extracted/failed counts, exit code, log path, and DB upsert counts
-  (`db_inserted`, `db_updated`, `db_unchanged`).
+  extracted/failed counts, exit code, log path, DB upsert counts
+  (`db_inserted`, `db_updated`, `db_unchanged`), and `changes_detected`
+  (Phase 2.2 — total field-level changes written this run).
+- **`business_snapshots`** *(Phase 2.2)* — pre-update snapshot of the five
+  high-value tracked fields (`rating`, `reviews_count`, `business_status`,
+  `phone`, `website`) captured before every UPDATE. Indexed on
+  `(business_id, snapshot_at DESC)`.
+- **`field_changes`** *(Phase 2.2)* — computed, queryable per-field delta log
+  (one row per field that changed, with `old_value`/`new_value`/`delta`).
+  Indexed on `(business_id, field, detected_at DESC)`.
 
 ### Idempotent upserts
 
 `upsertBusinessesBatch` classifies each business as `inserted`, `updated`, or
 `unchanged` by comparing a SHA-256 hash of the comparable field values against
 the stored `data_hash`. Only `updated` rows bump `updated_at` — identical
-re-scrapes produce zero writes. The end-of-run banner reports the counts:
+re-scrapes produce zero writes (and zero snapshots/changes — no noise). The
+end-of-run banner reports the counts:
 
 ```
-DB:       50 inserted, 30 updated, 20 unchanged (run #3)
+DB:       50 inserted, 30 updated (12 rating changes, 8 review-count changes, 2 status changes), 20 unchanged (run #3)
 ```
 
 All queries are parameterized (no SQL injection surface). Writes happen in a
 single transaction per run; a failure rolls back and is logged as a partial-
 success (exit code 1) without discarding any CSV/JSON files already written.
+
+## Change tracking & history (Phase 2.2)
+
+Every time a business is re-scraped and its data has changed, the scraper now
+snapshots the **old** values into `business_snapshots` and logs one
+`field_changes` row per tracked field that actually changed. This turns the
+scraper from a "snapshot tool" into a **trend data tool** — the foundation for
+delta alerts (Phase 5) and freshness scoring.
+
+### Tracked fields
+
+Five high-value columns (the ones clients pay a premium for trend data on):
+
+| Field | Delta type | Example change |
+|---|---|---|
+| `rating` | numeric (Δ) | 4.5 → 4.3 (Δ -0.2) |
+| `reviews_count` | numeric (Δ) | 1234 → 1289 (Δ +55) |
+| `business_status` | text (null delta) | open → permanently_closed |
+| `phone` | text (null delta) | +1-555-0100 → +1-555-0200 |
+| `website` | text (null delta) | https://old.example.com → null |
+
+Re-scraping with **identical** data produces zero snapshots and zero changes
+(detected via the `data_hash` no-op path from Phase 2.1 — no noise).
+
+### Viewing a business's history
+
+`npm run db:history` prints the full change timeline for a single business
+(keyed by `place_id`), most recent first:
+
+```bash
+npm run db:history -- --placeId ChIJxxx
+# or with aliases:
+npm run db:history -- -p ChIJxxx --limit 20
+```
+
+```
+Business:  Test Cafe (ChIJxxx)
+Current:   rating 4.3 | reviews 1289 | status open | phone +1-555-0100 | website https://example.com
+
+Timeline (5 change events, 2 snapshots):
+  2026-08-07 14:03  rating 4.5 → 4.3  (Δ -0.2)
+  2026-08-07 14:03  reviews 1234 → 1289 (Δ +55)
+  2026-07-01 09:12  rating 4.6 → 4.5  (Δ -0.1)
+  2026-06-15 18:44  status open → temporarily_closed
+  2026-06-15 18:44  phone +1-555-0100 → +1-555-0200
+```
+
+Flags: `--placeId <id>` (required), `--place-id`/`-p` aliases, `--limit N`
+(default 100), `--help`/`-h`. A positional connection string overrides
+`DATABASE_URL`. The pure formatting helpers are exported from
+`src/db/history.js` for unit testing.
+
+### Transactional snapshotting
+
+The snapshot + field_changes writes run **inside the same BEGIN/COMMIT
+transaction** as the `businesses` UPDATE (in `persistRunResults`). A crash
+mid-upsert rolls back the snapshot, the changes, and the update atomically —
+the database is never left in a state where the old values were snapshotted
+but the update didn't happen (or vice versa).
 

@@ -41,6 +41,15 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// Phase 2.2 — pure change-tracking helpers (computeChanges, numericDelta, etc.).
+// Kept in a separate module so they're unit-testable without a database.
+const deltas = require('./db/deltas');
+const {
+  TRACKED_FIELDS,
+  computeChanges,
+  summarizeChanges,
+} = deltas;
+
 // `pg` is an optional runtime dependency: the scraper still works without it
 // (Phase 1 file-only behavior) as long as `--output db` is never requested.
 // We lazy-require it inside createPool() so `require('./db')` never throws
@@ -456,18 +465,151 @@ function buildUpdate(business, hash, runId) {
   return { text, params };
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2.2 — Change-tracking SQL builders
+// ---------------------------------------------------------------------------
+// These run BEFORE the businesses UPDATE (inside the same transaction) to
+// snapshot the old row and log per-field deltas. Both are pure functions
+// returning { text, params } — exported for unit testing.
+//
+// Tracked fields (kept in sync with src/db/schema.sql + src/db/deltas.js):
+//   rating, reviews_count, business_status, phone, website
+// ---------------------------------------------------------------------------
+
+// Columns snapshotted into business_snapshots (the high-value tracked fields).
+// `business_id` and `place_id` come from the existing row; `snapshot_at` and
+// `run_id` are supplied by the caller. Order here MUST match the VALUES order
+// in buildSnapshotInsert.
+const SNAPSHOT_COLUMNS = [
+  'business_id',
+  'place_id',
+  'rating',
+  'reviews_count',
+  'business_status',
+  'phone',
+  'website',
+  'run_id',
+];
+
+/**
+ * Build a parameterized multi-row INSERT into business_snapshots. Each row is
+ * the OLD values of one business about to be updated. `snapshotAt` defaults
+ * to NOW() in the schema, so we omit it here (let Postgres stamp it).
+ *
+ * @param {Array<{oldRow: object, runId: number|null}>} rows
+ * @returns {{text: string, params: any[]}}
+ */
+function buildSnapshotInsert(rows) {
+  const params = [];
+  const placeholders = [];
+  let idx = 1;
+  for (const { oldRow, runId } of rows) {
+    const rowPh = [];
+    for (const col of SNAPSHOT_COLUMNS) {
+      rowPh.push('$' + idx);
+      if (col === 'business_id') {
+        params.push(oldRow ? toInt(oldRow.id) : null);
+      } else if (col === 'run_id') {
+        params.push(runId !== undefined ? runId : null);
+      } else if (col === 'rating') {
+        params.push(oldRow ? toNum(oldRow.rating) : null);
+      } else if (col === 'reviews_count') {
+        params.push(oldRow ? toInt(oldRow.reviews_count) : null);
+      } else {
+        // business_status / phone / website → text
+        params.push(oldRow ? toText(oldRow[col]) : null);
+      }
+      idx++;
+    }
+    placeholders.push('(' + rowPh.join(', ') + ')');
+  }
+  const text =
+    'INSERT INTO business_snapshots (' +
+    SNAPSHOT_COLUMNS.join(', ') +
+    ') VALUES ' +
+    placeholders.join(', ');
+  return { text, params };
+}
+
+// Columns written into field_changes. `detected_at` defaults to NOW() in the
+// schema, so we omit it here.
+const FIELD_CHANGE_COLUMNS = [
+  'business_id',
+  'place_id',
+  'field',
+  'old_value',
+  'new_value',
+  'delta',
+  'run_id',
+];
+
+/**
+ * Build a parameterized multi-row INSERT into field_changes. Each row is one
+ * field that changed on one business. `old_value` / `new_value` are stringified
+ * (the column is TEXT); `delta` is the numeric delta for numeric fields, null
+ * for text fields.
+ *
+ * @param {Array<{change: {field, old, new, delta}, placeId: string, businessId: number|null, runId: number|null}>} rows
+ * @returns {{text: string, params: any[]}}
+ */
+function buildFieldChangesInsert(rows) {
+  const params = [];
+  const placeholders = [];
+  let idx = 1;
+  for (const { change, placeId, businessId, runId } of rows) {
+    const rowPh = [];
+    for (const col of FIELD_CHANGE_COLUMNS) {
+      rowPh.push('$' + idx);
+      if (col === 'business_id') {
+        params.push(businessId !== undefined && businessId !== null ? toInt(businessId) : null);
+      } else if (col === 'place_id') {
+        params.push(toText(placeId));
+      } else if (col === 'field') {
+        params.push(toText(change.field));
+      } else if (col === 'old_value') {
+        params.push(change.old === null || change.old === undefined ? null : String(change.old));
+      } else if (col === 'new_value') {
+        params.push(change.new === null || change.new === undefined ? null : String(change.new));
+      } else if (col === 'delta') {
+        params.push(change.delta === null || change.delta === undefined ? null : String(change.delta));
+      } else if (col === 'run_id') {
+        params.push(runId !== undefined ? runId : null);
+      }
+      idx++;
+    }
+    placeholders.push('(' + rowPh.join(', ') + ')');
+  }
+  const text =
+    'INSERT INTO field_changes (' +
+    FIELD_CHANGE_COLUMNS.join(', ') +
+    ') VALUES ' +
+    placeholders.join(', ');
+  return { text, params };
+}
+
 /**
  * Upsert a batch of businesses in a single transaction. For each batch:
  *   1. SELECT existing place_id + data_hash for the whole batch (1 round-trip).
  *   2. Classify each business as insert / update / unchanged (in JS).
  *   3. Multi-row INSERT for the new ones (1 round-trip).
- *   4. Per-row UPDATE for changed ones (N round-trips — optimization deferred
- *      to a later phase; the common case is a fresh scrape with 0 updates).
+ *   4. For changed businesses (Phase 2.2 change tracking):
+ *      a. SELECT the existing rows' id + tracked fields (1 round-trip).
+ *      b. Compute per-field deltas (pure — src/db/deltas.js).
+ *      c. INSERT old values into business_snapshots (1 round-trip, multi-row).
+ *      d. INSERT per-field changes into field_changes (1 round-trip, multi-row).
+ *      e. Per-row UPDATE for changed businesses (N round-trips — optimization
+ *         deferred; the common case is a fresh scrape with 0 updates).
+ *
+ * The snapshot + field_changes writes happen INSIDE the same transaction as
+ * the UPDATE (the caller — persistRunResults — wraps everything in BEGIN/COMMIT,
+ * and a crash mid-batch rolls back via ROLLBACK). This guarantees the
+ * acceptance criterion: "a crash mid-upsert leaves the DB consistent (old
+ * snapshot written, or nothing written)."
  *
  * @param {object} client — pg Client or mock with .query(text, params).
  * @param {object[]} businesses
  * @param {object} [opts] — { runId, batchSize }
- * @returns {Promise<{ inserted: number, updated: number, unchanged: number, details: object[] }>}
+ * @returns {Promise<{ inserted: number, updated: number, unchanged: number, changesByField: object, changesTotal: number, snapshotsWritten: number, details: object[] }>}
  */
 async function upsertBusinessesBatch(client, businesses, opts) {
   if (!client) throw new Error('upsertBusinessesBatch: client is null');
@@ -476,7 +618,15 @@ async function upsertBusinessesBatch(client, businesses, opts) {
   const batchSize = o.batchSize || 50;
 
   const list = Array.isArray(businesses) ? businesses : [];
-  const totals = { inserted: 0, updated: 0, unchanged: 0, details: [] };
+  const totals = {
+    inserted: 0,
+    updated: 0,
+    unchanged: 0,
+    changesByField: summarizeChanges([]).byField, // { rating:0, reviews_count:0, ... }
+    changesTotal: 0,
+    snapshotsWritten: 0,
+    details: [],
+  };
 
   for (let i = 0; i < list.length; i += batchSize) {
     const chunk = list.slice(i, i + batchSize);
@@ -508,7 +658,7 @@ async function upsertBusinessesBatch(client, businesses, opts) {
         toUpdate.push({ business, hash });
       } else {
         totals.unchanged++;
-        totals.details.push({ place_id: business.place_id, action: 'unchanged' });
+        totals.details.push({ place_id: business.place_id, action: 'unchanged', changes: [] });
       }
     }
 
@@ -518,16 +668,78 @@ async function upsertBusinessesBatch(client, businesses, opts) {
       await client.query(ins.text, ins.params);
       totals.inserted += toInsert.length;
       for (const { business } of toInsert) {
-        totals.details.push({ place_id: business.place_id, action: 'inserted' });
+        totals.details.push({ place_id: business.place_id, action: 'inserted', changes: [] });
       }
     }
 
-    // 4. Per-row UPDATE for changed businesses.
-    for (const { business, hash } of toUpdate) {
-      const upd = buildUpdate(business, hash, runId);
-      await client.query(upd.text, upd.params);
-      totals.updated++;
-      totals.details.push({ place_id: business.place_id, action: 'updated' });
+    // 4. Change tracking + UPDATE for changed businesses.
+    if (toUpdate.length > 0) {
+      // 4a. Fetch the existing rows' id + tracked fields (1 round-trip).
+      const updatePlaceIds = toUpdate.map((u) => u.business.place_id);
+      const trackedSel = await client.query(
+        'SELECT id, place_id, rating, reviews_count, business_status, phone, website ' +
+          'FROM businesses WHERE place_id = ANY($1)',
+        [updatePlaceIds],
+      );
+      const oldRows = new Map();
+      for (const row of trackedSel.rows || []) {
+        oldRows.set(row.place_id, row);
+      }
+
+      // 4b. Compute per-field deltas + collect snapshot/field-change rows.
+      const snapshotRows = [];
+      const fieldChangeRows = [];
+      const perBusinessChanges = new Map(); // place_id → changes[]
+      for (const { business } of toUpdate) {
+        const oldRow = oldRows.get(business.place_id) || null;
+        const changes = computeChanges(oldRow, business);
+        perBusinessChanges.set(business.place_id, changes);
+        // Always snapshot the old row when updating — even if no tracked
+        // field changed, the data_hash differed (some non-tracked field
+        // changed), so the snapshot records the pre-update state. This
+        // keeps "what did this business look like before run N?" answerable.
+        snapshotRows.push({ oldRow, runId });
+        for (const change of changes) {
+          fieldChangeRows.push({
+            change,
+            placeId: business.place_id,
+            businessId: oldRow ? oldRow.id : null,
+            runId,
+          });
+        }
+      }
+
+      // 4c. INSERT old values into business_snapshots (1 round-trip, multi-row).
+      if (snapshotRows.length > 0) {
+        const snapIns = buildSnapshotInsert(snapshotRows);
+        await client.query(snapIns.text, snapIns.params);
+        totals.snapshotsWritten += snapshotRows.length;
+      }
+
+      // 4d. INSERT per-field changes into field_changes (1 round-trip, multi-row).
+      if (fieldChangeRows.length > 0) {
+        const fcIns = buildFieldChangesInsert(fieldChangeRows);
+        await client.query(fcIns.text, fcIns.params);
+      }
+
+      // 4e. Per-row UPDATE for changed businesses + roll up change counts.
+      for (const { business, hash } of toUpdate) {
+        const upd = buildUpdate(business, hash, runId);
+        await client.query(upd.text, upd.params);
+        totals.updated++;
+        const changes = perBusinessChanges.get(business.place_id) || [];
+        // Roll up per-field counts for the run banner.
+        const summary = summarizeChanges(changes);
+        for (const f of Object.keys(summary.byField)) {
+          totals.changesByField[f] = (totals.changesByField[f] || 0) + summary.byField[f];
+        }
+        totals.changesTotal += summary.total;
+        totals.details.push({
+          place_id: business.place_id,
+          action: 'updated',
+          changes: changes.map((c) => c.field),
+        });
+      }
     }
   }
 
@@ -587,10 +799,18 @@ async function persistRunResults(pool, args) {
 
       const upsertRes = await upsertBusinessesBatch(client, list, { runId, batchSize: 50 });
 
-      // Stamp the DB counts back onto the run row.
+      // Stamp the DB counts + change-detection totals back onto the run row.
+      // (Phase 2.2 — `changes_detected` is the total field_changes rows written
+      // this run, surfaced in the end-of-run banner.)
       await client.query(
-        'UPDATE scrape_runs SET db_inserted = $1, db_updated = $2, db_unchanged = $3 WHERE id = $4',
-        [upsertRes.inserted, upsertRes.updated, upsertRes.unchanged, runId],
+        'UPDATE scrape_runs SET db_inserted = $1, db_updated = $2, db_unchanged = $3, changes_detected = $4 WHERE id = $5',
+        [
+          upsertRes.inserted,
+          upsertRes.updated,
+          upsertRes.unchanged,
+          upsertRes.changesTotal,
+          runId,
+        ],
       );
 
       await client.query('COMMIT');
@@ -602,6 +822,9 @@ async function persistRunResults(pool, args) {
           inserted: upsertRes.inserted,
           updated: upsertRes.updated,
           unchanged: upsertRes.unchanged,
+          changesDetected: upsertRes.changesTotal,
+          changesByField: upsertRes.changesByField,
+          snapshotsWritten: upsertRes.snapshotsWritten,
         });
       }
 
@@ -610,6 +833,9 @@ async function persistRunResults(pool, args) {
         inserted: upsertRes.inserted,
         updated: upsertRes.updated,
         unchanged: upsertRes.unchanged,
+        changesDetected: upsertRes.changesTotal,
+        changesByField: upsertRes.changesByField,
+        snapshotsWritten: upsertRes.snapshotsWritten,
       };
     } catch (err) {
       try {
@@ -628,6 +854,10 @@ module.exports = {
   JSONB_COLUMNS,
   HASH_COLUMNS,
   INSERT_COLUMNS,
+  // Phase 2.2 — change tracking constants + builders
+  TRACKED_FIELDS,
+  SNAPSHOT_COLUMNS,
+  FIELD_CHANGE_COLUMNS,
   // pure helpers
   computeRowHash,
   decideAction,
@@ -643,6 +873,8 @@ module.exports = {
   // SQL builders (exported for tests)
   buildBatchInsert,
   buildUpdate,
+  buildSnapshotInsert,
+  buildFieldChangesInsert,
   // pool / client lifecycle
   createPool,
   getClient,
@@ -657,6 +889,11 @@ module.exports = {
   upsertBusinessesBatch,
   // pipeline hook
   persistRunResults,
+  // Phase 2.2 — re-export the pure change-tracking helpers (so callers can
+  // `const { computeChanges } = require('./db')` without a second import).
+  computeChanges,
+  summarizeChanges,
   // internal: loadPg (for monkey-patching in tests)
   _loadPg: loadPg,
+  _deltas: deltas,
 };

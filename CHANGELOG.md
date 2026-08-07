@@ -98,6 +98,105 @@ Phase 1 is tagged `v1.0.0-phase1` — the `-phase1` suffix marks the milestone
 - `PHASE2_EXECUTION_PLAN.md` — Phase 2.1 marked ✅ DONE; task checklist and
   acceptance criteria updated with verification notes.
 
+### Phase 2.2 — Change Tracking & History
+
+#### Added
+- **`src/db/deltas.js`** — pure, side-effect-free change-tracking helpers:
+  - `TRACKED_FIELDS` — the five high-value columns clients pay for trend data
+    on: `rating`, `reviews_count`, `business_status`, `phone`, `website`.
+  - `normalizeValue(v)` — null/undefined/`''` collapse to null; finite numbers
+    kept; NaN/Infinity rejected.
+  - `coerceNumber(v)` — parses numeric strings (`'4.5'` → `4.5`), rejects
+    non-numeric strings / NaN / Infinity. Used by `numericDelta` so stringified
+    DB values still produce a meaningful delta.
+  - `valuesEqual(a, b)` — comparison after normalization; numeric string vs
+    number compare equal (`4.5 === '4.5'`).
+  - `numericDelta(old, new)` — `new - old` for numbers (rounded to 1 dp to
+    match `NUMERIC(2,1)` precision); the new value itself when old is null
+    (a business gaining its first rating); null for non-numeric / NaN / Infinity.
+  - `computeChanges(oldRow, newRow, fields?)` — returns an array of
+    `{ field, old, new, delta }` for each tracked field that actually changed
+    (after normalization). Empty array when nothing changed or when `oldRow` is
+    null (brand-new insert — no prior data to diff).
+  - `summarizeChanges(changes)` — `{ total, byField }` rollup for the run banner;
+    `byField` always contains every tracked field (0 when none changed).
+- **`src/db/history.js`** + `npm run db:history` — CLI that prints the change
+  timeline for a single business (keyed by `place_id`):
+  ```
+  Business:  Test Cafe (ChIJxxx)
+  Current:   rating 4.3 | reviews 1289 | status open | phone +1-555-0100 | website https://example.com
+
+  Timeline (5 change events, 2 snapshots):
+    2026-08-07 14:03  rating 4.5 → 4.3  (Δ -0.2)
+    2026-08-07 14:03  reviews 1234 → 1289 (Δ +55)
+    2026-07-01 09:12  rating 4.6 → 4.5  (Δ -0.1)
+  ```
+  - Flags: `--placeId <id>` (required), `--place-id`/`-p` aliases, `--limit N`
+    (default 100, most-recent-first), `--help`/`-h`. A positional connection
+    string overrides `DATABASE_URL`.
+  - Pure formatters (`formatValue`, `formatDelta`, `fieldLabel`,
+    `formatTimestamp`, `formatChangeLine`, `formatCurrentLine`, `parseArgs`)
+    are exported for unit testing.
+- **Schema extension** in `src/db/schema.sql`:
+  - `business_snapshots` table — pre-update snapshot of tracked fields (`id`,
+    `business_id` FK, `place_id` denormalized, `rating`, `reviews_count`,
+    `business_status`, `phone`, `website`, `snapshot_at`, `run_id` FK). Indexes
+    on `(business_id, snapshot_at DESC)`, `place_id`, `run_id`.
+  - `field_changes` table — computed, queryable per-field delta log (`id`,
+    `business_id` FK, `place_id` denormalized, `field`, `old_value`, `new_value`,
+    `delta`, `detected_at`, `run_id` FK). Indexes on
+    `(business_id, field, detected_at DESC)`, `(place_id, detected_at DESC)`,
+    `run_id`.
+  - `scrape_runs.changes_detected` INTEGER column, added via an idempotent
+    `DO $$ … $$` ALTER guard (safe to re-run on Phase 2.1 databases).
+- **Snapshot + field_changes logic** in `src/db.js` `upsertBusinessesBatch`:
+  when a business is classified `updated`, the batch path now:
+  1. SELECTs the existing rows' `id` + tracked fields (1 round-trip, batched).
+  2. INSERTs the OLD values into `business_snapshots` (multi-row, 1 round-trip).
+  3. Computes per-field deltas (`computeChanges`) and INSERTs them into
+     `field_changes` (multi-row, 1 round-trip).
+  4. UPDATEs the `businesses` row (existing path).
+  All four steps run inside the `persistRunResults` BEGIN/COMMIT transaction, so
+  a crash mid-upsert rolls back the snapshot + changes + update atomically.
+- **`buildSnapshotInsert(rows)`** + **`buildFieldChangesInsert(rows)`** — pure,
+  parameterized multi-row INSERT builders (exported for unit testing). SQL-
+  injection-safe: malicious values appear in `params`, never interpolated.
+- **Run-summary extension** — `persistRunResults` now stamps `changes_detected`
+  onto the `scrape_runs` row alongside `db_inserted/updated/unchanged`, and
+  returns `{ changesDetected, changesByField, snapshotsWritten }` in its result.
+- **Banner change breakdown** in `src/index.js` — the end-of-run `DB:` line now
+  includes the per-field change counts when any tracked field changed:
+  `DB: 50 inserted, 30 updated (12 rating changes, 8 review-count changes, 2 status changes), 20 unchanged (run #5)`.
+
+#### Tests
+- **`tests/db-deltas.test.js`** (57 tests) — pure-function coverage for
+  `normalizeValue`, `coerceNumber`, `valuesEqual`, `numericDelta` (incl. null→gain,
+  value→loss, string coercion, NaN, Infinity), `computeChanges` (all five tracked
+  fields, null↔value, empty-string normalization, custom field list),
+  `summarizeChanges`, and every `history.js` pure formatter + `parseArgs`.
+- **`tests/db.test.js`** extended (65 → 84 tests):
+  - Mock client now mirrors `business_snapshots` + `field_changes` in-memory
+    (with transaction snapshot/restore so ROLLBACK clears them).
+  - New sections: change-tracking on update (insert→no snapshots, unchanged→no
+    snapshots, changed reviews_count→1 snapshot + 1 field_change, rating delta
+    -0.2, status flip null delta, multi-field update, `changesByField` rollup,
+    `persistRunResults` stamps `changes_detected`).
+  - SQL-builder tests for `buildSnapshotInsert` / `buildFieldChangesInsert`
+    (parameterization, null handling, SQL-injection safety).
+  - Integration tests (guarded on `DATABASE_URL`) now drop + recreate all four
+    tables and verify a real Postgres re-scrape writes snapshot + field_changes
+    rows; an identical re-scrape writes neither.
+
+#### Documentation
+- `PHASE2_EXECUTION_PLAN.md` — Phase 2.2 marked ✅ DONE (3 of 13); task checklist
+  and acceptance criteria updated with verification notes.
+- `README.md` — Phase 2.2 section added (change tracking overview, tracked
+  fields, `npm run db:history` usage, banner output example).
+- `package.json` — `db:history` script added; `syntax` script now checks
+  `src/db/deltas.js` + `src/db/history.js`.
+
+**Test count:** 551 tests / 1407 assertions (was 475 / 1028).
+
 ---
 
 ## [Unreleased] — post-v1.0.0-phase1 hotfixes

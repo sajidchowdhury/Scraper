@@ -475,8 +475,23 @@ async function main() {
       if (dbResult.failed) {
         outputLines.push(`DB:       FAILED — ${dbResult.message}`);
       } else {
+        // Phase 2.2 — include the change breakdown when any tracked field
+        // changed. Format: "30 updated (12 rating changes, 8 review-count
+        // changes, 2 status changes), 20 unchanged". When there are zero
+        // changes, fall back to the compact Phase 2.1 line.
+        const cbf = dbResult.changesByField || {};
+        const changeParts = [];
+        if (cbf.rating) changeParts.push(`${cbf.rating} rating changes`);
+        if (cbf.reviews_count) changeParts.push(`${cbf.reviews_count} review-count changes`);
+        if (cbf.business_status) changeParts.push(`${cbf.business_status} status changes`);
+        if (cbf.phone) changeParts.push(`${cbf.phone} phone changes`);
+        if (cbf.website) changeParts.push(`${cbf.website} website changes`);
+        const changesClause =
+          dbResult.updated > 0 && changeParts.length > 0
+            ? ` (${changeParts.join(', ')})`
+            : '';
         outputLines.push(
-          `DB:       ${dbResult.inserted} inserted, ${dbResult.updated} updated, ${dbResult.unchanged} unchanged (run #${dbResult.runId})`,
+          `DB:       ${dbResult.inserted} inserted, ${dbResult.updated} updated${changesClause}, ${dbResult.unchanged} unchanged (run #${dbResult.runId})`,
         );
       }
     }

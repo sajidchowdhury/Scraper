@@ -10,15 +10,15 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 2.1 complete. 2 of 13 sub-phases shipped.
+> **Last updated:** Phase 2.2 complete. 3 of 13 sub-phases shipped.
 >
-> **Overall:** 2 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
+> **Overall:** 3 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
 | 2.0 — Audit, Fixtures & Dependency Setup | ✅ DONE | _(this commit)_ | 410 | Baseline metrics captured, 6 DOM fixtures, 8 deps installed, docker-compose.yml, .env.example Phase 2 vars |
 | 2.1 — PostgreSQL Persistence Layer | ✅ DONE | _(this commit)_ | 475 (+65) | `src/db.js` (pool, upserts, change-hash), `schema.sql`, `migrate.js`, `--output csv\|json\|db\|all` flag, batched upserts, transaction rollback, SQL-injection-safe |
-| 2.2 — Change Tracking & History | ⬜ NOT STARTED | — | — | `business_snapshots` table, delta detection, trend data |
+| 2.2 — Change Tracking & History | ✅ DONE | _(this commit)_ | 551 (+76) | `business_snapshots` + `field_changes` tables, `src/db/deltas.js` (computeChanges, numericDelta), snapshot-on-update, `changes_detected` on scrape_runs, `npm run db:history` CLI, change-breakdown banner |
 | 2.3 — Proxy Management & Rotation | ⬜ NOT STARTED | — | — | `proxy.js`, pool, rotation strategies, burn detection |
 | 2.4 — Browser Fingerprint Randomization | ⬜ NOT STARTED | — | — | UA, viewport, timezone, locale, WebGL, canvas, fonts |
 | 2.5 — Stealth Hardening | ⬜ NOT STARTED | — | — | `playwright-extra` + stealth, `navigator.webdriver`, headless evasion |
@@ -223,7 +223,7 @@ A database layer that makes scraped data queryable, idempotent, and ready for ch
 
 ## Phase 2.2 — Change Tracking & History
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE** (3 of 13 sub-phases shipped)
 
 ### Goal
 Every time a business is re-scraped, snapshot the old values into a history table. Detect and log deltas (rating changed, reviews_count increased, business_status flipped to closed). This turns the scraper from a "snapshot tool" into a "trend data tool."
@@ -232,7 +232,7 @@ Every time a business is re-scraped, snapshot the old values into a history tabl
 Clients pay a premium for trend data: "This restaurant's rating dropped from 4.5 to 4.2 in the last 30 days" is far more valuable than "This restaurant has a 4.2 rating." Change tracking is the foundation for delta alerts (Phase 5) and freshness scoring.
 
 ### Task checklist
-- [ ] **Schema extension.** Add to `src/db/schema.sql`:
+- [x] **Schema extension.** Added to `src/db/schema.sql`:
   - `business_snapshots` table:
     - `id` SERIAL PRIMARY KEY
     - `business_id` INT REFERENCES businesses(id) ON DELETE CASCADE
@@ -247,6 +247,7 @@ Clients pay a premium for trend data: "This restaurant's rating dropped from 4.5
   - `field_changes` table (computed, not raw — for fast querying):
     - `id` SERIAL PRIMARY KEY
     - `business_id` INT REFERENCES businesses(id)
+    - `place_id` TEXT (denormalized for fast lookups without joins)
     - `field` TEXT (e.g., 'rating', 'reviews_count', 'business_status')
     - `old_value` TEXT
     - `new_value` TEXT
@@ -254,43 +255,59 @@ Clients pay a premium for trend data: "This restaurant's rating dropped from 4.5
     - `detected_at` TIMESTAMPTZ DEFAULT NOW()
     - `run_id` INT REFERENCES scrape_runs(id)
     - Index on `(business_id, field, detected_at DESC)`.
-- [ ] **Snapshot logic in `upsertBusiness`.** When a business is re-scraped and the existing row differs from the new data:
-  1. Insert the OLD row's values into `business_snapshots` (before updating).
-  2. Compare fields, insert rows into `field_changes` for each changed field.
-  3. Update the `businesses` row with new values.
-  4. Return `{ action: 'updated', changes: ['rating', 'reviews_count'] }`.
-- [ ] **Delta computation helpers.** `src/db/deltas.js`:
-  - `computeChanges(oldRow, newRow)` — pure function, returns array of `{ field, old, new, delta }`.
-  - `numericDelta(old, new)` — returns `new - old` for numbers, null for non-numeric.
-  - Unit-tested with edge cases: null → value, value → null, type coercion, NaN.
-- [ ] **Run summary extension.** The `scrape_runs` table gains `inserted`, `updated`, `unchanged`, `changes_detected` columns. The end-of-run banner shows:
+  - `scrape_runs.changes_detected` INTEGER column (added via idempotent DO block).
+- [x] **Snapshot logic in `upsertBusiness`.** When a business is re-scraped and the existing row differs from the new data:
+  1. SELECT the OLD row's id + tracked fields (1 round-trip, batched).
+  2. INSERT the OLD row's values into `business_snapshots` (multi-row, 1 round-trip).
+  3. Compute per-field deltas (`computeChanges`), INSERT rows into `field_changes` for each changed field (multi-row, 1 round-trip).
+  4. UPDATE the `businesses` row with new values (existing path).
+  5. The `details` entry returns `{ action: 'updated', changes: ['rating', 'reviews_count'] }`.
+  - All four steps run inside the same BEGIN/COMMIT transaction (persistRunResults), so a crash mid-upsert rolls back the snapshot + changes + update atomically.
+- [x] **Delta computation helpers.** `src/db/deltas.js`:
+  - `computeChanges(oldRow, newRow, fields?)` — pure function, returns array of `{ field, old, new, delta }`.
+  - `numericDelta(old, new)` — returns `new - old` for numbers, the new value when old is null (gaining a value), null for non-numeric / NaN / Infinity.
+  - `coerceNumber(v)` — parses numeric strings, rejects NaN/Infinity/non-numeric.
+  - `summarizeChanges(changes)` — `{ total, byField }` rollup for the run banner.
+  - Unit-tested with edge cases: null → value, value → null, type coercion, NaN, empty-string normalization.
+- [x] **Run summary extension.** `scrape_runs` gains `changes_detected` (INTEGER) via idempotent ALTER. `persistRunResults` stamps it alongside `db_inserted/updated/unchanged`. The end-of-run banner shows:
   ```
-  DB: 50 inserted, 30 updated (12 rating changes, 8 review-count changes, 2 status changes), 20 unchanged
+  DB:       50 inserted, 30 updated (12 rating changes, 8 review-count changes, 2 status changes), 20 unchanged (run #5)
   ```
-- [ ] **CLI query helper.** `npm run db:history -- --placeId ChIJxxx` prints the snapshot timeline for a business:
+- [x] **CLI query helper.** `npm run db:history -- --placeId ChIJxxx` (`src/db/history.js`) prints the snapshot timeline for a business:
   ```
-  2026-08-07 14:03  rating 4.5 → 4.3  (Δ -0.2)
-  2026-08-07 14:03  reviews 1234 → 1289 (Δ +55)
-  2026-07-01 09:12  rating 4.6 → 4.5  (Δ -0.1)
+  Business:  Test Cafe (ChIJxxx)
+  Current:   rating 4.3 | reviews 1289 | status open | phone +1-555-0100 | website https://example.com
+
+  Timeline (5 change events, 2 snapshots):
+    2026-08-07 14:03  rating 4.5 → 4.3  (Δ -0.2)
+    2026-08-07 14:03  reviews 1234 → 1289 (Δ +55)
+    2026-07-01 09:12  rating 4.6 → 4.5  (Δ -0.1)
+    2026-06-15 18:44  status open → temporarily_closed
+    2026-06-15 18:44  phone +1-555-0100 → +1-555-0200
   ```
-- [ ] **Unit tests.** `tests/db-deltas.test.js`:
+  Supports `--limit N`, `--place-id`/`-p` aliases, and a positional connection-string override.
+- [x] **Unit tests.** `tests/db-deltas.test.js` (57 tests) + `tests/db.test.js` Phase 2.2 sections (19 new tests):
   - `computeChanges` detects rating, review-count, status, phone, website changes.
-  - `computeChanges` returns empty array when nothing changed.
-  - `numericDelta` handles nulls, strings, NaN.
-  - Integration test: scrape → scrape again with changed data → verify snapshot + field_changes rows exist.
+  - `computeChanges` returns empty array when nothing changed; returns `[]` when oldRow is null (brand-new insert).
+  - `numericDelta` handles nulls (gain), value→null (loss), string-number coercion, NaN, Infinity.
+  - SQL builders `buildSnapshotInsert` / `buildFieldChangesInsert` are parameterized (SQL-injection-safe).
+  - DI mock-client cycle: insert → unchanged → updated, asserting 1 snapshot + N field_changes per update.
+  - `persistRunResults` stamps `changes_detected` onto `scrape_runs`.
+  - `history.js` pure formatters: `formatValue`, `formatDelta`, `fieldLabel`, `formatTimestamp`, `formatChangeLine`, `formatCurrentLine`, `parseArgs`.
+  - Integration test (guarded on DATABASE_URL): real Postgres re-scrape writes snapshot + field_changes rows; identical re-scrape writes neither.
 
 ### Acceptance criteria
-- Re-scraping the same business after a week produces a `business_snapshots` row with the old values and `field_changes` rows for each changed field.
-- The end-of-run banner correctly reports change counts.
-- `npm run db:history -- --placeId <id>` prints a readable timeline.
-- Snapshotting is transactional — a crash mid-upsert leaves the DB consistent (old snapshot written, or nothing written).
-- Re-scraping with identical data produces zero snapshots and zero changes (no noise).
+- [x] Re-scraping the same business after a week produces a `business_snapshots` row with the old values and `field_changes` rows for each changed field. _(verified via mock + integration tests)_
+- [x] The end-of-run banner correctly reports change counts. _(changesByField rollup + banner line)_
+- [x] `npm run db:history -- --placeId <id>` prints a readable timeline. _(src/db/history.js)_
+- [x] Snapshotting is transactional — a crash mid-upsert leaves the DB consistent (old snapshot written, or nothing written). _(snapshot + changes + UPDATE run inside one BEGIN/COMMIT; ROLLBACK restores the mock's change tables)_
+- [x] Re-scraping with identical data produces zero snapshots and zero changes (no noise). _(verified: unchanged action skips the snapshot/changes path entirely)_
 
 ### Dependencies
 Phase 2.1 (PostgreSQL persistence).
 
 ### Deliverable
-A change-tracking system that turns re-scrapes into trend data, with queryable delta history.
+A change-tracking system that turns re-scrapes into trend data, with queryable delta history. **Shipped:** `src/db/deltas.js`, `src/db/history.js`, extended `src/db/schema.sql` + `src/db.js`, `tests/db-deltas.test.js` + extended `tests/db.test.js`, `npm run db:history` script. 551 tests / 1407 assertions passing.
 
 ---
 

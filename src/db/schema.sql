@@ -115,3 +115,89 @@ BEGIN
       FOREIGN KEY (run_id) REFERENCES scrape_runs (id) ON DELETE SET NULL;
   END IF;
 END $$;
+
+-- ===========================================================================
+-- Phase 2.2 — Change Tracking & History
+-- ===========================================================================
+-- Two new tables turn re-scrapes into trend data:
+--   - business_snapshots: the OLD values of high-value fields, captured the
+--     moment before an UPDATE overwrites them. One row per update event.
+--   - field_changes: a computed, queryable delta log — one row per field that
+--     actually changed in a given update. Supports fast "show me every rating
+--     change for business X" queries without diffing snapshot rows.
+--
+-- Tracked fields (the ones clients pay a premium for trend data on):
+--   rating, reviews_count, business_status, phone, website
+-- These are the columns snapshotted AND the fields compared in field_changes.
+-- The full businesses row is never overwritten without a snapshot being
+-- written first, inside the same transaction (see src/db.js upsertBusinessesBatch).
+--
+-- `changes_detected` is added to scrape_runs so the end-of-run banner can
+-- report "30 updated (12 rating changes, 8 review-count changes, ...)".
+-- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- business_snapshots — pre-update snapshot of high-value fields
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS business_snapshots (
+  id              SERIAL PRIMARY KEY,
+  business_id     INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  place_id        TEXT NOT NULL,   -- denormalized for fast lookups without joins
+  rating          NUMERIC(2, 1),
+  reviews_count   INTEGER,
+  business_status TEXT,
+  phone           TEXT,
+  website         TEXT,
+  snapshot_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  run_id          INTEGER REFERENCES scrape_runs(id) ON DELETE SET NULL
+);
+
+-- "Latest N snapshots for a business" — the common history-query pattern.
+CREATE INDEX IF NOT EXISTS idx_snapshots_business_time
+  ON business_snapshots (business_id, snapshot_at DESC);
+-- Lookup by place_id (used by the `db:history` CLI helper).
+CREATE INDEX IF NOT EXISTS idx_snapshots_place_id
+  ON business_snapshots (place_id);
+-- Lookup by run_id (used by run-summary rollups).
+CREATE INDEX IF NOT EXISTS idx_snapshots_run_id
+  ON business_snapshots (run_id);
+
+-- ---------------------------------------------------------------------------
+-- field_changes — computed, queryable per-field delta log
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS field_changes (
+  id            SERIAL PRIMARY KEY,
+  business_id   INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  place_id      TEXT NOT NULL,     -- denormalized for fast lookups without joins
+  field         TEXT NOT NULL,     -- e.g. 'rating', 'reviews_count', 'business_status'
+  old_value     TEXT,              -- stringified old value (null → 'null' omitted)
+  new_value     TEXT,              -- stringified new value
+  delta         TEXT,              -- numeric delta for numeric fields, NULL for text
+  detected_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  run_id        INTEGER REFERENCES scrape_runs(id) ON DELETE SET NULL
+);
+
+-- "Show me every rating change for business X, most recent first."
+CREATE INDEX IF NOT EXISTS idx_changes_business_field_time
+  ON field_changes (business_id, field, detected_at DESC);
+-- Lookup by place_id (used by the `db:history` CLI helper).
+CREATE INDEX IF NOT EXISTS idx_changes_place_id_time
+  ON field_changes (place_id, detected_at DESC);
+-- Lookup by run_id (used by run-summary rollups).
+CREATE INDEX IF NOT EXISTS idx_changes_run_id
+  ON field_changes (run_id);
+
+-- ---------------------------------------------------------------------------
+-- scrape_runs.changes_detected — total field_changes rows written this run.
+-- Added via ALTER (with IF NOT EXISTS guard emulated via a DO block) so the
+-- migration is re-runnable against Phase 2.1 databases.
+-- ---------------------------------------------------------------------------
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'scrape_runs' AND column_name = 'changes_detected'
+  ) THEN
+    ALTER TABLE scrape_runs ADD COLUMN changes_detected INTEGER;
+  END IF;
+END $$;
