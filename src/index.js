@@ -112,6 +112,16 @@ const { createPool, persistRunResults, closePool } = require('./db');
 // Phase 2.3 — proxy management & rotation. Only initialized when cfg.proxy
 // is enabled (i.e. --noProxy is not set AND a proxy source is configured).
 const { createProxyPool } = require('./proxy');
+// Phase 2.8 — worker pool & concurrency. Only used when --workers > 1; with
+// --workers 1 (the default) the existing single-browser pipeline runs unchanged.
+// Aliased as createWorkerPool to avoid colliding with the DB pool's createPool.
+const { createPool: createWorkerPool } = require('./pool');
+const {
+  createWorker,
+  createSearchTask,
+  createDetailTask,
+  validateTask,
+} = require('./worker');
 
 async function main() {
   const cfg = loadConfig(process.argv.slice(2));
@@ -500,10 +510,461 @@ async function main() {
   };
   process.on('SIGINT', onSigInt);
 
+  // Phase 2.8 — worker pool & concurrency. --workers 1 (the default) preserves
+  // Phase 1 sequential behavior EXACTLY (the existing single-browser pipeline
+  // below runs unchanged). --workers N > 1 constructs a pool of N isolated
+  // browser workers, each with its own proxy + fingerprint + session + rate
+  // limiter, and dispatches tasks across them with self-healing on per-worker
+  // failures (block → cooldown + re-queue; crash → restart, retire after limit).
+  if (cfg.workers.size > 1) {
+    logger.info('Phase 2.8 — worker pool enabled', {
+      size: cfg.workers.size,
+      proxyStrategy: cfg.workers.proxyStrategy,
+      loadBalancer: cfg.workers.loadBalancer,
+      crashLimit: cfg.workers.crashLimit,
+      cooldownMs: cfg.workers.cooldownMs,
+      detailBatchSize: cfg.workers.detailBatchSize,
+      taskRetries: cfg.workers.taskRetries === null ? cfg.workers.size : cfg.workers.taskRetries,
+    });
+  } else {
+    logger.info('Phase 2.8 — worker pool disabled (size 1 — Phase 1 sequential behavior)', {
+      hint: 'Use --workers N to run N parallel browser workers',
+    });
+  }
+
+  // Phase 2.8 — runWithPool: the multi-worker pipeline. Builds a pool, dispatches
+  // a search-task (search + scroll + extract) to one worker, then — if deepScrape
+  // — splits the businesses into detail-task batches and runs them in parallel
+  // across the pool. Returns the same `result` shape as the sequential pipeline
+  // so the downstream export/summary/banner logic is shared.
+  const runWithPool = async () => {
+    // getIdentity — called per worker (initial + after every block/crash
+    // rotation). Acquires a proxy from the proxy pool, generates a fresh
+    // fingerprint, and builds a per-worker session manager + rate limiter.
+    // With proxyStrategy 'isolated' each worker pins its proxy; with 'shared'
+    // a new proxy is drawn from the pool on every rotation (more IPs, less
+    // stickiness). When no proxy pool is configured, proxy is null (direct).
+    const getIdentity = async () => {
+      let proxy = null;
+      if (proxyPool) {
+        proxy = await proxyPool.acquire();
+        // If the pool is exhausted, fall back to a direct connection for this
+        // worker rather than crashing the whole run. The burn detector will
+        // recycle proxies as their cooldowns elapse.
+        if (!proxy) {
+          logger.warn('Worker getIdentity: proxy pool exhausted — worker will run direct', {
+            hint: 'Add more proxies or wait for cooldowns to elapse',
+          });
+        }
+      }
+      // Each worker gets its own fingerprint (Phase 2.4) so N workers don't
+      // share an identity. --noFingerprint → null (Phase 1 behavior per worker).
+      let fp = null;
+      if (cfg.fingerprint.profile !== 'off') {
+        fp = generateFingerprint({ logger: logger.phase('fingerprint') });
+      }
+      // Per-worker session manager (Phase 2.7) + rate limiter (Phase 1.8).
+      // Each worker's rate limiter caps THAT worker's Google-bound request rate
+      // at cfg.antiblock.maxRequestsPerMin — with isolated proxies this is a
+      // per-IP cap, so N workers = N× the aggregate rate (each from its own IP).
+      const workerRateLimiter = new RateLimiter(cfg.antiblock.maxRequestsPerMin, {
+        logger: logger.phase('antiblock'),
+      });
+      const workerSessionCreateContext = createRealContextFactory({
+        cfg,
+        logger,
+        stealth: cfg.stealth.resolved || { enabled: false, debug: false },
+      });
+      const workerWarmupFn = cfg.session.warmup
+        ? async (page, ctx) =>
+            warmupContext(page, {
+              logger: (ctx && ctx.logger) || logger.phase('session'),
+              durationMs: cfg.session.warmupDurationMs,
+              sleepFn: ctx && ctx.sleepFn,
+            })
+        : null;
+      const workerSessionManager = createSessionManager({
+        maxRequests: cfg.session.maxRequests,
+        maxAgeMs: cfg.session.maxAgeMs,
+        warmup: cfg.session.warmup,
+        warmupFn: workerWarmupFn,
+        createContext: workerSessionCreateContext,
+        logger: logger.phase('session'),
+      });
+      return { proxy, fingerprint: fp, sessionManager: workerSessionManager, rateLimiter: workerRateLimiter };
+    };
+
+    // runTask — the per-worker task executor. Handles search-task (search +
+    // scroll + extract) and detail-task (deep-scrape a batch). Each task
+    // launches its own browser via withBrowser using the worker's identity,
+    // so a block/crash + rotateIdentity gives the next task a fresh browser.
+    const runTask = async (worker, task) => {
+      // Per-worker cfg: same as the base cfg but with the worker's own rate
+      // limiter wired in (so detail.js / search.js rate-limit against THIS
+      // worker's limiter, not the shared one).
+      const wcfg = { ...cfg, rateLimiter: worker.rateLimiter };
+      const wlogger = worker.logger || logger;
+      const taskErrs = validateTask(task);
+      if (taskErrs.length > 0) {
+        throw new Error(`invalid task: ${taskErrs.join('; ')}`);
+      }
+
+      if (task.type === 'search-task') {
+        // Search + scroll + extract on the worker's browser. Mirrors the
+        // sequential pipeline minus deep-scrape (deep-scrape runs as separate
+        // detail-tasks so it can be parallelized).
+        return withBrowser(
+          wcfg,
+          async ({ page, browser }) => {
+            if (cfg.session.warmup) {
+              try {
+                await warmupContext(page, {
+                  logger: wlogger.phase('session'),
+                  durationMs: cfg.session.warmupDurationMs,
+                });
+              } catch (err) {
+                wlogger.phase('session').warn('Worker warmup failed (non-fatal)', {
+                  workerId: worker.id,
+                  error: err.message,
+                });
+              }
+            }
+            await performSearch(page, wcfg, wlogger, wcfg.retry, wcfg.rateLimiter);
+            const scrollResult = await scrollFeedToBottomOnPage(page, wcfg, wlogger);
+            wlogger.info('Worker scroll complete', {
+              workerId: worker.id,
+              finalCount: scrollResult.finalCount,
+              reason: scrollResult.reason,
+              elapsedMs: scrollResult.elapsedMs,
+            });
+            const { businesses: freshBusinesses, extractionRates, stats: extractStats } =
+              await extractBusinesses(page, {
+                query: task.query || cfg.query,
+                location: task.location || cfg.location,
+                logger: wlogger,
+                retry: wcfg.retry,
+              });
+            return { businesses: freshBusinesses, scrollResult, extractionRates, extractStats };
+          },
+          {
+            logger: wlogger,
+            proxy: worker.proxy,
+            fingerprint: worker.fingerprint,
+            stealth: cfg.stealth.resolved,
+            onBlocked: ({ status, url }) => {
+              wlogger.warn('Worker got a block-status response', {
+                workerId: worker.id,
+                status,
+                url,
+              });
+            },
+          },
+        );
+      }
+
+      if (task.type === 'detail-task') {
+        // Deep-scrape a batch of businesses. Each worker navigates to Maps,
+        // searches + scrolls (so the feed loads + the batch's businesses are
+        // findable by name), then deepScrapeAll on just the batch. Parallelism:
+        // N workers each scrape M/N businesses → ~N× faster than sequential.
+        const batch = Array.isArray(task.businesses) ? task.businesses : [];
+        return withBrowser(
+          wcfg,
+          async ({ page, browser }) => {
+            if (cfg.session.warmup) {
+              try {
+                await warmupContext(page, {
+                  logger: wlogger.phase('session'),
+                  durationMs: cfg.session.warmupDurationMs,
+                });
+              } catch (err) {
+                wlogger.phase('session').warn('Worker warmup failed (non-fatal)', {
+                  workerId: worker.id,
+                  error: err.message,
+                });
+              }
+            }
+            await performSearch(page, wcfg, wlogger, wcfg.retry, wcfg.rateLimiter);
+            await scrollFeedToBottomOnPage(page, wcfg, wlogger);
+            // deepScrapeAll mutates the batch array in place (replaces slots
+            // with merged-detail objects). We return the batch so the caller
+            // can write the detail fields back to the master array.
+            const detailStats = await deepScrapeAll(page, batch, wcfg, wlogger, {
+              captchaCheck: cfg.antiblock.captchaPause
+                ? async () => {
+                    if (cfg.captcha.resolved && cfg.captcha.resolved.solver) {
+                      const r = await handleCaptcha(page, {
+                        solver: cfg.captcha.resolved.solver,
+                        budgetGuard: cfg.captcha.resolved.budgetGuard,
+                        costLogger: cfg.captcha.resolved.costLogger,
+                        logger: wlogger.phase('captcha'),
+                        captchaWaitMs: 0,
+                      });
+                      if (r.resolved) return { detected: false, indicator: null };
+                      return { detected: true, indicator: r.indicator };
+                    }
+                    return detectCaptcha(page);
+                  }
+                : null,
+              captchaWaitMs: cfg.antiblock.captchaWaitMs,
+            });
+            return { businesses: batch, detailStats };
+          },
+          {
+            logger: wlogger,
+            proxy: worker.proxy,
+            fingerprint: worker.fingerprint,
+            stealth: cfg.stealth.resolved,
+            onBlocked: ({ status, url }) => {
+              wlogger.warn('Worker got a block-status response', {
+                workerId: worker.id,
+                status,
+                url,
+              });
+            },
+          },
+        );
+      }
+
+      throw new Error(`unknown task type: ${task.type}`);
+    };
+
+    // Build the pool. createWorker is the real factory (DI: runTask injected).
+    const pool = createWorkerPool({
+      size: cfg.workers.size,
+      cfg,
+      createWorker: (wOpts) => createWorker({ ...wOpts, runTask }),
+      getIdentity,
+      loadBalancer: cfg.workers.loadBalancer,
+      crashLimit: cfg.workers.crashLimit,
+      cooldownMs: cfg.workers.cooldownMs,
+      taskRetries: cfg.workers.taskRetries === null ? cfg.workers.size : cfg.workers.taskRetries,
+      logger,
+    });
+
+    let poolResult;
+    try {
+      // 1) Dispatch the search-task (runs on one worker; the rest idle until
+      //    detail batches are dispatched).
+      const searchTask = createSearchTask({
+        query: cfg.query,
+        location: cfg.location,
+        maxResults: cfg.maxResults,
+      });
+      logger.info('Phase 2.8 — dispatching search-task to worker pool', {
+        taskId: searchTask.id,
+        size: cfg.workers.size,
+      });
+      const searchResult = await pool.dispatch(searchTask);
+
+      // Dedup against checkpoint (same logic as the sequential pipeline).
+      let newCount = 0;
+      let skipCount = 0;
+      const allBusinesses = existingBusinesses.slice();
+      const seenKeys = new Set(dedupSet);
+      for (const b of searchResult.businesses) {
+        const k = dedupKey(b);
+        if (k && seenKeys.has(k)) {
+          skipCount++;
+        } else {
+          allBusinesses.push(b);
+          if (k) seenKeys.add(k);
+          newCount++;
+        }
+      }
+      logger.info('Worker pool extraction + checkpoint dedup complete', {
+        fresh: searchResult.businesses.length,
+        existing: existingBusinesses.length,
+        new: newCount,
+        skipped: skipCount,
+        total: allBusinesses.length,
+      });
+
+      // Stamp EMPTY_DETAIL on new records (stable output schema).
+      for (let i = 0; i < allBusinesses.length; i++) {
+        if (!allBusinesses[i].detail_scraped) {
+          allBusinesses[i] = { ...allBusinesses[i], ...EMPTY_DETAIL };
+        }
+      }
+
+      let detailStats = null;
+      if (cfg.deepScrape) {
+        // 2) Split into detail-task batches + dispatch in parallel across the
+        //    pool. Each batch is a slice of allBusinesses; after a batch
+        //    completes we write the detail-enriched records back by index.
+        const batchSize = cfg.workers.detailBatchSize;
+        const batches = [];
+        for (let i = 0; i < allBusinesses.length; i += batchSize) {
+          const slice = allBusinesses.slice(i, i + batchSize).map((b) => ({ ...b }));
+          batches.push({ startIdx: i, businesses: slice });
+        }
+        logger.info('Phase 2.8 — dispatching detail-task batches to worker pool', {
+          total: allBusinesses.length,
+          batches: batches.length,
+          batchSize,
+          workers: cfg.workers.size,
+        });
+        const detailTasks = batches.map((b) =>
+          createDetailTask({ businesses: b.businesses, opts: { startIdx: b.startIdx } }),
+        );
+        const settled = await pool.dispatchBatchSettled(detailTasks);
+
+        // Merge batch results back into allBusinesses by startIdx.
+        let attempted = 0;
+        let succeeded = 0;
+        let failed = 0;
+        const durations = [];
+        const errors = {};
+        let batchIdx = 0;
+        for (const r of settled.results) {
+          const startIdx = batches[batchIdx].startIdx;
+          if (r.status === 'fulfilled' && r.value && Array.isArray(r.value.businesses)) {
+            for (let j = 0; j < r.value.businesses.length; j++) {
+              allBusinesses[startIdx + j] = r.value.businesses[j];
+            }
+            if (r.value.detailStats) {
+              attempted += r.value.detailStats.attempted || 0;
+              succeeded += r.value.detailStats.succeeded || 0;
+              failed += r.value.detailStats.failed || 0;
+              if (Array.isArray(r.value.detailStats.durations)) {
+                durations.push(...r.value.detailStats.durations);
+              }
+              if (r.value.detailStats.errors) {
+                for (const [k, v] of Object.entries(r.value.detailStats.errors)) {
+                  errors[k] = (errors[k] || 0) + v;
+                }
+              }
+            }
+          } else {
+            // Batch failed entirely — count its businesses as failed.
+            const cnt = batches[batchIdx].businesses.length;
+            attempted += cnt;
+            failed += cnt;
+            const reason = r.reason ? r.reason.message : 'batch failed';
+            errors[reason] = (errors[reason] || 0) + cnt;
+            logger.error('Detail batch failed', {
+              startIdx,
+              count: cnt,
+              error: reason,
+            });
+          }
+          batchIdx++;
+        }
+        const avgMs = durations.length > 0 ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : 0;
+        const minMs = durations.length > 0 ? Math.min(...durations) : 0;
+        const maxMs = durations.length > 0 ? Math.max(...durations) : 0;
+        detailStats = {
+          attempted,
+          succeeded,
+          failed,
+          successRate: attempted > 0 ? Math.round((succeeded / attempted) * 100) : 0,
+          avgMs,
+          minMs,
+          maxMs,
+          errors,
+          durations,
+        };
+        logger.info('Worker pool deep-scrape complete', {
+          attempted,
+          succeeded,
+          failed,
+          successRate: detailStats.successRate,
+          batches: batches.length,
+          batchFailures: settled.rejected,
+        });
+      }
+
+      // Aggregate per-worker session stats (each worker has its own manager).
+      let sessionsCreated = 0;
+      let rotations = 0;
+      let totalRequests = 0;
+      const warmup = cfg.session.warmup;
+      let ageSum = 0;
+      let sessionCount = 0;
+      for (const w of pool.workers) {
+        if (w.sessionManager && typeof w.sessionManager.stats === 'function') {
+          const s = w.sessionManager.stats();
+          sessionsCreated += s.sessionsCreated || 0;
+          rotations += s.rotations || 0;
+          totalRequests += s.totalRequests || 0;
+          if (s.avgAgeMs) {
+            ageSum += s.avgAgeMs;
+            sessionCount++;
+          }
+        }
+      }
+
+      poolResult = {
+        businesses: allBusinesses,
+        extractionRates: searchResult.extractionRates,
+        scrollResult: searchResult.scrollResult,
+        detailStats,
+        extractStats: searchResult.extractStats,
+        recovery: {
+          resumed: resume,
+          existingCount: existingBusinesses.length,
+          newCount,
+          skipped: skipCount,
+        },
+        antiblock: {
+          maxRPM: cfg.antiblock.maxRequestsPerMin,
+          rateLimitWaits: 0, // per-worker limiters; aggregate omitted for brevity
+          humanTyping: cfg.antiblock.humanTyping,
+        },
+        captcha: cfg.captcha.resolved && cfg.captcha.resolved.costLogger
+          ? {
+              provider: cfg.captcha.provider,
+              fallback: cfg.captcha.fallbackProvider || null,
+              budget: cfg.captcha.budget,
+              spent: cfg.captcha.resolved.budgetGuard ? cfg.captcha.resolved.budgetGuard.spent : 0,
+              budgetExceeded: cfg.captcha.resolved.budgetGuard ? cfg.captcha.resolved.budgetGuard.exceeded : false,
+              costLog: cfg.captcha.resolved.costLogger.summary(),
+              costLogPath: cfg.captcha.resolved.costLogger.filePath,
+            }
+          : { provider: 'none', costLog: { count: 0, totalCost: 0, avgMs: 0 } },
+        session: {
+          enabled: true,
+          sessionsCreated,
+          rotations,
+          totalRequests,
+          avgRequestsPerSession: sessionsCreated > 0 ? Math.round(totalRequests / sessionsCreated) : 0,
+          avgAgeMs: sessionCount > 0 ? Math.round(ageSum / sessionCount) : 0,
+          warmup,
+        },
+        pool: pool.stats(),
+      };
+    } finally {
+      // Graceful pool shutdown — workers finish current tasks, release proxies.
+      try {
+        await pool.shutdown();
+      } catch (err) {
+        logger.warn('Pool shutdown error (non-fatal)', { error: err.message });
+      }
+      // Release any proxies still held by retired workers (best-effort).
+      if (proxyPool) {
+        for (const w of pool.workers) {
+          if (w.proxy && w.proxy.id) {
+            try {
+              proxyPool.release(w.proxy.id, { success: !w.isRetired() });
+            } catch {
+              /* best-effort */
+            }
+          }
+        }
+      }
+    }
+    return poolResult;
+  };
+
   const startedAt = Date.now();
   let result;
 
   try {
+    // Phase 2.8 — multi-worker path. --workers N > 1 runs the pool; --workers 1
+    // (default) runs the existing single-browser pipeline unchanged.
+    if (cfg.workers.size > 1) {
+      result = await runWithPool();
+    } else {
     // Phase 2.3 — acquire a proxy (if the pool is enabled) before launching
     // the browser. The proxy descriptor flows through withBrowser →
     // launchBrowser → chromium.launch({ proxy }). On teardown (success OR
@@ -861,6 +1322,7 @@ async function main() {
         }
       }
     }
+    } // end Phase 2.8 else (sequential single-browser path)
   } catch (err) {
     if (err && err.code === 'CAPTCHA_DETECTED') {
       logger.error('Run aborted — CAPTCHA detected', {
@@ -924,6 +1386,9 @@ async function main() {
     captcha: result.captcha,
     // Phase 2.7 — session rotation stats (sessionsCreated, rotations, avgRequests).
     session: result.session,
+    // Phase 2.8 — worker pool stats (per-worker counts + aggregate). Null when
+    // --workers 1 (Phase 1 sequential behavior — no pool constructed).
+    pool: result.pool || null,
   };
 
   // Phase 2.1 — output dispatch. cfg.output is a normalized array of targets
@@ -1088,6 +1553,17 @@ async function main() {
   // where the full JSON-lines record of this run lives.
   const logFile = logger.getLogFile ? logger.getLogFile() : null;
   const logLine = logFile ? `Log:      ${logFile}` : null;
+  // Phase 2.8 — worker pool stats line. Shows the active pool size, completed
+  // tasks, re-queues, and any retired workers. Omitted when --workers 1 (no
+  // pool constructed — Phase 1 sequential behavior).
+  const poolLines = [];
+  if (result.pool) {
+    const ps = result.pool;
+    const retired = ps.retiredCount > 0 ? `, ${ps.retiredCount} retired` : '';
+    poolLines.push(
+      `Pool:     ${ps.activeSize}/${ps.size} workers, ${ps.totals.tasksCompleted} tasks, ${ps.totals.businessesScraped} businesses, ${ps.requeueCount} re-queues${retired} (${ps.loadBalancer})`,
+    );
+  }
   const banner = [
     '========================================',
     'Run complete',
@@ -1101,6 +1577,7 @@ async function main() {
     ...proxyLines,
     ...captchaLines,
     ...sessionLines,
+    ...poolLines,
     ...(logLine ? [logLine] : []),
     '========================================',
   ].join('\n');

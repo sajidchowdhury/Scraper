@@ -119,6 +119,17 @@ function parseArgs(argv) {
     else if (a === '--noWarmup') out.noWarmup = true;
     else if (a === '--accountWarmup') out.accountWarmup = argv[++i];
     else if (a === '--accountsFile') out.accountsFile = argv[++i];
+    // Phase 2.8 — worker pool & concurrency. --workers N spawns N parallel
+    // browser workers (default: 1 = Phase 1 sequential behavior preserved
+    // exactly). Each worker gets its own proxy + fingerprint + session + rate
+    // limiter. --workers 1 skips the pool entirely (no overhead).
+    else if (a === '--workers') out.workers = argv[++i];
+    else if (a === '--workerProxyStrategy') out.workerProxyStrategy = argv[++i];
+    else if (a === '--workerCrashLimit') out.workerCrashLimit = argv[++i];
+    else if (a === '--workerCooldownMs') out.workerCooldownMs = argv[++i];
+    else if (a === '--workerLoadBalancer') out.workerLoadBalancer = argv[++i];
+    else if (a === '--workerDetailBatchSize') out.workerDetailBatchSize = argv[++i];
+    else if (a === '--workerTaskRetries') out.workerTaskRetries = argv[++i];
   }
   return out;
 }
@@ -382,6 +393,47 @@ function validate(cfg) {
       );
     }
   }
+  // Phase 2.8 — worker pool validation.
+  if (cfg.workers.size < 1 || cfg.workers.size > 64) {
+    errors.push(
+      `workers must be between 1 and 64 (got ${cfg.workers.size}). --workers 1 = Phase 1 sequential behavior.`,
+    );
+  }
+  if (!['shared', 'isolated'].includes(cfg.workers.proxyStrategy)) {
+    errors.push(
+      `workerProxyStrategy must be one of shared, isolated (got "${cfg.workers.proxyStrategy}"). ` +
+        'isolated = each worker gets its own proxy (default); shared = all workers draw from the pool.',
+    );
+  }
+  if (cfg.workers.crashLimit < 1 || cfg.workers.crashLimit > 50) {
+    errors.push(
+      `workerCrashLimit must be between 1 and 50 (got ${cfg.workers.crashLimit}). ` +
+        'Worker is retired after this many crashes in the 10-min window.',
+    );
+  }
+  if (cfg.workers.cooldownMs < 0 || cfg.workers.cooldownMs > 24 * 60 * 60 * 1000) {
+    errors.push(
+      `workerCooldownMs must be between 0 and 86400000 (got ${cfg.workers.cooldownMs}). ` +
+        'How long a blocked worker stays out before revival (default 300000 = 5 min).',
+    );
+  }
+  if (!['round-robin', 'least-busy'].includes(cfg.workers.loadBalancer)) {
+    errors.push(
+      `workerLoadBalancer must be one of round-robin, least-busy (got "${cfg.workers.loadBalancer}").`,
+    );
+  }
+  if (cfg.workers.detailBatchSize < 1 || cfg.workers.detailBatchSize > 500) {
+    errors.push(
+      `workerDetailBatchSize must be between 1 and 500 (got ${cfg.workers.detailBatchSize}). ` +
+        'Number of businesses per detail-task (default 20).',
+    );
+  }
+  if (cfg.workers.taskRetries < 0 || cfg.workers.taskRetries > 64) {
+    errors.push(
+      `workerTaskRetries must be between 0 and 64 (got ${cfg.workers.taskRetries}). ` +
+        'Max re-queues per task across workers (default = workers size).',
+    );
+  }
   return errors;
 }
 
@@ -606,6 +658,45 @@ function loadConfig(argv = process.argv.slice(2)) {
       resolved: null,
     },
 
+    // Phase 2.8 — worker pool & concurrency.
+    //   --workers N                  — parallel browser workers (default: 1 =
+    //                                  Phase 1 sequential behavior preserved).
+    //                                  Each worker gets its own proxy +
+    //                                  fingerprint + session + rate limiter.
+    //   --workerProxyStrategy shared|isolated — isolated = each worker gets its
+    //                                  own proxy (default); shared = all workers
+    //                                  draw from the proxy pool (more IPs used).
+    //   --workerCrashLimit N         — retire a worker after N crashes in 10 min
+    //                                  (default 3). Retired workers drop the
+    //                                  effective pool size.
+    //   --workerCooldownMs <ms>      — block cooldown (default 300000 = 5 min).
+    //                                  A blocked worker sits out this long
+    //                                  before revival with a fresh identity.
+    //   --workerLoadBalancer <s>     — round-robin (default) | least-busy.
+    //   --workerDetailBatchSize N    — businesses per detail-task (default 20).
+    //                                  With --workers N --deepScrape true, the
+    //                                  detail work is split into batches of N
+    //                                  and run in parallel across the pool.
+    //   --workerTaskRetries N        — max re-queues per task (default = workers
+    //                                  size). A task is re-tried on another
+    //                                  worker after a block/crash.
+    workers: {
+      size: toIntOrNull(cli.workers ?? process.env.WORKERS) ?? 1,
+      proxyStrategy:
+        cli.workerProxyStrategy || process.env.WORKER_PROXY_STRATEGY || 'isolated',
+      crashLimit: toIntOrNull(cli.workerCrashLimit ?? process.env.WORKER_CRASH_LIMIT) ?? 3,
+      cooldownMs:
+        toIntOrNull(cli.workerCooldownMs ?? process.env.WORKER_COOLDOWN_MS) ?? 5 * 60 * 1000,
+      loadBalancer:
+        cli.workerLoadBalancer || process.env.WORKER_LOAD_BALANCER || 'round-robin',
+      detailBatchSize:
+        toIntOrNull(cli.workerDetailBatchSize ?? process.env.WORKER_DETAIL_BATCH_SIZE) ?? 20,
+      taskRetries:
+        toIntOrNull(cli.workerTaskRetries ?? process.env.WORKER_TASK_RETRIES) ?? null,
+      // Resolved at runtime in index.js into { pool } (null when size === 1).
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -722,6 +813,23 @@ Optional:
                              gitignored + chmod 600. Credentials are never logged
                              (email redacted to prefix***@domain).
 
+  --workers <n>              Phase 2.8 — parallel browser workers (default: 1 =
+                             Phase 1 sequential behavior). Each worker gets its
+                             own proxy + fingerprint + session + rate limiter.
+                             With --workers N --deepScrape true, detail-scrape
+                             batches run in parallel across the pool (~N× faster).
+  --workerProxyStrategy <s>  Phase 2.8 — shared | isolated (default: isolated).
+                             isolated = each worker pins its own proxy; shared =
+                             all workers draw from the proxy pool on each task.
+  --workerCrashLimit <n>     Phase 2.8 — retire a worker after N crashes in 10 min
+                             (default: 3). Retired workers drop the pool size.
+  --workerCooldownMs <ms>    Phase 2.8 — block cooldown (default: 300000 = 5 min).
+                             A blocked worker sits out, rotates its identity, then
+                             revives. Its task is re-queued to another worker.
+  --workerLoadBalancer <s>   Phase 2.8 — round-robin (default) | least-busy.
+  --workerDetailBatchSize <n> Phase 2.8 — businesses per detail-task (default: 20).
+  --workerTaskRetries <n>    Phase 2.8 — max re-queues per task (default = workers).
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
@@ -767,6 +875,13 @@ Examples:
   npm start -- --query "Cafe" --location "Berlin" --sessionMaxRequests 10   # rotate every 10 requests
   npm start -- --query "Cafe" --location "Berlin" --noWarmup    # skip warmup (Phase 1 behavior)
   npm start -- --query "Cafe" --location "Berlin" --accountWarmup on --accountsFile ./accounts.json
+
+  # Phase 2.8 — worker pool & concurrency (default: 1 = Phase 1 sequential)
+  npm start -- --query "Cafe" --location "Berlin"               # 1 worker (Phase 1 behavior, unchanged)
+  npm start -- --query "Cafe" --location "Berlin" --workers 3   # 3 parallel workers
+  npm start -- --query "Restaurant" --location "Toronto" --workers 5 --deepScrape true   # 5× parallel detail-scrape
+  npm start -- --query "Cafe" --location "Berlin" --workers 4 --workerLoadBalancer least-busy
+  npm start -- --query "Cafe" --location "Berlin" --workers 3 --workerCrashLimit 5 --workerCooldownMs 120000
 
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun

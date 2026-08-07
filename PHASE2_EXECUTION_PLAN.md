@@ -10,9 +10,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 2.7 complete. 8 of 13 sub-phases shipped.
+> **Last updated:** Phase 2.8 complete. 9 of 13 sub-phases shipped.
 >
-> **Overall:** 8 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
+> **Overall:** 9 of 13 sub-phases shipped. Phase 2 work on `phase2` branch.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -24,7 +24,7 @@
 | 2.5 — Stealth Hardening | ✅ DONE | 83 tests | `src/stealth-patches.js`, `src/browser.js` (playwright-extra + stealth plugin + custom patches), `src/config.js` (--stealth/--noStealth/--stealthDebug), `src/banner.js` (stealth row), `src/index.js` (resolve + apply), `scripts/verify-stealth.js` (dev-only) | 10 bot-detection patches (webdriver, chrome.runtime, plugins, permissions, outerWidth/Height, Notification.permission, vendor, maxTouchPoints); coexists with fingerprint (yields to WebGL+languages overrides); launch args (--disable-blink-features=AutomationControlled); stub-page eval tests |
 | 2.6 — CAPTCHA Auto-Solving | ✅ DONE | 90 tests | `src/captcha/solver.js`, `src/captcha/cost-log.js`, `src/captcha/injector.js`, `src/captcha/orchestrator.js`, `src/captcha/index.js`, `src/antiblock.js` (detectCaptchaType + extractSitekey + CAPTCHA_TYPES), `src/config.js` (--captchaProvider/--captchaApiKey/--captchaBudget/--noCaptchaSolve), `src/banner.js` (CAPTCHA row), `src/index.js` (resolve solver + budget guard + cost logger; wire handleCaptcha into deep-scrape hook; end-of-run CAPTCHA cost line), `tests/fixtures/recaptcha-v2.html`, `tests/helpers/mock-dom.js` | 4 providers (2captcha REST, anticaptcha JSON-RPC, capsolver JSON-RPC, mock) via injectable httpClient (no real API calls in tests); BudgetGuard spend cap; cost-log JSONL + summary; pure DOM token-injection tested against reCAPTCHA v2 fixture; orchestrator fallback chain (solve→retry→fallback provider→pause-and-alert); provider 'none' preserves Phase 1.8 behavior exactly |
 | 2.7 — Session & Cookie Rotation | ✅ DONE | 59 tests | `src/session/manager.js`, `src/session/warmup.js`, `src/session/account-warmup.js`, `src/session/context-factory.js`, `src/session/index.js`, `src/detail.js` (sessionCheck hook + page swap), `src/config.js` (--sessionMaxRequests/--sessionMaxAgeMs/--warmup/--warmupDurationMs/--accountWarmup/--accountsFile), `src/banner.js` (Session row), `src/index.js` (construct manager, warmup before search, tickRequest in deep-scrape, rotate + re-navigate, end-of-run stats) | createSessionManager with injectable createContext/clock/sleep; rotation by request count OR age (whichever first); warmupContext visits google.com + random second site + benign search; accountWarmup opt-in (off by default, credentials never logged, email redacted); cookie isolation (each context fresh jar); createRealContextFactory bridges to browser.newContext + fingerprint + stealth; mid-deep-scrape rotation via sessionCheck hook + re-navigate to Maps search |
-| 2.8 — Worker Pool & Concurrency | ⬜ NOT STARTED | — | — | N parallel browsers, per-worker proxy+fingerprint, graceful degradation |
+| 2.8 — Worker Pool & Concurrency | ✅ DONE | 67 tests | `src/worker.js`, `src/pool.js`, `src/config.js` (--workers/--workerProxyStrategy/--workerCrashLimit/--workerCooldownMs/--workerLoadBalancer/--workerDetailBatchSize/--workerTaskRetries), `src/index.js` (runWithPool: getIdentity + runTask [search-task/detail-task] + dispatchBatchSettled + per-worker session aggregation + Pool: banner line), `.env.example` (Phase 2.8 section) | createWorker with DI runTask + state machine (idle/busy/cooldown/retired) + block/crash tracking + rotateIdentity; createPool with round-robin/least-busy + race-free acquireWorker + re-queue on block/crash + retire after crashLimit; serializable task types (search/detail/resume); --workers 1 preserves Phase 1 sequential pipeline byte-for-byte |
 | 2.9 — Job Queue & Orchestration | ⬜ NOT STARTED | — | — | BullMQ/Redis or in-memory queue, async jobs, priorities |
 | 2.10 — Memory Management & Long-Run Stability | ⬜ NOT STARTED | — | — | Context restart, leak mitigation, health probes |
 | 2.11 — Self-Healing Selectors & Health Checks | ⬜ NOT STARTED | — | — | Auto-discovery, extraction-rate alerting, selector versioning |
@@ -659,7 +659,7 @@ A session-rotation layer that distributes traffic across many distinct sessions,
 
 ## Phase 2.8 — Worker Pool & Concurrency
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ COMPLETE** (9 of 13 sub-phases)
 
 ### Goal
 Run N browser workers in parallel, each with its own proxy, fingerprint, and session. A job dispatcher distributes search tasks (one per query/location pair, or one per batch of businesses to deep-scrape) across the pool. If a worker gets blocked, it's marked burned and its tasks are re-queued.
@@ -668,49 +668,54 @@ Run N browser workers in parallel, each with its own proxy, fingerprint, and ses
 A single browser maxes out at ~200 businesses/hour (rate-limited). 10 workers = ~2000/hour. The 10,000-listing overnight run requires concurrency. Per-worker proxy isolation means one block doesn't kill the whole run.
 
 ### Task checklist
-- [ ] **Worker abstraction.** `src/worker.js`:
-  - `createWorker({ id, proxy, fingerprint, cfg, logger })` — returns a worker object.
-  - `worker.run(task)` — executes a scrape task (search + scroll + extract, or detail-scrape batch).
-  - `worker.isHealthy()` — returns true if the worker hasn't been blocked / hasn't exceeded error threshold.
-  - `worker.shutdown()` — closes browser, releases proxy, logs final stats.
-  - Each worker has its own: browser instance, proxy, fingerprint, session manager, rate limiter, retry config.
-  - Workers are isolated: a crash in one worker doesn't affect others.
-- [ ] **Worker pool.** `src/pool.js`:
-  - `createPool({ size, cfg, proxyPool, fingerprintGen, logger })` — returns a pool.
-  - `pool.dispatch(task)` — assigns a task to the next available worker; returns a promise that resolves when the task completes.
-  - `pool.dispatchBatch(tasks)` — distributes a batch of tasks across workers; returns when all complete.
-  - `pool.stats()` — returns per-worker stats: `{ workerId, tasksCompleted, businessesScraped, errors, blocked, proxyId }`.
+- [x] **Worker abstraction.** `src/worker.js`:
+  - `createWorker({ id, proxy, fingerprint, cfg, logger, runTask, ... })` — returns a worker object.
+  - `worker.run(task)` — executes a scrape task via the injected `runTask` (DI); tracks stats + handles block/crash signals.
+  - `worker.isHealthy()` / `worker.isAvailable()` — returns true unless retired / busy / in cooldown.
+  - `worker.shutdown()` — releases the session manager, logs final stats.
+  - Each worker has its own: proxy, fingerprint, session manager, rate limiter, retry config (browser is per-task via `withBrowser`).
+  - Workers are isolated: a crash in one worker doesn't affect others (the pool re-queues + restarts).
+- [x] **Worker pool.** `src/pool.js`:
+  - `createPool({ size, cfg, createWorker, getIdentity, loadBalancer, ... })` — returns a pool.
+  - `pool.dispatch(task)` — assigns a task to the next available worker; re-queues on block/crash; resolves when the task completes.
+  - `pool.dispatchBatch(tasks)` / `dispatchBatchSettled(tasks)` — distributes a batch; runs up to `size` concurrently.
+  - `pool.stats()` — returns per-worker stats: `{ workerId, state, tasksCompleted, businessesScraped, errors, blocked, crashes, proxyId, ... }` + aggregate totals.
   - `pool.shutdown()` — gracefully stops all workers (finish current task, then close).
-  - Load balancing: round-robin by default; least-busy optional.
-- [ ] **Graceful degradation.**
-  - If a worker returns a block signal (CAPTCHA unsolvable, proxy burned, 3 consecutive 403s):
-    1. Mark the worker as unhealthy.
-    2. Re-queue its current task to another worker.
-    3. Rotate the worker's proxy + fingerprint + session.
-    4. After cooldown, mark the worker healthy again and return it to the pool.
-  - If a worker crashes (uncaught exception):
-    1. Log the error with full stack.
-    2. Re-queue its current task.
-    3. Restart the worker (new browser, new proxy, new fingerprint).
-    4. Track crash count; after 3 crashes in 10 minutes, retire the worker permanently (reduce pool size).
-- [ ] **Task types.**
-  - `search-task` — a full search + scroll + extract for one query/location.
-  - `detail-task` — deep-scrape a batch of businesses (e.g., 20 at a time).
-  - `resume-task` — resume a crashed search-task from checkpoint.
-  - Tasks are serializable (JSON) so they can be persisted to the job queue (Phase 2.9).
-- [ ] **Config flags.**
-  - `--workers N` (default: 1 = Phase 1 behavior)
-  - `--workerProxyStrategy shared|isolated` (default: isolated = each worker has its own proxy; shared = all workers share the pool)
-  - `--workerCrashLimit 3` (retire worker after this many crashes in 10 min)
-  - `--workerCooldownMs` (default: 300000 = 5 min; how long a blocked worker stays out)
-- [ ] **Logging.** Every log line includes `workerId` so the operator can trace which worker did what. The end-of-run summary includes per-worker stats.
-- [ ] **Unit tests.** `tests/worker.test.js`, `tests/pool.test.js`:
-  - `createWorker` with a mock browser returns expected interface.
-  - `pool.dispatch` assigns tasks round-robin.
-  - Blocked worker triggers re-queue of its task.
-  - Crashed worker is restarted; after crash limit, retired.
-  - `pool.stats` aggregates correctly.
-  - DI: workers accept a mock `runTask` function; pool accepts a mock `createWorker`.
+  - Load balancing: round-robin by default; least-busy optional (`--workerLoadBalancer`).
+- [x] **Graceful degradation.**
+  - If a worker returns a block signal (`runTask` throws `{ code: 'WORKER_BLOCKED' }`):
+    1. The worker enters cooldown (`state='cooldown'`, `cooldownUntil = now + cooldownMs`).
+    2. Its task is re-queued to another worker (the pool's `dispatch` retry loop).
+    3. The pool calls `worker.rotateIdentity({ proxy, fingerprint, sessionManager })` (fresh identity via `getIdentity`).
+    4. After cooldown, `isAvailable()` lazy-revives the worker back to `idle`.
+  - If a worker crashes (any other thrown error):
+    1. The error is logged with full stack (`lastError` on `stats()`).
+    2. Its task is re-queued.
+    3. `rotateIdentity()` restarts the worker (the next task launches a fresh browser with the new identity).
+    4. Crash timestamps are tracked; after `crashLimit` (default 3) crashes in 10 minutes, the worker is **retired** permanently (pool size drops).
+- [x] **Task types.**
+  - `search-task` — a full search + scroll + extract for one query/location (`createSearchTask`).
+  - `detail-task` — deep-scrape a batch of businesses (`createDetailTask`, default 20 at a time).
+  - `resume-task` — resume a crashed search-task from checkpoint (`createResumeTask`).
+  - All tasks are JSON-serializable (`validateTask` enforces this) so they can be persisted to the Phase 2.9 job queue.
+- [x] **Config flags.**
+  - `--workers N` (default: 1 = Phase 1 sequential behavior — the existing single-browser pipeline runs unchanged)
+  - `--workerProxyStrategy shared|isolated` (default: isolated = each worker pins its own proxy)
+  - `--workerCrashLimit N` (default: 3; retire worker after this many crashes in 10 min)
+  - `--workerCooldownMs <ms>` (default: 300000 = 5 min; how long a blocked worker stays out)
+  - `--workerLoadBalancer round-robin|least-busy` (default: round-robin)
+  - `--workerDetailBatchSize N` (default: 20; businesses per detail-task)
+  - `--workerTaskRetries N` (default: = workers size; max re-queues per task)
+- [x] **Logging.** Every worker binds `workerId` to every log line via `logger.child({ workerId })`. The end-of-run banner includes a `Pool:` line with active size, tasks completed, businesses scraped, re-queues, and retired count.
+- [x] **Unit tests.** `tests/worker.test.js` (29 tests), `tests/pool.test.js` (17 tests), `tests/config.test.js` Phase 2.8 section (21 tests):
+  - `createWorker` with a mock `runTask` returns the expected interface.
+  - `pool.dispatch` assigns tasks round-robin (3 workers → 3 distinct workers).
+  - Blocked worker triggers re-queue of its task; the run completes on another worker.
+  - Crashed worker is restarted; after `crashLimit` crashes it's retired and the active pool size drops.
+  - `pool.stats` aggregates correctly (dispatchCount, requeueCount, per-worker totals).
+  - DI: workers accept a mock `runTask`; pool accepts a mock `createWorker` + `getIdentity`.
+  - Parallelism: 3 tasks on 3 workers run concurrently (~1× duration, verified via overlapping start/end windows).
+  - No race conditions: concurrent dispatch never double-assigns a worker (verified via a max-concurrency assertion).
 
 ### Acceptance criteria
 - With `--workers 3`, three tasks run in parallel and complete ~3× faster than sequential.
@@ -725,6 +730,8 @@ Phase 2.3 (proxies), Phase 2.4 (fingerprints), Phase 2.7 (sessions).
 
 ### Deliverable
 A concurrent worker pool that scales horizontally and self-heals on per-worker failures.
+
+**Shipped:** `src/worker.js` (createWorker with injectable runTask/clock/sleep; run/isHealthy/isAvailable/isRetired/markBlocked/markCrashed/rotateIdentity/stats/shutdown; state machine idle→busy→cooldown→retired; block signal via `{code:'WORKER_BLOCKED'}` → cooldown + re-throw; crash → markCrashed with sliding-window crash timestamps, retire after crashLimit in 10min; businessesScraped accumulated from {businesses}|{count}|array result shapes; WorkerError; createSearchTask/createDetailTask/createResumeTask/validateTask — all JSON-serializable for the Phase 2.9 queue), `src/pool.js` (createPool with DI createWorker + getIdentity; dispatch with re-queue loop on block/crash + rotateIdentity; dispatchBatch + dispatchBatchSettled for partial-failure; acquireWorker via single-threaded claim + injectable-sleep poll (race-free); round-robin + least-busy load balancers; stats aggregate per-worker + dispatchCount/requeueCount; graceful shutdown with in-flight drain; PoolError for exhausted/shutdown), `src/config.js` (--workers/--workerProxyStrategy/--workerCrashLimit/--workerCooldownMs/--workerLoadBalancer/--workerDetailBatchSize/--workerTaskRetries + WORKER_* env vars + validation + HELP_TEXT + examples), `src/index.js` (runWithPool: getIdentity acquires proxy+generates fingerprint+builds per-worker session manager + rate limiter; runTask handles search-task [warmup+search+scroll+extract] + detail-task [warmup+search+scroll+deepScrapeAll batch]; dispatch search-task → dedup → split into detail batches → dispatchBatchSettled → merge back by index; aggregate per-worker session stats; pool stats in summary + banner Pool: line; --workers 1 preserves Phase 1 sequential pipeline byte-for-byte), `.env.example` (Phase 2.8 section expanded), `tests/worker.test.js` (29 tests), `tests/pool.test.js` (17 tests), `tests/config.test.js` Phase 2.8 section (21 tests). **1016 tests / 7280 assertions passing total** (67 new).
 
 ---
 
