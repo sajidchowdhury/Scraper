@@ -82,6 +82,9 @@ const { showStartupBanner } = require('./banner');
 // Phase 2.1 — PostgreSQL persistence (lazy-loaded; only used when
 // cfg.output includes 'db').
 const { createPool, persistRunResults, closePool } = require('./db');
+// Phase 2.3 — proxy management & rotation. Only initialized when cfg.proxy
+// is enabled (i.e. --noProxy is not set AND a proxy source is configured).
+const { createProxyPool } = require('./proxy');
 
 async function main() {
   const cfg = loadConfig(process.argv.slice(2));
@@ -128,11 +131,80 @@ async function main() {
       scrollDelay: [cfg.antiblock.scrollDelayMinMs, cfg.antiblock.scrollDelayMaxMs],
       detailDelay: [cfg.antiblock.detailDelayMinMs, cfg.antiblock.detailDelayMaxMs],
     },
+    proxy: {
+      enabled: cfg.proxy.enabled,
+      strategy: cfg.proxy.strategy,
+      sessionLength: cfg.proxy.sessionLength,
+      cooldownMs: cfg.proxy.cooldownMs,
+      listFile: cfg.proxy.listFile,
+      provider: cfg.proxy.provider,
+      healthCheck: cfg.proxy.healthCheck,
+    },
   });
 
   // Phase 1.8 — construct the rate limiter once and attach to cfg so every
   // module that makes Google-bound requests (search, detail) can acquire.
   cfg.rateLimiter = new RateLimiter(cfg.antiblock.maxRequestsPerMin, { logger });
+
+  // Phase 2.3 — construct the proxy pool (if enabled). The pool is then
+  // queried before each browser launch to pick a proxy; release() is called
+  // in the finally block with the outcome so the burn detector can track it.
+  let proxyPool = null;
+  if (cfg.proxy.enabled) {
+    const proxySources = {};
+    if (cfg.proxy.listFile) proxySources.file = cfg.proxy.listFile;
+    if (cfg.proxy.provider && cfg.proxy.providerUrl) {
+      // The provider() function is wired up here. Currently a stub that reads
+      // from a local file or returns an empty list — real provider APIs
+      // (Bright Data / Smartproxy / Oxylabs) are integrated in Phase 2.7.
+      proxySources.provider = async () => {
+        logger.warn('Proxy provider configured but not yet implemented', {
+          provider: cfg.proxy.provider,
+          hint: 'Use --proxyListFile for now. Provider API integration is Phase 2.7.',
+        });
+        return [];
+      };
+    }
+    proxyPool = createProxyPool({
+      sources: proxySources,
+      strategy: cfg.proxy.strategy,
+      sessionLength: cfg.proxy.sessionLength,
+      cooldownMs: cfg.proxy.cooldownMs,
+      burnLogPath: cfg.proxy.burnLogPath || undefined,
+      logger,
+    });
+
+    // Optional pre-run health check. Probes every proxy with a HEAD to Google;
+    // benches failures for one cooldown cycle. Useful before long overnight runs.
+    if (cfg.proxy.healthCheck) {
+      logger.info('Phase 2.3 — running proxy health check', {
+        hint: 'Probes every proxy with a HEAD to google.com before scraping',
+      });
+      try {
+        const hc = await proxyPool.healthCheck();
+        logger.info('Proxy health check result', {
+          total: hc.total,
+          healthy: hc.healthy.length,
+          dead: hc.dead.length,
+        });
+        if (hc.healthy.length === 0) {
+          logger.error('All proxies failed health check — aborting', {
+            dead: hc.dead,
+            hint: 'Check your proxy list or provider credentials, or rerun with --noProxy',
+          });
+          process.exit(3);
+        }
+      } catch (err) {
+        logger.error('Proxy health check failed (non-fatal — continuing)', {
+          message: err.message,
+        });
+      }
+    }
+  } else {
+    logger.info('Phase 2.3 — proxy rotation disabled (direct connection)', {
+      reason: cfg.proxy.enabled === false ? 'no proxy source configured (use --proxyListFile or PROXY_LIST_FILE)' : '--noProxy flag set',
+    });
+  }
 
   // Phase 1.10 — startup banner. Prints the resolved config and waits 1s so
   // the operator can eyeball it and Ctrl-C if it looks wrong. Skipped (no
@@ -170,12 +242,30 @@ async function main() {
   let result;
 
   try {
-    result = await withBrowser(
-      cfg,
-      async ({ page }) => {
-        // We always re-search + re-scroll on resume — a live browser session
-        // can't be restored, only the extracted data can.
-        await performSearch(page, cfg, logger, cfg.retry, cfg.rateLimiter);
+    // Phase 2.3 — acquire a proxy (if the pool is enabled) before launching
+    // the browser. The proxy descriptor flows through withBrowser →
+    // launchBrowser → chromium.launch({ proxy }). On teardown (success OR
+    // failure) we release the proxy back to the pool with the outcome so the
+    // burn detector can track success rate + consecutive failures.
+    let acquiredProxy = null;
+    if (proxyPool) {
+      acquiredProxy = await proxyPool.acquire();
+      if (!acquiredProxy) {
+        logger.error('Proxy pool exhausted — every proxy is burned', {
+          hint: 'Wait for the cooldown window to elapse, add more proxies, or rerun with --noProxy',
+        });
+        process.exit(3);
+      }
+    }
+
+    let pipelineError = null;
+    try {
+      result = await withBrowser(
+        cfg,
+        async ({ page }) => {
+          // We always re-search + re-scroll on resume — a live browser session
+          // can't be restored, only the extracted data can.
+          await performSearch(page, cfg, logger, cfg.retry, cfg.rateLimiter);
 
         const scrollResult = await scrollFeedToBottomOnPage(page, cfg, logger);
         logger.info('Scroll complete', {
@@ -325,11 +415,48 @@ async function main() {
       // Phase 1.8 — wire the 429/503 watcher. On a blocked response we just
       // log (the rate limiter + CAPTCHA check handle the actual backoff).
       logger,
+      // Phase 2.3 — pass the acquired proxy through to launchBrowser.
+      proxy: acquiredProxy,
       onBlocked: ({ status, url, count }) => {
         logger.warn('Google returned a block-status response', { status, url, count });
+        // Phase 2.3 — a 429/503 from Google while using a proxy is a strong
+        // signal that the proxy is being rate-limited. We mark it burned via
+        // release() below (the onBlocked hook is informational only; the
+        // actual burn decision happens in the finally block based on whether
+        // the pipeline threw).
       },
     },
   );
+    } catch (err) {
+      pipelineError = err;
+      throw err;
+    } finally {
+      // Phase 2.3 — release the proxy back to the pool with the outcome so the
+      // burn detector can track success rate + consecutive failures. A CAPTCHA
+      // or 429 from Google counts as a soft failure (the proxy may be getting
+      // rate-limited); a hard crash counts as a timeout-equivalent failure.
+      if (proxyPool && acquiredProxy) {
+        let outcome;
+        if (pipelineError && pipelineError.code === 'CAPTCHA_DETECTED') {
+          // CAPTCHA → treat as a 429 (block signal) for burn-detection purposes.
+          outcome = { success: false, statusCode: 429 };
+        } else if (pipelineError) {
+          // Other crash → treat as a timeout (different burn rule, separate
+          // streak counter in the detector).
+          outcome = { success: false, statusCode: 'TIMEOUT' };
+        } else {
+          outcome = { success: true };
+        }
+        try {
+          proxyPool.release(acquiredProxy.id, outcome);
+        } catch (releaseErr) {
+          logger.warn('Proxy release failed (non-fatal)', {
+            proxyId: acquiredProxy.id,
+            error: releaseErr.message,
+          });
+        }
+      }
+    }
   } catch (err) {
     if (err && err.code === 'CAPTCHA_DETECTED') {
       logger.error('Run aborted — CAPTCHA detected', {
@@ -346,6 +473,14 @@ async function main() {
     process.exit(3);
   } finally {
     browserClosed = true;
+    // Phase 2.3 — flush + close the proxy pool (best-effort).
+    if (proxyPool && typeof proxyPool.close === 'function') {
+      try {
+        proxyPool.close();
+      } catch {
+        /* best-effort */
+      }
+    }
   }
 
   const durationMs = Date.now() - startedAt;
@@ -379,6 +514,8 @@ async function main() {
     startedAt: new Date(startedAt).toISOString(),
     durationMs,
     fields: [...CANONICAL_FIELDS, ...DETAIL_FIELDS],
+    // Phase 2.3 — proxy pool stats for this run (null when proxy disabled).
+    proxy: proxyPool ? proxyPool.stats() : { enabled: false },
   };
 
   // Phase 2.1 — output dispatch. cfg.output is a normalized array of targets
@@ -497,6 +634,18 @@ async function main() {
     }
     if (outputLines.length === 0) outputLines.push('Output:   (no targets selected)');
   }
+  // Phase 2.3 — proxy stats line. Shows total/healthy/burned + the strategy.
+  // When proxy is disabled, the line is omitted entirely (matches Phase 1).
+  const proxyLines = [];
+  if (proxyPool) {
+    const ps = proxyPool.stats();
+    const rate = ps.avgSuccessRate !== null
+      ? `${Math.round(ps.avgSuccessRate * 100)}% success`
+      : 'no requests yet';
+    proxyLines.push(
+      `Proxy:    ${ps.healthy}/${ps.total} healthy, ${ps.cooldown} cooling, ${ps.burned} burned (${ps.strategy}, ${rate})`,
+    );
+  }
   // Phase 1.9 — include the log file path in the banner so the operator knows
   // where the full JSON-lines record of this run lives.
   const logFile = logger.getLogFile ? logger.getLogFile() : null;
@@ -511,6 +660,7 @@ async function main() {
     ...(recoveryLine ? [recoveryLine] : []),
     ...(extractFailLine ? [extractFailLine] : []),
     ...outputLines,
+    ...proxyLines,
     ...(logLine ? [logLine] : []),
     '========================================',
   ].join('\n');

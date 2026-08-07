@@ -860,3 +860,131 @@ mid-upsert rolls back the snapshot, the changes, and the update atomically —
 the database is never left in a state where the old values were snapshotted
 but the update didn't happen (or vice versa).
 
+
+## Proxy management & rotation (Phase 2.3)
+
+Phase 2.3 introduces a configurable proxy pool that sits between the scraper
+and Google. Every browser launch (or every N requests, via `--sessionLength`)
+pulls a different proxy from the pool. Burned proxies (3 consecutive 403/429,
+<50% success rate over last 20 requests, 3 consecutive timeouts) are benched
+for a cooldown window; permanently bad proxies (HTTP 407, provider-reported
+retired) are removed entirely.
+
+### Quick start
+
+Create a proxy list file (one proxy per line):
+
+```bash
+# proxies.txt — accepted formats per line:
+#   protocol://[user:pass@]host:port   e.g. http://u:p@1.2.3.4:8080
+#   host:port:user:pass                e.g. 1.2.3.4:8080:u:p
+#   host:port                           (no auth — public proxy)
+http://user1:pass1@1.2.3.4:8080
+http://5.6.7.8:3128
+socks5://9.10.11.12:1080
+```
+
+Run with proxy rotation:
+
+```bash
+npm start -- --query "Cafe" --location "Berlin" --proxyListFile ./proxies.txt
+npm start -- --query "Cafe" --location "Berlin" --proxyListFile ./proxies.txt --proxyStrategy round-robin
+npm start -- --query "Cafe" --location "Berlin" --proxyListFile ./proxies.txt --proxyHealthCheck
+```
+
+Or via env vars (in `.env`):
+
+```bash
+PROXY_LIST_FILE=./proxies.txt
+PROXY_STRATEGY=random
+SESSION_LENGTH=1
+PROXY_COOLDOWN_MS=600000
+```
+
+### CLI flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--proxyListFile <path>` | — | Proxy list file (one proxy per line) |
+| `--proxyStrategy <s>` | `random` | `round-robin` \| `random` \| `sticky` |
+| `--sessionLength <n>` | `1` | Requests per proxy before rotation (sticky only) |
+| `--proxyCooldownMs <ms>` | `600000` | Burn cooldown window (10 min) |
+| `--proxyHealthCheck` | off | Probe every proxy with a HEAD before scraping |
+| `--noProxy` | off | Force direct connection (Phase 1 behavior) |
+
+### Rotation strategies
+
+- **`round-robin`** — cycle through the pool sequentially. Deterministic, best
+  for evenly distributing load across a small pool.
+- **`random`** (default) — pick uniformly at random. Better for large pools
+  where round-robin's predictability could be fingerprinted.
+- **`sticky`** — same proxy per session of N requests (`--sessionLength N`).
+  Useful when Google's session cookies should stay consistent within a session.
+
+### Burn detection
+
+The burn detector (`src/proxy/burn-detector.js`) tracks per-proxy:
+- request count, success count, last 10 status codes
+- consecutive failures (resets on success)
+- consecutive timeouts (resets on any non-timeout outcome)
+- state: `healthy` | `cooldown` | `burned` (permanent)
+
+Auto-burn rules:
+- **3 consecutive 403/429** → cooldown (10 min default)
+- **Success rate < 50%** over last 20 requests (min 5 samples) → cooldown
+- **3 consecutive timeouts** (`statusCode === 'TIMEOUT'`) → cooldown
+- **HTTP 407** (Proxy Authentication Required) → permanent (removed entirely)
+
+Cooldown proxies auto-recover after `PROXY_COOLDOWN_MS`. Permanent proxies
+never recover.
+
+### Burn log
+
+Every burn event is appended to `data/proxy_burn_log.jsonl` with timestamp,
+proxy id, reason, recent status codes, provider, and burn kind. Used for ops
+debugging and provider charge disputes.
+
+```json
+{"ts":"2026-08-07T16:08:24.501Z","kind":"cooldown","proxyId":"1.1.1.1:80","reason":"3 consecutive 403/429 responses","recentStatusCodes":[403,403,403],"provider":"file","stats":{...}}
+{"ts":"2026-08-07T16:08:24.502Z","kind":"permanent","proxyId":"2.2.2.2:80","reason":"provider retired IP","manual":true,"provider":"manual","stats":{...}}
+```
+
+### Health check
+
+`--proxyHealthCheck` probes every proxy with a HEAD to `google.com/robots.txt`
+before scraping starts. Failed proxies are benched for one cooldown cycle. If
+all proxies fail, the run aborts with exit code 3.
+
+### End-of-run banner
+
+The banner now includes a `Proxy:` line showing healthy/cooling/burned counts
++ strategy + avg success rate:
+
+```
+========================================
+Run complete
+Query:    Cafe in Berlin
+Results:  50 extracted (50 loaded, reason=maxResults)
+Duration: 42.3s
+Detail:   disabled (--deepScrape false)
+CSV:      data/cafe_berlin_2026-08-07_160824.csv
+JSON:     data/cafe_berlin_2026-08-07_160824.json
+Summary:  data/cafe_berlin_2026-08-07_160824_summary.json
+Proxy:    4/5 healthy, 1 cooling, 0 burned (round-robin, 96% success)
+Log:      logs/cafe_berlin_2026-08-07_160824.log
+========================================
+```
+
+### Design notes
+
+- **`--noProxy` preserves Phase 1 behavior.** When proxy rotation is disabled
+  (the default), the scraper launches a direct browser with no proxy — exactly
+  the Phase 1 code path.
+- **CAPTCHA → 429 mapping.** When the pipeline aborts with `CAPTCHA_DETECTED`,
+  the proxy is released with `statusCode: 429` (not `'TIMEOUT'`). This feeds
+  the consecutive-block burn rule: 3 CAPTCHAs from the same proxy → cooldown.
+  The signal is correct — a CAPTCHA means Google is rate-limiting that IP.
+- **Provider API integration is Phase 2.7.** The `PROXY_PROVIDER` env var is
+  parsed and validated but the actual provider fetch is a stub that returns an
+  empty list. Use `--proxyListFile` for now; Bright Data / Smartproxy / Oxylabs
+  integration lands in Phase 2.7 (Session & Cookie Rotation).

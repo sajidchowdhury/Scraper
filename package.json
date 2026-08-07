@@ -1,6 +1,6 @@
 {
   "name": "gmaps-scraper",
-  "version": "1.0.0-phase1",
+  "version": "1.0.0-phase2.3",
   "description": "Google Maps business scraper — Phase 2 (PostgreSQL persistence, change tracking, proxy/stealth, scale). Phase 1 tagged v1.0.0-phase1.",
   "engines": {
     "node": ">=20"

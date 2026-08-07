@@ -85,6 +85,13 @@ function parseArgs(argv) {
     // Phase 2.1 — output targets (csv, json, db, all). Accepts comma-separated
     // values too: --output csv,json,db. The keyword `all` expands to csv,json,db.
     else if (a === '--output') out.output = argv[++i];
+    // Phase 2.3 — proxy management & rotation
+    else if (a === '--proxyStrategy') out.proxyStrategy = argv[++i];
+    else if (a === '--sessionLength') out.sessionLength = argv[++i];
+    else if (a === '--proxyCooldownMs') out.proxyCooldownMs = argv[++i];
+    else if (a === '--noProxy') out.noProxy = true;
+    else if (a === '--proxyListFile') out.proxyListFile = argv[++i];
+    else if (a === '--proxyHealthCheck') out.proxyHealthCheck = true;
   }
   return out;
 }
@@ -191,6 +198,30 @@ function validate(cfg) {
   if (cfg.antiblock.captchaWaitMs < 0 || cfg.antiblock.captchaWaitMs > 3_600_000) {
     errors.push(
       `captchaWaitMs must be between 0 and 3600000 (got ${cfg.antiblock.captchaWaitMs})`,
+    );
+  }
+  // Phase 2.3 — proxy validation
+  if (!['round-robin', 'random', 'sticky'].includes(cfg.proxy.strategy)) {
+    errors.push(
+      `proxyStrategy must be one of round-robin, random, sticky (got "${cfg.proxy.strategy}")`,
+    );
+  }
+  if (cfg.proxy.sessionLength < 1 || cfg.proxy.sessionLength > 10000) {
+    errors.push(
+      `sessionLength must be between 1 and 10000 (got ${cfg.proxy.sessionLength})`,
+    );
+  }
+  if (cfg.proxy.cooldownMs < 0 || cfg.proxy.cooldownMs > 24 * 60 * 60 * 1000) {
+    errors.push(
+      `proxyCooldownMs must be between 0 and 86400000 (got ${cfg.proxy.cooldownMs})`,
+    );
+  }
+  // --proxyListFile must point to a readable file IF specified. We don't
+  // require it (the pool can also be populated via a provider() function),
+  // but a non-existent file is a config error, not a runtime one.
+  if (cfg.proxy.listFile && !fs.existsSync(cfg.proxy.listFile)) {
+    errors.push(
+      `--proxyListFile not found: ${cfg.proxy.listFile} (set PROXY_LIST_FILE in .env or pass --proxyListFile <path>)`,
     );
   }
   return errors;
@@ -304,6 +335,29 @@ function loadConfig(argv = process.argv.slice(2)) {
       typeKeyMaxMs: toIntOrNull(process.env.TYPE_KEY_MAX_MS) ?? 150,
     },
 
+    // Phase 2.3 — Proxy management & rotation
+    proxy: {
+      // --noProxy forces a direct connection (Phase 1 behavior). Overrides
+      // every other proxy flag. Also implied when no proxy source is configured.
+      enabled: !cli.noProxy && process.env.NO_PROXY !== 'true' &&
+        !!(cli.proxyListFile || process.env.PROXY_LIST_FILE || process.env.PROXY_PROVIDER),
+      strategy: cli.proxyStrategy || process.env.PROXY_STRATEGY || 'random',
+      sessionLength: toIntOrNull(cli.sessionLength ?? process.env.SESSION_LENGTH) ?? 1,
+      cooldownMs: toIntOrNull(cli.proxyCooldownMs ?? process.env.PROXY_COOLDOWN_MS) ?? 10 * 60 * 1000,
+      listFile: cli.proxyListFile || process.env.PROXY_LIST_FILE || null,
+      // Provider name (informational — the actual fetch impl is wired in index.js
+      // based on this string, e.g. 'brightdata' → Bright Data API).
+      provider: process.env.PROXY_PROVIDER || null,
+      providerUrl: process.env.PROXY_PROVIDER_URL || null,
+      providerToken: process.env.PROXY_PROVIDER_TOKEN || null,
+      // Optional pre-run health check (--proxyHealthCheck probes every proxy
+      // with a HEAD to google.com before the scrape starts).
+      healthCheck: !!cli.proxyHealthCheck,
+      // Burn log path (defaults to data/proxy_burn_log.jsonl). Override via env
+      // for ops teams that want to centralize the log.
+      burnLogPath: process.env.PROXY_BURN_LOG || null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -362,6 +416,13 @@ Optional:
                                --output csv,json,db  (all three, explicit)
                                --output all          (all three, shorthand)
 
+  --proxyStrategy <s>        Phase 2.3 — round-robin | random | sticky (default: random)
+  --sessionLength <n>        Phase 2.3 — requests per proxy before rotation (sticky only; default: 1)
+  --proxyCooldownMs <ms>     Phase 2.3 — burn cooldown window (default: 600000 = 10 min)
+  --proxyListFile <path>     Phase 2.3 — proxy list file (one proxy per line)
+  --proxyHealthCheck         Phase 2.3 — probe every proxy with a HEAD before scraping
+  --noProxy                  Phase 2.3 — force direct connection (Phase 1 behavior)
+
   --version                  Print version and exit
   --help, -h                 Show this help
 
@@ -376,6 +437,13 @@ Examples:
   npm run db:migrate                                        # create schema (once)
   npm start -- --query "Cafe" --location "Berlin" --output db --yes
   npm start -- --query "Cafe" --location "Berlin" --output all   # CSV + JSON + DB
+
+  # Phase 2.3 — proxy rotation (set PROXY_LIST_FILE in .env or pass --proxyListFile)
+  #   Format: one proxy per line — protocol://[user:pass@]host:port or host:port:user:pass
+  npm start -- --query "Cafe" --location "Berlin" --proxyListFile ./proxies.txt
+  npm start -- --query "Cafe" --location "Berlin" --proxyStrategy round-robin --sessionLength 5
+  npm start -- --query "Cafe" --location "Berlin" --proxyListFile ./proxies.txt --proxyHealthCheck
+  npm start -- --query "Cafe" --location "Berlin" --noProxy   # force direct connection
 
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun

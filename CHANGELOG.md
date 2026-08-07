@@ -199,6 +199,139 @@ Phase 1 is tagged `v1.0.0-phase1` — the `-phase1` suffix marks the milestone
 
 ---
 
+### Phase 2.3 — Proxy Management & Rotation
+
+#### Added
+- **`src/proxy.js`** — a configurable proxy pool that sits between the scraper
+  and Google. Every browser launch (or every N requests, via `--sessionLength`)
+  pulls a different proxy from the pool. Burned proxies (3 consecutive 403/429,
+  <50% success rate over last 20 requests, 3 consecutive timeouts) are benched
+  for a cooldown window; permanently bad proxies (HTTP 407, provider-reported
+  retired) are removed entirely.
+  - `createProxyPool({ sources, strategy, sessionLength, cooldownMs, logger, now, rng, burnDetector, burnLogWriter })`
+    — factory. Sources: `file` (`PROXY_LIST_FILE`), inline `list` (for tests),
+    or async `provider()` (Bright Data / Smartproxy / Oxylabs — caller supplies
+    the impl). All clocks and randomness are injectable for deterministic tests.
+  - `pool.acquire()` — returns the next proxy `{ id, server, url, username,
+    password, host, port, protocol, provider }` per the rotation strategy.
+    Skips proxies in cooldown or permanently burned. Returns null when the pool
+    is exhausted (caller falls back to direct or aborts).
+  - `pool.release(proxyId, { success, statusCode })` — reports the outcome of
+    an acquire→use cycle. The burn detector decides whether to burn based on
+    the outcome history.
+  - `pool.markBurned(proxyId, reason, { permanent })` — manual burn override.
+  - `pool.stats()` — `{ total, healthy, cooldown, burned, avgSuccessRate,
+    totalRequests, totalSuccess, strategy, sessionLength, perProxy[] }`.
+  - `pool.healthCheck({ fetchFn, url, timeoutMs })` — optional pre-run probe
+    that pings every proxy with a HEAD to Google; benches failures for one
+    cooldown cycle. `fetchFn` is injectable so unit tests make zero real
+    network calls.
+  - `pool.close()` — best-effort teardown (burn log uses sync writes).
+- **`src/proxy/burn-detector.js`** — pure per-proxy health tracking + burn
+  decision logic. Kept separate from the pool so unit tests can exercise burn
+  thresholds without spinning up a pool, and future strategies (ML-based
+  anomaly detection) can be dropped in without touching the pool's
+  acquire/release flow.
+  - `createBurnDetector({ cooldownMs, statusWindow, rateWindow, rateThreshold,
+    minRateSamples, consecutiveBlock, consecutiveTimeout, now })`
+  - `detector.record(proxyId, { success, statusCode })` — mutates state, may
+    transition to cooldown/burned. Returns `{ burned, kind, reason }`.
+  - `detector.markPermanent/markCooldown/clear(proxyId, reason)` — manual overrides.
+  - `detector.isReusable(proxyId)` — false for permanent burns and for cooldown
+    burns whose window hasn't elapsed.
+  - `detector.state/stats/cooldownRemainingMs/all/resetCounters(proxyId)` —
+    introspection.
+  - Auto-burn rules:
+    - 3 consecutive 403/429 → cooldown.
+    - Success rate < 50% over last 20 requests (min 5 samples) → cooldown.
+    - 3 consecutive timeouts (`statusCode === 'TIMEOUT'`) → cooldown.
+    - HTTP 407 (Proxy Authentication Required) → permanent (removed entirely).
+  - Cooldown proxies auto-recover after `cooldownMs` (default 10 min). Permanent
+    proxies never recover.
+- **`src/browser.js`** — `launchBrowser(cfg, opts)` now accepts
+  `opts.proxy = { server, username, password, id, provider, host, port }`.
+  When present, it's passed to Playwright's `chromium.launch({ proxy })` so all
+  browser traffic flows through it. When no proxy is configured, the launch is
+  direct (Phase 1 behavior preserved). The "Browser launched" log line now
+  records the proxy id + provider so the JSON-lines log can be cross-referenced
+  with `data/proxy_burn_log.jsonl`.
+- **`src/config.js`** — new CLI flags + env vars:
+  - `--proxyStrategy round-robin|random|sticky` (default: random)
+  - `--sessionLength N` (default: 1 = rotate every request; sticky only)
+  - `--proxyCooldownMs` (default: 600000 = 10 min)
+  - `--proxyListFile <path>` (or `PROXY_LIST_FILE` env)
+  - `--proxyHealthCheck` (probe every proxy with a HEAD before scraping)
+  - `--noProxy` (force direct connection; overrides everything)
+  - Env: `PROXY_STRATEGY`, `SESSION_LENGTH`, `PROXY_COOLDOWN_MS`, `NO_PROXY`,
+    `PROXY_LIST_FILE`, `PROXY_PROVIDER`, `PROXY_PROVIDER_URL`,
+    `PROXY_PROVIDER_TOKEN`, `PROXY_BURN_LOG`.
+  - Validation: strategy must be one of the three; sessionLength 1–10000;
+    cooldownMs 0–86400000; listFile must exist if specified.
+- **`src/index.js`** — pipeline wiring:
+  - Constructs the proxy pool after config validation (only when
+    `cfg.proxy.enabled`).
+  - Optional pre-run health check (`--proxyHealthCheck`) probes every proxy
+    before scraping; aborts if all fail.
+  - Acquires a proxy before each `withBrowser` call; passes it through to
+    `launchBrowser` via `opts.proxy`.
+  - Releases the proxy in a `finally` block with the pipeline outcome:
+    - Success → `{ success: true }`.
+    - CAPTCHA → `{ success: false, statusCode: 429 }` (treat as block signal).
+    - Other crash → `{ success: false, statusCode: 'TIMEOUT' }`.
+  - The end-of-run banner now includes a `Proxy:` line with healthy/cooling/
+    burned counts + strategy + avg success rate.
+  - The run summary (`summary.json`) now includes `proxy: pool.stats()`.
+- **`src/banner.js`** — startup banner now shows a `Proxy` row: strategy +
+  session length + cooldown when enabled, or "disabled (direct)" otherwise.
+- **`data/proxy_burn_log.jsonl`** — append-only JSONL log of every burn event.
+  Each line: `{ ts, kind, proxyId, reason, recentStatusCodes, provider, stats }`.
+  Used for ops debugging + provider charge disputes.
+- **`tests/proxy.test.js`** — 52 tests / 143 assertions across 9 describe
+  blocks:
+  - `parseProxyLine` (6 tests) — all 3 URL formats + edge cases.
+  - Burn detector (13 tests) — every burn rule + recovery + manual overrides.
+  - Pool strategies (5 tests) — round-robin, random (seeded), sticky,
+    sessionLength rotation.
+  - Pool burn integration (5 tests) — release triggers burn, markBurned,
+    exhaustion, cooldown recovery, stats accuracy.
+  - Burn log writer (2 tests) — JSONL format + event fields.
+  - Health check (2 tests) — DI'd fetchFn, failed proxies benched.
+  - DI / no-network guarantees (3 tests) — inline list, injected provider,
+    empty pool.
+  - Config integration (8 tests) — every flag + env var + validation errors.
+  - Acceptance criteria (7 tests) — AC1–AC7 from the execution plan, each
+    verified by a dedicated test.
+
+#### Changed
+- `package.json` — version bumped to `1.0.0-phase2.3`.
+- `src/browser.js` — `withBrowser` now returns `{ browser, page, proxy }` so
+  the caller can release the proxy to the pool with the appropriate outcome.
+- `.env.example` — new Phase 2.3 section documenting all proxy env vars.
+- `PHASE2_EXECUTION_PLAN.md` — Phase 2.3 marked ✅ DONE with test counts and
+  deliverable summary.
+
+#### Design notes
+- **Eager sync load.** The pool loads sync sources (file + list) eagerly at
+  construction so `stats()` and `markBurned()` work without an `acquire()`
+  first. Async sources (provider API) load lazily on first `acquire()`/
+  `healthCheck()` via a shared `loadPromise`.
+- **Default-port restoration.** Node's `URL` strips default ports (80 for http,
+  443 for https, 1080 for socks5). `parseProxyLine` restores them so the
+  descriptor always has an explicit port — otherwise `http://1.1.1.1:80` would
+  parse as null.
+- **Burn log is sync.** Proxy burns are rare (a 1000-proxy pool might see a
+  few burns per hour), so we use `fs.appendFileSync` for durability rather
+  than buffering. This guarantees the burn event hits disk before the pool
+  moves on, which matters for provider charge disputes.
+- **CAPTCHA → 429 mapping.** When the pipeline aborts with `CAPTCHA_DETECTED`,
+  we release the proxy with `statusCode: 429` rather than `'TIMEOUT'`. This
+  feeds the consecutive-block burn rule (3 CAPTCHAs → cooldown), which is the
+  correct signal: a CAPTCHA means Google is rate-limiting that IP.
+
+**Test count:** 603 tests / 1550 assertions (was 551 / 1407).
+
+---
+
 ## [Unreleased] — post-v1.0.0-phase1 hotfixes
 
 ### Fixed

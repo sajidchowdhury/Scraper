@@ -19,7 +19,7 @@
 | 2.0 — Audit, Fixtures & Dependency Setup | ✅ DONE | _(this commit)_ | 410 | Baseline metrics captured, 6 DOM fixtures, 8 deps installed, docker-compose.yml, .env.example Phase 2 vars |
 | 2.1 — PostgreSQL Persistence Layer | ✅ DONE | _(this commit)_ | 475 (+65) | `src/db.js` (pool, upserts, change-hash), `schema.sql`, `migrate.js`, `--output csv\|json\|db\|all` flag, batched upserts, transaction rollback, SQL-injection-safe |
 | 2.2 — Change Tracking & History | ✅ DONE | _(this commit)_ | 551 (+76) | `business_snapshots` + `field_changes` tables, `src/db/deltas.js` (computeChanges, numericDelta), snapshot-on-update, `changes_detected` on scrape_runs, `npm run db:history` CLI, change-breakdown banner |
-| 2.3 — Proxy Management & Rotation | ⬜ NOT STARTED | — | — | `proxy.js`, pool, rotation strategies, burn detection |
+| 2.3 — Proxy Management & Rotation | ✅ DONE | 52 tests | `src/proxy.js`, `src/proxy/burn-detector.js` | pool, 3 rotation strategies, burn detection, health check |
 | 2.4 — Browser Fingerprint Randomization | ⬜ NOT STARTED | — | — | UA, viewport, timezone, locale, WebGL, canvas, fonts |
 | 2.5 — Stealth Hardening | ⬜ NOT STARTED | — | — | `playwright-extra` + stealth, `navigator.webdriver`, headless evasion |
 | 2.6 — CAPTCHA Auto-Solving | ⬜ NOT STARTED | — | — | 2Captcha/Anti-Captcha/CapSolver integration, fallback chain |
@@ -313,7 +313,7 @@ A change-tracking system that turns re-scrapes into trend data, with queryable d
 
 ## Phase 2.3 — Proxy Management & Rotation
 
-> **Status: ⬜ NOT STARTED**
+> **Status: ✅ DONE** — `src/proxy.js` (290 LOC) + `src/proxy/burn-detector.js` (320 LOC) + `tests/proxy.test.js` (52 tests / 143 assertions). All 7 acceptance criteria verified by tests AC1–AC7.
 
 ### Goal
 Introduce a proxy layer between the scraper and Google. Every browser launch (or every N requests) uses a different proxy from a configurable pool. Burned proxies (returned 403/429) are automatically retired and flagged.
@@ -322,7 +322,7 @@ Introduce a proxy layer between the scraper and Google. Every browser launch (or
 A single IP scraping Google Maps for 10,000 listings will get blocked within hours. Rotating proxies (especially residential) are the #1 defense. Without this, Phase 2's "survive overnight" goal is impossible.
 
 ### Task checklist
-- [ ] **Proxy pool module.** `src/proxy.js`:
+- [x] **Proxy pool module.** `src/proxy.js`:
   - `createProxyPool({ sources, strategy, logger })` — returns a pool object.
   - Sources: file (`PROXY_LIST_FILE`), provider API (Bright Data / Smartproxy / Oxylabs), or manual list.
   - `pool.acquire()` — returns the next proxy `{ url, auth, id, provider }` per the rotation strategy.
@@ -330,11 +330,11 @@ A single IP scraping Google Maps for 10,000 listings will get blocked within hou
   - `pool.markBurned(proxyId, reason)` — removes a proxy from rotation, logs to `proxy_burn_log`.
   - `pool.stats()` — returns `{ total, healthy, burned, avgSuccessRate }`.
   - `pool.healthCheck()` — optional async method that pings each proxy with a HEAD to Google; prunes dead ones.
-- [ ] **Rotation strategies.** Implement three, configurable via `--proxyStrategy`:
+- [x] **Rotation strategies.** Implement three, configurable via `--proxyStrategy`:
   - `round-robin` — cycle through the pool sequentially.
   - `random` — pick randomly (default; better for distributing load).
   - `sticky` — same proxy per session/worker (used when `--sessionLength N` keeps a proxy for N requests, then rotates).
-- [ ] **Burn detection.** `src/proxy/burn-detector.js`:
+- [x] **Burn detection.** `src/proxy/burn-detector.js`:
   - Tracks per-proxy: request count, success count, last 10 status codes.
   - Auto-burn conditions:
     - 3 consecutive 403/429 responses.
@@ -342,17 +342,17 @@ A single IP scraping Google Maps for 10,000 listings will get blocked within hou
     - Connection timeout 3 times in a row.
   - Burned proxies go to a cooldown list (configurable: 10 min default) before being retried.
   - Permanent burn (proxy returns 407 auth failed) → removed from pool entirely.
-- [ ] **Browser integration.** Modify `src/browser.js`:
+- [x] **Browser integration.** Modify `src/browser.js`:
   - `launchBrowser({ proxy, ...opts })` — passes `proxy.server`, `proxy.username`, `proxy.password` to Playwright's `chromium.launch({ proxy })`.
   - If no proxy configured → falls back to direct connection (Phase 1 behavior preserved).
   - Log: `Browser launched via proxy <id> (provider: brightdata, location: de-frankfurt)`.
-- [ ] **Config flags.**
+- [x] **Config flags.**
   - `--proxyStrategy round-robin|random|sticky` (default: random)
   - `--sessionLength N` (requests per proxy before rotation; default: 1 = rotate every request)
   - `--proxyCooldownMs` (default: 600000 = 10 min)
   - `--noProxy` (force direct connection; overrides everything)
-- [ ] **Burn log.** `data/proxy_burn_log.jsonl` — append-only log of every burn event with timestamp, proxy id, reason, status codes, provider. Used for ops debugging and provider cost tracking.
-- [ ] **Unit tests.** `tests/proxy.test.js`:
+- [x] **Burn log.** `data/proxy_burn_log.jsonl` — append-only log of every burn event with timestamp, proxy id, reason, status codes, provider. Used for ops debugging and provider cost tracking.
+- [x] **Unit tests.** `tests/proxy.test.js`:
   - `pool.acquire()` cycles correctly per strategy.
   - `pool.markBurned()` removes from rotation; `pool.release({ success: false })` triggers burn after threshold.
   - Burn detector: 3 consecutive 403s → burned; recovery after cooldown.
@@ -372,7 +372,7 @@ A single IP scraping Google Maps for 10,000 listings will get blocked within hou
 Phase 2.0 (dependencies, infra).
 
 ### Deliverable
-A proxy rotation layer that distributes requests across a pool and self-heals by retiring burned proxies.
+A proxy rotation layer that distributes requests across a pool and self-heals by retiring burned proxies. **Shipped:** `src/proxy.js` (pool, 3 strategies, health check, burn log writer), `src/proxy/burn-detector.js` (pure burn logic with cooldown + permanent burn), `tests/proxy.test.js` (52 tests / 143 assertions covering all 7 acceptance criteria), `src/browser.js` proxy integration, `src/config.js` + `src/banner.js` + `src/index.js` wiring, `.env.example` Phase 2.3 vars. 603 tests / 1550 assertions passing.
 
 ---
 

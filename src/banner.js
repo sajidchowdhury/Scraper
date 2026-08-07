@@ -82,6 +82,14 @@ function buildStartupBanner(cfg, opts = {}) {
     ['Max RPM', fmt(cfg.antiblock.maxRequestsPerMin)],
     ['Human typing', fmt(cfg.antiblock.humanTyping)],
     ['CAPTCHA pause', cfg.antiblock.captchaPause ? `yes (${cfg.antiblock.captchaWaitMs}ms)` : 'no'],
+    // Phase 2.3 — proxy rotation summary. Shows strategy + session length +
+    // cooldown when enabled, or "disabled" when --noProxy or no source is set.
+    [
+      'Proxy',
+      cfg.proxy && cfg.proxy.enabled
+        ? `${cfg.proxy.strategy} (session ${cfg.proxy.sessionLength}, cooldown ${Math.round(cfg.proxy.cooldownMs / 1000)}s)${cfg.proxy.listFile ? ` [${cfg.proxy.listFile}]` : ''}${cfg.proxy.healthCheck ? ' +healthcheck' : ''}`
+        : 'disabled (direct)',
+    ],
   ];
 
   const width = rows.reduce((m, [k]) => Math.max(m, k.length), 0);
