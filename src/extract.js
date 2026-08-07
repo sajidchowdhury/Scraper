@@ -25,6 +25,16 @@
  *   - Per-record normalizeRecord wrapped in try/catch — a bad card never
  *     crashes the whole extraction; it's logged + counted as failed
  *   - Returns stats: { total, succeeded, failed, failures: [{index, error}] }
+ *
+ * Phase 1.9 additions:
+ *   - All log lines bound to the 'extract' phase so the JSON-lines log file
+ *     can be filtered by pipeline stage.
+ *   - Per-business extraction log: each record emits an INFO line with index,
+ *     name, and success/fail so the operator sees real-time progress and the
+ *     log file captures every business with its outcome.
+ *   - Per-field DEBUG logs: at --logLevel debug, every normalized record emits
+ *     a line listing each canonical field's value (or null) so an operator
+ *     can diagnose which selectors are missing for which businesses.
  */
 
 const { withRetry } = require('./retry');
@@ -576,24 +586,28 @@ function cleanPhone(raw) {
  */
 async function extractBusinesses(page, ctx) {
   const logger = ctx.logger || { info() {}, warn() {}, debug() {}, error() {} };
+  // Phase 1.9 — bind every line to the 'extract' phase (no-op for plain stubs).
+  const log = logger.phase ? logger.phase('extract') : logger;
+  const isDebug = logger.minLevel != null && logger.minLevel <= 10; // LEVELS.debug === 10
   const scrapedAt = new Date().toISOString();
   // Retry only when ctx.retry is explicitly provided (production path).
   // Unit tests pass a stub page without retry — no retry, preserves fast-fail.
   const hasRetry = !!ctx.retry;
   const retryOpts = hasRetry
-    ? { attempts: ctx.retry.attempts || 3, baseMs: ctx.retry.baseMs || 1000, logger }
-    : { attempts: 1, baseMs: 0, logger };
+    ? { attempts: ctx.retry.attempts || 3, baseMs: ctx.retry.baseMs || 1000, logger: log }
+    : { attempts: 1, baseMs: 0, logger: log };
 
-  logger.info('Extracting business records from feed');
+  log.info('Extracting business records from feed');
   const rawExtract = () => extractRawFromPage(page);
   const rawRecords = hasRetry
     ? await withRetry(rawExtract, { ...retryOpts, label: 'extractRawFromPage' })
     : await rawExtract();
-  logger.info('Raw records pulled from DOM', { count: rawRecords.length });
+  log.info('Raw records pulled from DOM', { count: rawRecords.length });
 
   const businesses = [];
   const failures = [];
   for (let i = 0; i < rawRecords.length; i++) {
+    const rawIndex = rawRecords[i].index ?? i;
     try {
       const normalized = normalizeRecord(rawRecords[i], {
         scrapedAt,
@@ -601,11 +615,37 @@ async function extractBusinesses(page, ctx) {
         location: ctx.location,
       });
       businesses.push(normalized);
+      // Phase 1.9 — per-business success log. Every business the operator sees
+      // scroll by is recorded in the log file with its index + name, so a
+      // post-run audit can confirm every card was captured.
+      log.info('Business extracted', {
+        index: rawIndex,
+        name: normalized.name,
+        success: true,
+        sponsored: normalized.is_sponsored,
+        status: normalized.business_status,
+      });
+      // Phase 1.9 — per-field debug log. At --logLevel debug the operator gets
+      // a full field-by-field breakdown so a missing selector is obvious.
+      if (isDebug) {
+        const fields = {};
+        for (const f of CANONICAL_FIELDS) {
+          const v = normalized[f];
+          fields[f] =
+            v === null || v === undefined || v === ''
+              ? null
+              : typeof v === 'string' && v.length > 60
+                ? v.slice(0, 60) + '...'
+                : v;
+        }
+        log.debug('Normalized fields', { index: rawIndex, name: normalized.name, fields });
+      }
     } catch (err) {
       // Per-business error isolation: log + count, don't crash the run.
-      failures.push({ index: rawRecords[i].index ?? i, error: err.message });
-      logger.warn('Failed to normalize business record — skipping', {
-        index: rawRecords[i].index ?? i,
+      failures.push({ index: rawIndex, error: err.message });
+      log.warn('Business extraction failed — skipping', {
+        index: rawIndex,
+        success: false,
         error: err.message,
       });
     }
@@ -618,8 +658,13 @@ async function extractBusinesses(page, ctx) {
     failed: failures.length,
     failures,
   };
+  log.info('Extraction batch complete', {
+    total: stats.total,
+    succeeded: stats.succeeded,
+    failed: stats.failed,
+  });
   if (failures.length > 0) {
-    logger.warn('Extraction completed with failures', {
+    log.warn('Extraction completed with failures', {
       total: stats.total,
       succeeded: stats.succeeded,
       failed: stats.failed,
@@ -664,6 +709,9 @@ function computeExtractionRates(businesses, opts = {}) {
  * Returns the same rates object (for inclusion in run summary).
  */
 function logExtractionRates(rates, logger) {
+  // Phase 1.9 — bind to the 'extract' phase so the rate table is grouped with
+  // the rest of the extraction events in the log file.
+  const log = logger && logger.phase ? logger.phase('extract') : logger;
   const lines = [];
   lines.push('Field extraction rates:');
   lines.push('  field              filled / total   rate');
@@ -678,9 +726,17 @@ function logExtractionRates(rates, logger) {
     );
   }
   for (const l of lines) {
-    if (l.includes('WARN')) logger.warn(l.trim());
-    else logger.info(l);
+    if (l.includes('WARN')) log.warn(l.trim());
+    else log.info(l);
   }
+  // Phase 1.9 — also emit a single structured summary line so the JSON-lines
+  // file has a machine-parseable record of the rate table (not just the
+  // pre-formatted text lines above).
+  const summary = {};
+  for (const field of CANONICAL_FIELDS) {
+    if (rates[field]) summary[field] = rates[field].rate;
+  }
+  log.info('Extraction-rate summary', { rates: summary });
   return rates;
 }
 

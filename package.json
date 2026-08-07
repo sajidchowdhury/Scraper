@@ -1,7 +1,7 @@
 {
   "name": "gmaps-scraper",
-  "version": "0.8.0",
-  "description": "Google Maps business scraper — Phase 1 (search, paginate, extract, deep scrape, CSV export, crash recovery, anti-block).",
+  "version": "0.9.0",
+  "description": "Google Maps business scraper — Phase 1 (search, paginate, extract, deep scrape, CSV export, crash recovery, anti-block, structured logging).",
   "engines": {
     "node": ">=20"
   },

@@ -22,6 +22,9 @@
  *   - Sleep is injectable for unit testing (so tests don't actually wait).
  *
  * DI pattern matches src/scroll.js and src/detail.js.
+ *
+ * Phase 1.9: every log line is bound to the 'retry' phase so the JSON-lines
+ * log file can be filtered by pipeline stage.
  */
 
 function defaultSleep(ms) {
@@ -61,11 +64,13 @@ async function withRetry(fn, opts = {}) {
   const label = opts.label || 'operation';
   const retryIf = opts.retryIf || (() => true);
   const sleep = opts.sleep || defaultSleep;
-  const logger = opts.logger || {
+  const rawLogger = opts.logger || {
     warn() {},
     debug() {},
     info() {},
   };
+  // Phase 1.9 — bind retry log lines to the 'retry' phase (no-op for stubs).
+  const logger = rawLogger && rawLogger.phase ? rawLogger.phase('retry') : rawLogger;
 
   let lastErr;
   for (let attempt = 0; attempt < attempts; attempt++) {

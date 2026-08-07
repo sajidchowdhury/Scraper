@@ -26,6 +26,9 @@
  *   - Page-bound functions are thin wrappers over the pure ones.
  *   - Async functions accept injectable sleep/type/delay functions for fast,
  *     deterministic unit tests (see tests/antiblock.test.js).
+ *
+ * Phase 1.9: every log line is bound to the 'antiblock' phase so the
+ * JSON-lines log file can be filtered by pipeline stage.
  */
 
 // ---------------------------------------------------------------------------
@@ -150,7 +153,9 @@ class RateLimiter {
     this.windowMs = opts.windowMs || 60_000;
     this.sleepFn = opts.sleepFn || sleep;
     this.nowFn = opts.nowFn || (() => Date.now());
-    this.logger = opts.logger || null;
+    // Phase 1.9 — bind to the 'antiblock' phase (no-op for plain stubs).
+    const rawLogger = opts.logger || null;
+    this.logger = rawLogger && rawLogger.phase ? rawLogger.phase('antiblock') : rawLogger;
     this._timestamps = [];
     this._waits = 0; // total times we blocked
   }
@@ -279,7 +284,9 @@ function isBlockStatus(status) {
  * @returns {() => void} detach
  */
 function attachBlockWatcher(page, opts = {}) {
-  const logger = opts.logger || null;
+  const rawLogger = opts.logger || null;
+  // Phase 1.9 — bind to the 'antiblock' phase (no-op for plain stubs).
+  const logger = rawLogger && rawLogger.phase ? rawLogger.phase('antiblock') : rawLogger;
   const onBlocked = opts.onBlocked || (() => {});
   const hostFilter = opts.hostFilter || 'google.com';
   let blockedCount = 0;

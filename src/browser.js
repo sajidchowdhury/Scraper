@@ -15,12 +15,21 @@
  *     SLOW_MO env var still works for debugging but defaults to 0.
  *   - Optional attachBlockWatcher hook: callers can pass an onBlocked callback
  *     to be notified of Google 429 / 503 responses (handled in index.js).
+ *
+ * Phase 1.9 changes:
+ *   - Emits a structured "Browser launched" event (phase: browser) with UA,
+ *     viewport, headless mode so the log file records the exact launch config
+ *     for post-run debugging.
  */
 
 const { chromium } = require('playwright');
 const { pickUserAgent, attachBlockWatcher } = require('./antiblock');
 
 async function launchBrowser(cfg, opts = {}) {
+  const rawLogger = opts.logger || null;
+  // Phase 1.9 — bind every launch-related line to the 'browser' phase.
+  const log = rawLogger && rawLogger.phase ? rawLogger.phase('browser') : rawLogger;
+
   const browser = await chromium.launch({
     headless: cfg.headless,
     // slowMo default 0 — Phase 1.8 relies on explicit randomized delays at
@@ -40,6 +49,19 @@ async function launchBrowser(cfg, opts = {}) {
   context.setDefaultTimeout(cfg.navTimeoutMs || 60000);
 
   const page = await context.newPage();
+
+  // Phase 1.9 — record the exact launch config. The UA is truncated for log
+  // readability (full UA is in the context, not needed in every log line).
+  if (log) {
+    log.info('Browser launched', {
+      headless: cfg.headless,
+      viewport: { width: cfg.viewportWidth, height: cfg.viewportHeight },
+      userAgent: ua.slice(0, 80) + (ua.length > 80 ? '...' : ''),
+      slowMo: cfg.slowMo || 0,
+      navTimeoutMs: cfg.navTimeoutMs || 60000,
+      locale: 'en-US',
+    });
+  }
 
   // Phase 1.8 — attach the HTTP 429/503 watcher if a callback was provided.
   // The callback decides what to do (pause + alert, or exit). The watcher

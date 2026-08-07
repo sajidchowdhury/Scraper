@@ -13,6 +13,9 @@
  * Functions accept an injectable `countFn` / `scrollFn` / `endFn` for unit
  * testing without a real browser (DI pattern). The production wrapper
  * (`scrollFeedToBottomOnPage`) wraps each in withRetry (Phase 1.7).
+ *
+ * Phase 1.9: every log line is bound to the 'scroll' phase so the JSON-lines
+ * log file can be filtered by pipeline stage.
  */
 
 const { withRetry } = require('./retry');
@@ -134,34 +137,37 @@ async function scrollFeedToBottom({
   pollIntervalMs = 500,
   logger = { info() {}, debug() {}, warn() {} },
 }) {
+  // Phase 1.9 — bind every line to the 'scroll' phase. The DI signature keeps
+  // the default stub so unit tests that pass a plain object still work.
+  const log = logger && logger.phase ? logger.phase('scroll') : logger;
   const start = Date.now();
   let count = await countFn();
   let lastCount = count;
   let stallCount = 0;
   let reason = 'maxResults';
 
-  logger.info('Scroll loop started', { initialCount: count, maxResults });
+  log.info('Scroll loop started', { initialCount: count, maxResults });
 
   while (true) {
     // Stop conditions
     if (maxResults !== null && count >= maxResults) {
       reason = 'maxResults';
-      logger.info('Scroll stop: maxResults reached', { count, maxResults });
+      log.info('Scroll stop: maxResults reached', { count, maxResults });
       break;
     }
     if (Date.now() - start > totalTimeoutMs) {
       reason = 'timeout';
-      logger.warn('Scroll stop: total timeout reached', { count, elapsedMs: Date.now() - start });
+      log.warn('Scroll stop: total timeout reached', { count, elapsedMs: Date.now() - start });
       break;
     }
     if (await endFn()) {
       reason = 'endOfList';
-      logger.info('Scroll stop: end-of-list indicator detected', { count });
+      log.info('Scroll stop: end-of-list indicator detected', { count });
       break;
     }
     if (stallCount >= stallThreshold) {
       reason = 'stall';
-      logger.info('Scroll stop: stall threshold reached', { count, stallCount });
+      log.info('Scroll stop: stall threshold reached', { count, stallCount });
       break;
     }
 
@@ -170,7 +176,7 @@ async function scrollFeedToBottom({
     // When batchDelayMinMs/MaxMs are unset, falls back to fixed batchDelayMs
     // (preserves deterministic behavior for legacy callers / unit tests).
     const delay = pickBatchDelay({ batchDelayMs, batchDelayMinMs, batchDelayMaxMs });
-    logger.debug('Inter-scroll delay', { ms: delay, randomized: batchDelayMinMs != null });
+    log.debug('Inter-scroll delay', { ms: delay, randomized: batchDelayMinMs != null });
     await sleep(delay);
 
     // Wait for count to settle after this scroll
@@ -181,11 +187,14 @@ async function scrollFeedToBottom({
     });
 
     if (newCount > lastCount) {
-      logger.info('Scroll progress', { from: lastCount, to: newCount });
+      // Phase 1.9 — scroll progress now includes the page number (approx,
+      // ~20 results per page) so the operator can see real-time pagination.
+      const page = Math.ceil(newCount / 20);
+      log.info('Scroll progress', { from: lastCount, to: newCount, page });
       stallCount = 0;
     } else {
       stallCount++;
-      logger.debug('Scroll stall', { stallCount, count: newCount });
+      log.debug('Scroll stall', { stallCount, count: newCount });
     }
     lastCount = newCount;
     count = newCount;
@@ -207,14 +216,16 @@ async function scrollFeedToBottom({
  * unit tests remain deterministic with synthetic functions.
  */
 async function scrollFeedToBottomOnPage(page, cfg, logger) {
+  // Phase 1.9 — bind to the 'scroll' phase (no-op if logger is a plain stub).
+  const log = logger && logger.phase ? logger.phase('scroll') : logger;
   // Retry only when cfg.retry is explicitly provided (production path via
   // index.js). Unit tests call scrollFeedToBottom directly with synthetic
   // functions, so this wrapper's retry doesn't affect them. But to be safe,
   // we also guard here in case a test calls this wrapper without cfg.retry.
   const hasRetry = !!(cfg && cfg.retry);
   const retryOpts = hasRetry
-    ? { attempts: cfg.retry.attempts || 3, baseMs: cfg.retry.baseMs || 1000, logger }
-    : { attempts: 1, baseMs: 0, logger };
+    ? { attempts: cfg.retry.attempts || 3, baseMs: cfg.retry.baseMs || 1000, logger: log }
+    : { attempts: 1, baseMs: 0, logger: log };
 
   const wrap = (fn, label) =>
     hasRetry ? () => withRetry(fn, { ...retryOpts, label }) : fn;
@@ -233,7 +244,7 @@ async function scrollFeedToBottomOnPage(page, cfg, logger) {
     batchDelayMinMs: cfg.antiblock ? cfg.antiblock.scrollDelayMinMs : null,
     batchDelayMaxMs: cfg.antiblock ? cfg.antiblock.scrollDelayMaxMs : null,
     pollIntervalMs: cfg.scroll.pollIntervalMs,
-    logger,
+    logger: log,
   });
 }
 

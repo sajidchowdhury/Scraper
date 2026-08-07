@@ -8,9 +8,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 1.8 complete (v0.8.0) — 331 tests / 811 assertions passing.
+> **Last updated:** Phase 1.9 complete (v0.9.0) — 358 tests / 911 assertions passing.
 >
-> **Overall:** 9 of 12 sub-phases shipped. Phases 1.0–1.8 are done; 1.9–1.11 are partial.
+> **Overall:** 10 of 12 sub-phases shipped. Phases 1.0–1.9 are done; 1.10–1.11 are partial.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -23,11 +23,11 @@
 | 1.6 — CSV Export Engine | ✅ DONE | `a6b0315` | 69 | RFC 4180 escaping, UTF-8 BOM, CSV + JSON + summary.json |
 | 1.7 — Reliability & Crash Recovery | ✅ DONE | `48c7306` | 85 | withRetry (3 attempts, 1s→2s→4s), checkpoint resume, per-business isolation |
 | 1.8 — Minimal Anti-Block Behavior | ✅ DONE | _(this commit)_ | 55 | `antiblock.js`: rate limiter (30 RPM), human typing, CAPTCHA detection, UA rotation, 429/503 watcher |
-| 1.9 — Logging & Observability | 🟡 PARTIAL | — | — | Dual-sink logger + JSON-lines + end-of-run summary exist; needs event-logging audit + `phase` field standardization |
+| 1.9 — Logging & Observability | ✅ DONE | _(this commit)_ | 27 | `phase` field on every line, per-business + per-field debug logs, run-complete event, sync file sink |
 | 1.10 — CLI Polish & DX | 🟡 PARTIAL | — | — | `--help`, `--version`, `--dryRun`, `--limit`, exit codes 0/1/2/3 ✓; missing startup banner + `--yes` |
 | 1.11 — Documentation & Handoff | 🟡 PARTIAL | — | — | README has Quick start / CLI / per-phase docs ✓; missing Troubleshooting, CHANGELOG, git tag |
 
-**Critical path remaining:** 1.9 → 1.10 → 1.11 (then Phase 1 milestone complete).
+**Critical path remaining:** 1.10 → 1.11 (then Phase 1 milestone complete).
 
 ---
 
@@ -457,7 +457,7 @@ A scraper that behaves politely enough to survive normal-size runs.
 
 ## Phase 1.9 — Logging & Observability
 
-> **Status: 🟡 PARTIAL (~60%)** — Dual-sink logger (console + JSON-lines file), log levels, end-of-run summary block all exist. Missing: standardized `phase` field on every log line, full event-logging audit against the spec checklist.
+> **Status: ✅ DONE** — Every log line carries a standardized `phase` field (10 phases). All spec'd key events are logged. `--logLevel debug` produces per-field extraction logs. 27 dedicated unit tests in `tests/logger.test.js`.
 
 ### Goal
 The operator should be able to see exactly what the script is doing in real time and diagnose problems after the fact.
@@ -471,17 +471,17 @@ When (not if) something goes wrong, good logs are the difference between a 5-min
   - Console (colorized, human-readable)
   - File (JSON lines, machine-parseable) at `logs/{query}_{location}_{timestamp}.log`
 - [x] Log levels: `DEBUG`, `INFO`, `WARN`, `ERROR`. Configurable via `--logLevel`.
-- [ ] Every log line includes: timestamp, level, phase (search/scroll/extract/export), message, and contextual fields (e.g., business index, field name).
-- [ ] Log these key events:
-  - Config resolved at startup
-  - Browser launched (with UA, viewport, headless mode)
-  - Search submitted (query, location)
-  - Results feed detected
-  - Scroll progress (every page of ~20)
-  - Each business extracted (index, name, success/fail)
-  - Extraction-rate summary at end
-  - CSV/JSON written (path, row count)
-  - Run duration and final status
+- [x] Every log line includes: timestamp, level, phase (search/scroll/extract/export), message, and contextual fields (e.g., business index, field name).
+- [x] Log these key events:
+  - [x] Config resolved at startup
+  - [x] Browser launched (with UA, viewport, headless mode)
+  - [x] Search submitted (query, location)
+  - [x] Results feed detected
+  - [x] Scroll progress (every page of ~20)
+  - [x] Each business extracted (index, name, success/fail)
+  - [x] Extraction-rate summary at end
+  - [x] CSV/JSON written (path, row count)
+  - [x] Run duration and final status
 - [x] Print a **clean, scannable console summary** at the end:
   ```
   ========================================

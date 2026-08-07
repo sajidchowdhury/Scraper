@@ -32,6 +32,11 @@
  *     business, if the hook reports a CAPTCHA, the run pauses + alerts the
  *     operator, then aborts (auto-solve is Phase 2).
  *
+ * Phase 1.9 additions:
+ *   - All log lines bound to the 'detail' phase so the JSON-lines log file
+ *     can be filtered by pipeline stage. Per-business outcome (success/fail
+ *     + timing) is now logged with the phase tag, making it queryable.
+ *
  * Functions accept injectable openFn/extractFn/backFn for unit testing
  * without a real browser (DI pattern, matching src/scroll.js).
  */
@@ -567,6 +572,8 @@ async function deepScrapeDetails({
   timeoutMs = 15000,
   logger = { info() {}, debug() {}, warn() {}, error() {} },
 }) {
+  // Phase 1.9 — bind to the 'detail' phase (no-op for plain stub loggers).
+  const log = logger && logger.phase ? logger.phase('detail') : logger;
   const startedAt = Date.now();
   const name = business && business.name ? business.name : '(unknown)';
 
@@ -578,11 +585,11 @@ async function deepScrapeDetails({
   }, timeoutMs);
 
   try {
-    logger.debug('Opening detail panel', { business: name });
+    log.debug('Opening detail panel', { business: name });
     const opened = await openFn();
     if (timedOut) throw new Error(`detail-scrape timeout (${timeoutMs}ms) before open completed`);
     if (!opened) {
-      logger.warn('Detail panel did not open', { business: name });
+      log.warn('Detail panel did not open', { business: name });
       return {
         detail: { ...EMPTY_DETAIL },
         ok: false,
@@ -601,7 +608,7 @@ async function deepScrapeDetails({
     if (timedOut) throw new Error(`detail-scrape timeout (${timeoutMs}ms) during extract`);
 
     const detail = normalizeDetail(raw);
-    logger.debug('Detail panel scraped', {
+    log.debug('Detail panel scraped', {
       business: name,
       reviews: (detail.top_reviews || []).length,
       photos: (detail.photos || []).length,
@@ -616,7 +623,7 @@ async function deepScrapeDetails({
       error: null,
     };
   } catch (err) {
-    logger.warn('Detail scrape failed for business — continuing', {
+    log.warn('Detail scrape failed for business — continuing', {
       business: name,
       error: err.message,
     });
@@ -634,7 +641,7 @@ async function deepScrapeDetails({
       try {
         await backFn();
       } catch (err) {
-        logger.debug('backFn failed (non-fatal)', { business: name, error: err.message });
+        log.debug('backFn failed (non-fatal)', { business: name, error: err.message });
       }
     }
   }
@@ -656,6 +663,7 @@ function sleep(ms) {
  * @returns {Promise<boolean>} true if a panel-open signal was detected
  */
 async function openDetailPanelOnPage(page, business, { logger }) {
+  const log = logger && logger.phase ? logger.phase('detail') : logger;
   const targetHref = business && business.maps_url ? business.maps_url : null;
 
   // Find the matching place anchor in the current results list
@@ -680,7 +688,7 @@ async function openDetailPanelOnPage(page, business, { logger }) {
   try {
     await anchor.click({ timeout: 8000 });
   } catch (err) {
-    logger.debug('click on place anchor failed', { error: err.message });
+    log.debug('click on place anchor failed', { error: err.message });
     return false;
   }
 
@@ -709,6 +717,7 @@ async function openDetailPanelOnPage(page, business, { logger }) {
  * browser back navigation. Swallow all errors — caller also has a try/catch.
  */
 async function backToListOnPage(page, { logger }) {
+  const log = logger && logger.phase ? logger.phase('detail') : logger;
   // Try the in-Maps Back button first
   try {
     const backBtn = await page
@@ -721,7 +730,7 @@ async function backToListOnPage(page, { logger }) {
       return;
     }
   } catch (err) {
-    logger.debug('in-Maps back button failed, falling back to nav.back', {
+    log.debug('in-Maps back button failed, falling back to nav.back', {
       error: err.message,
     });
   }
@@ -729,7 +738,7 @@ async function backToListOnPage(page, { logger }) {
   try {
     await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 });
   } catch (err) {
-    logger.debug('page.goBack failed', { error: err.message });
+    log.debug('page.goBack failed', { error: err.message });
   }
 }
 
@@ -747,12 +756,13 @@ async function backToListOnPage(page, { logger }) {
  * happens — preserving backward compat with the existing fast-failing tests.
  */
 async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
+  const log = logger && logger.phase ? logger.phase('detail') : logger;
   const detailCfg = (cfg && cfg.detail) || {};
   const ab = (cfg && cfg.antiblock) || {};
   const hasRetry = !!(cfg && cfg.retry);
   const retryOpts = hasRetry
-    ? { attempts: cfg.retry.attempts || 3, baseMs: cfg.retry.baseMs || 1000, logger }
-    : { attempts: 1, baseMs: 0, logger };
+    ? { attempts: cfg.retry.attempts || 3, baseMs: cfg.retry.baseMs || 1000, logger: log }
+    : { attempts: 1, baseMs: 0, logger: log };
 
   // Phase 1.8 — rate-limit the detail-panel open (it triggers an XHR to
   // Google). Acquire before the openFn so the cap covers the actual request.
@@ -765,22 +775,22 @@ async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
     ? () =>
         withRetry(
           async () => {
-            const opened = await openDetailPanelOnPage(page, business, { logger });
+            const opened = await openDetailPanelOnPage(page, business, { logger: log });
             if (!opened) throw new Error('detail panel did not open');
             return opened;
           },
           { ...retryOpts, label: 'openDetailPanel' },
         )
-    : () => openDetailPanelOnPage(page, business, { logger });
+    : () => openDetailPanelOnPage(page, business, { logger: log });
 
   const backFn = hasRetry
     ? () =>
-        withRetry(() => backToListOnPage(page, { logger }), {
+        withRetry(() => backToListOnPage(page, { logger: log }), {
           ...retryOpts,
           label: 'backToList',
           attempts: Math.min(retryOpts.attempts, 2),
         })
-    : () => backToListOnPage(page, { logger });
+    : () => backToListOnPage(page, { logger: log });
 
   // Phase 1.8 — prefer antiblock detail delay range (1500-3500ms) when present;
   // fall back to detailCfg values (1000-3000) for backward compat.
@@ -796,7 +806,7 @@ async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
     delayMinMs: ab.detailDelayMinMs ?? detailCfg.delayMinMs ?? 1500,
     delayMaxMs: ab.detailDelayMaxMs ?? detailCfg.delayMaxMs ?? 3500,
     timeoutMs: detailCfg.timeoutMs ?? 15000,
-    logger,
+    logger: log,
   });
 }
 
@@ -823,6 +833,8 @@ async function deepScrapeDetailsOnPage(page, business, cfg, logger) {
  * @returns {Promise<{ successRate, attempted, succeeded, failed, durations }>}
  */
 async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
+  // Phase 1.9 — bind every line to the 'detail' phase (no-op for stubs).
+  const log = logger && logger.phase ? logger.phase('detail') : logger;
   const detailCfg = (cfg && cfg.detail) || {};
   const ab = (cfg && cfg.antiblock) || {};
   const sampleStep = detailCfg.sampleStep ?? 1; // 1 = every business; 5 = every 5th (QA mode)
@@ -836,7 +848,7 @@ async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
   const durations = [];
   const errors = {};
 
-  logger.info('Deep-scrape started', {
+  log.info('Deep-scrape started', {
     total: businesses.length,
     sampleStep,
     delayRangeMs: [ab.detailDelayMinMs ?? detailCfg.delayMinMs ?? 1500, ab.detailDelayMaxMs ?? detailCfg.delayMaxMs ?? 3500],
@@ -858,20 +870,35 @@ async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
     }
     attempted++;
     const b = businesses[i];
-    const res = await deepScrapeDetailsOnPage(page, b, cfg, logger);
+    const res = await deepScrapeDetailsOnPage(page, b, cfg, log);
     durations.push(res.elapsedMs);
     businesses[i] = mergeDetailFields(b, res.detail);
     if (res.ok) {
       succeeded++;
+      // Phase 1.9 — per-business outcome log with timing so the log file
+      // records every detail scrape with success/fail + duration.
+      log.info('Detail scraped', {
+        index: i,
+        business: b && b.name ? b.name : '(unknown)',
+        success: true,
+        elapsedMs: res.elapsedMs,
+      });
     } else {
       failed++;
       const errKey = res.error || 'unknown';
       errors[errKey] = (errors[errKey] || 0) + 1;
+      log.warn('Detail scrape failed', {
+        index: i,
+        business: b && b.name ? b.name : '(unknown)',
+        success: false,
+        elapsedMs: res.elapsedMs,
+        error: res.error,
+      });
     }
 
     // Progress log every 10 details
     if (attempted % 10 === 0) {
-      logger.info('Deep-scrape progress', {
+      log.info('Deep-scrape progress', {
         attempted,
         succeeded,
         failed,
@@ -890,11 +917,11 @@ async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
       try {
         captcha = await captchaCheck();
       } catch (err) {
-        logger.debug('captchaCheck hook threw (non-fatal)', { error: err.message });
+        log.debug('captchaCheck hook threw (non-fatal)', { error: err.message });
         captcha = { detected: false, indicator: null };
       }
       if (captcha.detected) {
-        logger.error('CAPTCHA / block detected during deep-scrape — pausing', {
+        log.error('CAPTCHA / block detected during deep-scrape — pausing', {
           indicator: captcha.indicator,
           pauseMs: captchaWaitMs,
           attemptedSoFar: attempted,
@@ -927,7 +954,7 @@ async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
   const maxMs = durations.length === 0 ? 0 : Math.max(...durations);
   const minMs = durations.length === 0 ? 0 : Math.min(...durations);
 
-  logger.info('Deep-scrape complete', {
+  log.info('Deep-scrape complete', {
     attempted,
     succeeded,
     failed,
@@ -939,7 +966,7 @@ async function deepScrapeAll(page, businesses, cfg, logger, hooks = {}) {
   });
 
   if (successRate < 80) {
-    logger.warn('Deep-scrape success rate below 80% threshold', { successRate: `${successRate}%` });
+    log.warn('Deep-scrape success rate below 80% threshold', { successRate: `${successRate}%` });
   }
 
   return {

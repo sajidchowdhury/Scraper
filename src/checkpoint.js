@@ -37,6 +37,9 @@
  *
  * Dedup key: place_id if present, else a hash of name+address+phone. This is
  * how we tell "already extracted this one" from "new business" on resume.
+ *
+ * Phase 1.9: every log line is bound to the 'recovery' phase so the
+ * JSON-lines log file can be filtered by pipeline stage.
  */
 
 const fs = require('fs');
@@ -229,12 +232,14 @@ function defaultPrompt(question) {
  *          counted as "skipped (already in checkpoint)" in the run summary).
  */
 async function shouldResume(cfg, deps = {}, logger = { info() {}, warn() {}, debug() {} }) {
+  // Phase 1.9 — bind to the 'recovery' phase (no-op for plain stub loggers).
+  const log = logger && logger.phase ? logger.phase('recovery') : logger;
   const prompt = deps.prompt || defaultPrompt;
 
   // --fresh: always start over
   if (cfg.fresh) {
     if (checkpointExists(cfg)) {
-      logger.info('--fresh: deleting existing checkpoint');
+      log.info('--fresh: deleting existing checkpoint');
       clearCheckpoint(cfg);
     }
     return { resume: false, checkpoint: null, skipped: 0 };
@@ -249,14 +254,14 @@ async function shouldResume(cfg, deps = {}, logger = { info() {}, warn() {}, deb
 
   // Corrupt / mismatched checkpoint — clear and start fresh.
   if (existing && (existing.corrupt || existing.mismatch)) {
-    logger.warn('Checkpoint exists but is unreadable — clearing and starting fresh', existing);
+    log.warn('Checkpoint exists but is unreadable — clearing and starting fresh', existing);
     clearCheckpoint(cfg);
     return { resume: false, checkpoint: null, skipped: 0 };
   }
 
   // --resume: auto-load without prompting.
   if (cfg.resume) {
-    logger.info('--resume: loading checkpoint', { count: existing.count });
+    log.info('--resume: loading checkpoint', { count: existing.count });
     return { resume: true, checkpoint: existing, skipped: existing.count };
   }
 
@@ -267,10 +272,10 @@ async function shouldResume(cfg, deps = {}, logger = { info() {}, warn() {}, deb
     `Resume from checkpoint? [y/N] `;
   const yes = await prompt(question);
   if (yes) {
-    logger.info('Resuming from checkpoint', { count: existing.count });
+    log.info('Resuming from checkpoint', { count: existing.count });
     return { resume: true, checkpoint: existing, skipped: existing.count };
   }
-  logger.info('Not resuming — clearing checkpoint and starting fresh');
+  log.info('Not resuming — clearing checkpoint and starting fresh');
   clearCheckpoint(cfg);
   return { resume: false, checkpoint: null, skipped: 0 };
 }

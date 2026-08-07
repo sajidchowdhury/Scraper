@@ -630,8 +630,10 @@ describe('exportResults end-to-end', () => {
       logger,
     });
     expect(logs.some(([m]) => m === 'CSV written')).toBe(true);
-    expect(logs.some(([m]) => m === 'JSON sidecar written')).toBe(true);
+    expect(logs.some(([m]) => m === 'JSON written')).toBe(true);
     expect(logs.some(([m]) => m === 'Run summary written')).toBe(true);
+    // Phase 1.9 — a single structured "Export complete" line summarizes all outputs.
+    expect(logs.some(([m]) => m === 'Export complete')).toBe(true);
   });
 });
 

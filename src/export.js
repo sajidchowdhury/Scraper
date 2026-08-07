@@ -33,6 +33,9 @@
  * Hand-rolled (no csv-writer dep) to match the project's no-deps philosophy
  * (see src/config.js, src/logger.js) and to give full control over BOM,
  * nested-field serialization, and encoding.
+ *
+ * Phase 1.9: every log line is bound to the 'export' phase so the JSON-lines
+ * log file can be filtered by pipeline stage.
  */
 
 const fs = require('fs');
@@ -262,6 +265,8 @@ async function exportResults({
   writeSummary = true,
   logger = { info() {}, debug() {}, warn() {} },
 }) {
+  // Phase 1.9 — bind to the 'export' phase (no-op for plain stub loggers).
+  const log = logger && logger.phase ? logger.phase('export') : logger;
   const basePath = resolveBasePath({
     outputFile,
     outputDir,
@@ -279,7 +284,7 @@ async function exportResults({
   const csvContent = buildCsv(businesses);
   fs.writeFileSync(csvPath, csvContent, 'utf8');
   const csvBytes = Buffer.byteLength(csvContent, 'utf8');
-  logger.info('CSV written', {
+  log.info('CSV written', {
     path: path.resolve(csvPath),
     rows: businesses.length,
     bytes: csvBytes,
@@ -292,7 +297,7 @@ async function exportResults({
     const jsonContent = JSON.stringify(jsonPayload, null, 2);
     fs.writeFileSync(jsonPath, jsonContent, 'utf8');
     jsonBytes = Buffer.byteLength(jsonContent, 'utf8');
-    logger.info('JSON sidecar written', {
+    log.info('JSON written', {
       path: path.resolve(jsonPath),
       rows: businesses.length,
       bytes: jsonBytes,
@@ -311,8 +316,19 @@ async function exportResults({
       columnOrder: CSV_COLUMNS,
     };
     fs.writeFileSync(summaryPath, JSON.stringify(summaryPayload, null, 2), 'utf8');
-    logger.info('Run summary written', { path: path.resolve(summaryPath) });
+    log.info('Run summary written', { path: path.resolve(summaryPath) });
   }
+
+  // Phase 1.9 — single structured record of all output paths + sizes so the
+  // JSON-lines log file has one machine-parseable line for the export stage.
+  log.info('Export complete', {
+    csv: path.resolve(csvPath),
+    csvBytes,
+    json: writeJson ? path.resolve(jsonPath) : null,
+    jsonBytes,
+    summary: writeSummary ? path.resolve(summaryPath) : null,
+    rows: businesses.length,
+  });
 
   return {
     csvPath: path.resolve(csvPath),

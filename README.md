@@ -223,9 +223,13 @@ the spec's exact acceptance criteria.
 ## Testing
 
 ```bash
-npm test          # bun test tests/ (276 tests, 675 assertions)
+npm test          # bun test tests/ (358 tests, 911 assertions)
 npm run syntax    # node --check on every src file
 ```
+
+Test coverage by phase: extract (67), detail (55), export (69), checkpoint
+(37), retry (12), antiblock (91), config (Phase 1.8 flags), **logger (27 —
+Phase 1.9)**.
 
 ## Exit codes
 
@@ -367,3 +371,82 @@ npm start -- --query "Cafe" --location "Berlin" --maxRPM 60 --noHumanTyping
 # Headed run so you can solve a CAPTCHA manually if one appears:
 npm start -- --query "Cafe" --location "Berlin" --headed --captchaWaitMs 600000
 ```
+
+## Phase 1.9 — Logging & Observability
+
+Every log line — console and file — carries a structured `phase` tag so an
+operator can filter the JSON-lines log file by pipeline stage after the fact.
+
+### Phases
+
+| Phase | Where it's emitted |
+|---|---|
+| `system` | Config resolved, run complete, global timeout, SIGINT |
+| `browser` | Browser launched (UA, viewport, headless mode) |
+| `search` | Navigating to Maps, search submitted, results feed detected |
+| `scroll` | Scroll loop start/progress/stop (with page number) |
+| `extract` | Each business extracted (index, name, success/fail), per-field debug, rate summary |
+| `detail` | Deep-scrape start/progress/complete, each detail outcome with timing |
+| `export` | CSV/JSON/summary written (path, rows, bytes) |
+| `recovery` | Checkpoint resume decisions |
+| `antiblock` | Rate-limit pauses, 429/503 detection |
+| `retry` | Transient-operation retry warnings |
+
+### Console output
+
+The console shows a dim `[phase]` tag on every line for scannability:
+
+```
+[2026-08-07T15:30:00.000Z] INFO  [system] Config resolved
+[2026-08-07T15:30:01.234Z] INFO  [browser] Browser launched
+[2026-08-07T15:30:02.456Z] INFO  [search] Search submitted
+[2026-08-07T15:30:03.789Z] INFO  [scroll] Scroll progress
+[2026-08-07T15:30:04.012Z] INFO  [extract] Business extracted
+```
+
+### Log file (JSON lines)
+
+Every run writes `logs/{query}_{location}_{timestamp}.log`. Each line is a JSON
+object with `ts`, `level`, `phase`, `msg`, and any context fields:
+
+```json
+{"ts":"2026-08-07T15:30:04.012Z","level":"info","phase":"extract","msg":"Business extracted","index":5,"name":"Joe's Diner","success":true,"sponsored":false,"status":"open"}
+```
+
+Filter by phase after a run:
+
+```bash
+jq 'select(.phase=="extract")' logs/Restaurant_Toronto_*.log | head
+jq 'select(.level=="warn" or .level=="error")' logs/Restaurant_Toronto_*.log
+```
+
+### `--logLevel debug`
+
+At debug level, every business emits a per-field breakdown so a missing
+selector is obvious:
+
+```
+[extract] Normalized fields  index=5 name="Joe's Diner" fields={name:"Joe's Diner",rating:4.5,reviews_count:128,...,phone:null,...}
+```
+
+### End-of-run summary
+
+The console banner now includes the log file path:
+
+```
+========================================
+Run complete
+Query:    Restaurant in Toronto
+Results:  342 extracted (342 loaded, reason=endOfList)
+Duration: 252.4s
+Detail:   disabled (--deepScrape false)
+CSV:      /home/z/Scraper/data/Restaurant_Toronto_2026-08-07_15-30-00.csv
+JSON:     /home/z/Scraper/data/Restaurant_Toronto_2026-08-07_15-30-00.json
+Summary:  /home/z/Scraper/data/Restaurant_Toronto_2026-08-07_15-30-00.summary.json
+Log:      /home/z/Scraper/logs/Restaurant_Toronto_2026-08-07_15-30-00.log
+========================================
+```
+
+A structured `Run complete` log line (phase: system) is also written to the
+log file with duration, counts, and exit code for machine-parseable post-run
+analysis.

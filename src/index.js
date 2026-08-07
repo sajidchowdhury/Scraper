@@ -36,6 +36,15 @@
  *     pauses (default 5min) + prints a clear alert, then aborts with the
  *     checkpoint preserved for --resume. Auto-solve is Phase 2.
  *
+ * Phase 1.9 — Logging & observability:
+ *   - Every module binds its log lines to a pipeline phase (search/scroll/
+ *     extract/detail/export/recovery/antiblock/retry/browser) via logger.phase().
+ *   - Each business extraction emits an INFO line (index, name, success/fail).
+ *   - At --logLevel debug, each business also emits a per-field breakdown.
+ *   - The end-of-run banner now includes the log file path.
+ *   - A structured "Run complete" log line (phase: system) records duration,
+ *     counts, and exit code for machine-parseable post-run analysis.
+ *
  * Exit codes (Phase 1.10 prep):
  *   0 = success (all businesses extracted/scraped cleanly)
  *   1 = partial success (run completed but some businesses failed)
@@ -119,7 +128,7 @@ async function main() {
   const dedupSet = buildDedupSet(existingBusinesses);
 
   if (resume) {
-    logger.info('Resuming from checkpoint', {
+    logger.phase('recovery').info('Resuming from checkpoint', {
       existingBusinesses: existingBusinesses.length,
       deepScrapedAlready: existingBusinesses.filter((b) => b.detail_scraped === true).length,
     });
@@ -393,6 +402,10 @@ async function main() {
   const outputLines = outPaths
     ? [`CSV:      ${outPaths.csvPath}`, `JSON:     ${outPaths.jsonPath}`, `Summary:  ${outPaths.summaryPath}`]
     : ['Output:   (dry run, no file written)'];
+  // Phase 1.9 — include the log file path in the banner so the operator knows
+  // where the full JSON-lines record of this run lives.
+  const logFile = logger.getLogFile ? logger.getLogFile() : null;
+  const logLine = logFile ? `Log:      ${logFile}` : null;
   const banner = [
     '========================================',
     'Run complete',
@@ -403,6 +416,7 @@ async function main() {
     ...(recoveryLine ? [recoveryLine] : []),
     ...(extractFailLine ? [extractFailLine] : []),
     ...outputLines,
+    ...(logLine ? [logLine] : []),
     '========================================',
   ].join('\n');
   // eslint-disable-next-line no-console
@@ -413,6 +427,27 @@ async function main() {
   const hasExtractFailures = result.extractStats && result.extractStats.failed > 0;
   const hasDetailFailures = result.detailStats && result.detailStats.failed > 0;
   const exitCode = hasExtractFailures || hasDetailFailures ? 1 : 0;
+
+  // Phase 1.9 — structured "Run complete" log line so the JSON-lines file has
+  // a single machine-parseable record of the run's final status (duration,
+  // counts, exit code). Emitted before logger.close() so it's flushed to disk.
+  logger.info('Run complete', {
+    phase: 'system',
+    query: cfg.query,
+    location: cfg.location,
+    extracted: result.businesses.length,
+    loaded: result.scrollResult.finalCount,
+    scrollReason: result.scrollResult.reason,
+    durationMs,
+    exitCode,
+    extractFailed: result.extractStats ? result.extractStats.failed : 0,
+    detailAttempted: result.detailStats ? result.detailStats.attempted : 0,
+    detailFailed: result.detailStats ? result.detailStats.failed : 0,
+    dryRun: cfg.dryRun,
+    csv: outPaths ? outPaths.csvPath : null,
+    json: outPaths ? outPaths.jsonPath : null,
+    log: logFile,
+  });
 
   clearTimeout(globalTimer);
   process.removeListener('SIGINT', onSigInt);
