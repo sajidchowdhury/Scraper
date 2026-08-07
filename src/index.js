@@ -45,6 +45,14 @@
  *   - A structured "Run complete" log line (phase: system) records duration,
  *     counts, and exit code for machine-parseable post-run analysis.
  *
+ * Phase 1.10 — CLI Polish & DX:
+ *   - A startup banner prints the resolved config (query, location, maxResults,
+ *     dryRun, deepScrape, retry, antiblock, ...) before any browser launches,
+ *     then waits 1s so the operator can Ctrl-C if it looks wrong.
+ *   - `--yes` (alias `-y`) skips the 1s delay for scripted / CI runs.
+ *   - Exit codes: 0 success, 1 partial success, 2 config error, 3 runtime
+ *     error, 130 SIGINT — all unchanged from prior phases.
+ *
  * Exit codes (Phase 1.10 prep):
  *   0 = success (all businesses extracted/scraped cleanly)
  *   1 = partial success (run completed but some businesses failed)
@@ -70,6 +78,7 @@ const {
   dedupKey,
 } = require('./checkpoint');
 const { RateLimiter, detectCaptcha } = require('./antiblock');
+const { showStartupBanner } = require('./banner');
 
 async function main() {
   const cfg = loadConfig(process.argv.slice(2));
@@ -120,6 +129,12 @@ async function main() {
   // Phase 1.8 — construct the rate limiter once and attach to cfg so every
   // module that makes Google-bound requests (search, detail) can acquire.
   cfg.rateLimiter = new RateLimiter(cfg.antiblock.maxRequestsPerMin, { logger });
+
+  // Phase 1.10 — startup banner. Prints the resolved config and waits 1s so
+  // the operator can eyeball it and Ctrl-C if it looks wrong. Skipped (no
+  // delay) when --yes is set, for scripted / CI runs.
+  const pkg = require('../package.json');
+  await showStartupBanner(cfg, { name: pkg.name, version: pkg.version });
 
   // Phase 1.7 — checkpoint resume decision (before launching the browser,
   // so we know whether to seed the businesses array).

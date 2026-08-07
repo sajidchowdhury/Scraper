@@ -60,6 +60,8 @@ function parseArgs(argv) {
     else if (a === '--help' || a === '-h') out.help = true;
     else if (a === '--version') out.version = true;
     else if (a === '--dryRun') out.dryRun = true;
+    // Phase 1.10 — startup banner / DX
+    else if (a === '--yes' || a === '-y') out.yes = true;
     // Phase 1.5 — detail-page deep scrape toggle
     else if (a === '--deepScrape') {
       const v = argv[++i];
@@ -161,6 +163,9 @@ function loadConfig(argv = process.argv.slice(2)) {
     outputDir: cli.outputDir || process.env.OUTPUT_DIR || './data',
     outputFile: cli.outputFile || null, // null = auto-generate
     dryRun: !!cli.dryRun,
+
+    // Phase 1.10 — DX: skip the startup-banner delay (scripted / CI runs).
+    yes: !!cli.yes,
 
     // Browser
     headless,
@@ -264,6 +269,7 @@ Optional:
   --logLevel <level>         debug | info | warn | error (default: info)
   --verbose                  Alias for --logLevel debug
   --dryRun                   Run pipeline but skip writing output files
+  --yes, -y                  Skip the 1s startup-banner delay (scripted / CI runs)
 
   --deepScrape true|false    Phase 1.5 — open each detail panel to fetch
                              hours, popular times, top reviews, photos,
@@ -290,6 +296,7 @@ Examples:
   npm start -- --query "Plumber" --location "Dhaka, Bangladesh" --headed --verbose
   npm start -- --query "Restaurant" --location "Toronto" --deepScrape true --deepScrapeSampleStep 5
   npm start -- --query "Restaurant" --location "Toronto" --resume   # continue after a crash
+  npm start -- --query "Cafe" --location "Berlin" --yes --dryRun    # no delay, scripted
 `;
 
 module.exports = { loadConfig, parseArgs, validate, HELP_TEXT };

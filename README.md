@@ -43,6 +43,7 @@ Optional:
   --logLevel <level>         debug | info | warn | error (default: info)
   --verbose                  Alias for --logLevel debug
   --dryRun                   Run pipeline but skip writing output files
+  --yes, -y                  Phase 1.10 — skip the 1s startup-banner delay (CI)
   --deepScrape true|false    Phase 1.5 — open each detail panel to fetch
                              hours, popular times, reviews, photos, links
   --deepScrapeSampleStep <n> Scrape every Nth business (1 = all, 5 = QA mode)
@@ -74,6 +75,7 @@ scraper/
 │   ├── retry.js     (Phase 1.7 — withRetry: exponential backoff for transient ops)
 │   ├── checkpoint.js (Phase 1.7 — crash-recovery checkpoint: read/write/clear/resume)
 │   ├── antiblock.js  (Phase 1.8 — rate limiter, human typing, CAPTCHA detection, UA rotation)
+│   ├── banner.js    (Phase 1.10 — startup banner + 1s confirm delay, --yes to skip)
 │   ├── config.js    (env + CLI config loader, validation)
 │   └── logger.js    (dual-sink logger: console + JSON-lines file)
 ├── tests/
@@ -83,7 +85,9 @@ scraper/
 │   ├── retry.test.js      (Phase 1.7 unit tests — backoff, retryIf, edge cases)
 │   ├── checkpoint.test.js (Phase 1.7 unit tests — dedup, resume, corrupt handling)
 │   ├── config.test.js     (Phase 1.7 config tests — new flags + validation)
-│   └── antiblock.test.js  (Phase 1.8 unit tests — rate limiter, human typing, CAPTCHA)
+│   ├── antiblock.test.js  (Phase 1.8 unit tests — rate limiter, human typing, CAPTCHA)
+│   ├── logger.test.js     (Phase 1.9 unit tests — phase binding, sinks, memory buffer)
+│   └── banner.test.js     (Phase 1.10 unit tests — startup banner, --yes, delay skip)
 ├── data/            (output CSV/JSON + .checkpoint.json, gitignored)
 ├── logs/            (run logs, gitignored)
 ├── .env.example
@@ -450,3 +454,67 @@ Log:      /home/z/Scraper/logs/Restaurant_Toronto_2026-08-07_15-30-00.log
 A structured `Run complete` log line (phase: system) is also written to the
 log file with duration, counts, and exit code for machine-parseable post-run
 analysis.
+
+## Phase 1.10 — CLI Polish & Developer Experience
+
+A tool you have to fight is a tool you stop using. Phase 1.10 makes the
+script pleasant to run, easy to debug, and self-documenting from the command
+line.
+
+### Startup banner
+
+Before any browser is launched, the script prints a compact snapshot of the
+**resolved** configuration so the operator gets one last chance to eyeball
+"what am I about to run?" and `Ctrl-C` if something looks wrong (wrong city,
+`--dryRun` off by accident, `--deepScrape` unexpectedly on, etc.):
+
+```
+========================================
+gmaps-scraper v0.10.0
+----------------------------------------
+  Query             Cafe
+  Location          Berlin
+  Max results       50
+  Output dir        ./data
+  Output file       (auto)
+  Dry run           no
+  Headless          yes
+  Log level         info
+  Deep scrape       no
+  Resume            no
+  Fresh             no
+  Checkpoint every  10 records
+  Retry             3× (base 1000ms)
+  Max RPM           30
+  Human typing      yes
+  CAPTCHA pause     yes (300000ms)
+----------------------------------------
+Starting in 1.0s — Ctrl-C to abort, --yes to skip.
+========================================
+```
+
+The banner is followed by a **1-second delay** (so a human can react). The
+delay is skippable with `--yes` (alias `-y`) for scripted / CI runs — the
+banner still prints, but the run starts immediately:
+
+```
+  ...
+  Starting immediately (--yes).
+  ...
+```
+
+### CLI surface (Phase 1.10 checklist)
+
+| Feature | Status |
+|---|---|
+| `--help` with every flag + usage example | ✅ |
+| `--version` (reads `package.json`) | ✅ |
+| `--dryRun` (full pipeline, no file writes) | ✅ |
+| `--limit N` (alias for `--maxResults`) | ✅ |
+| `--headless` / `--headed` overrides | ✅ |
+| `--verbose` (alias for `--logLevel debug`) | ✅ |
+| Startup banner + 1s confirm delay | ✅ |
+| `--yes` / `-y` to skip the banner delay | ✅ |
+| Friendly config errors (no stack traces) | ✅ |
+| Exit codes 0 / 1 / 2 / 3 / 130 | ✅ |
+

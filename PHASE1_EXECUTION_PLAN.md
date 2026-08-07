@@ -8,9 +8,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 1.9 complete (v0.9.0) — 358 tests / 911 assertions passing.
+> **Last updated:** Phase 1.10 complete (v0.10.0) — 397 tests / 999 assertions passing.
 >
-> **Overall:** 10 of 12 sub-phases shipped. Phases 1.0–1.9 are done; 1.10–1.11 are partial.
+> **Overall:** 11 of 12 sub-phases shipped. Phases 1.0–1.10 are done; 1.11 is partial.
 
 | Phase | Status | Commit | Tests | Notes |
 |---|---|---|---|---|
@@ -22,12 +22,12 @@
 | 1.5 — Detail-Page Deep Scrape | ✅ DONE | `48f9c0e` | 55 | `DETAIL_FIELDS` (8), per-business isolation, sample-step, success tracking |
 | 1.6 — CSV Export Engine | ✅ DONE | `a6b0315` | 69 | RFC 4180 escaping, UTF-8 BOM, CSV + JSON + summary.json |
 | 1.7 — Reliability & Crash Recovery | ✅ DONE | `48c7306` | 85 | withRetry (3 attempts, 1s→2s→4s), checkpoint resume, per-business isolation |
-| 1.8 — Minimal Anti-Block Behavior | ✅ DONE | _(this commit)_ | 55 | `antiblock.js`: rate limiter (30 RPM), human typing, CAPTCHA detection, UA rotation, 429/503 watcher |
-| 1.9 — Logging & Observability | ✅ DONE | _(this commit)_ | 27 | `phase` field on every line, per-business + per-field debug logs, run-complete event, sync file sink |
-| 1.10 — CLI Polish & DX | 🟡 PARTIAL | — | — | `--help`, `--version`, `--dryRun`, `--limit`, exit codes 0/1/2/3 ✓; missing startup banner + `--yes` |
+| 1.8 — Minimal Anti-Block Behavior | ✅ DONE | `2644759` | 55 | `antiblock.js`: rate limiter (30 RPM), human typing, CAPTCHA detection, UA rotation, 429/503 watcher |
+| 1.9 — Logging & Observability | ✅ DONE | `972a6bb` | 27 | `phase` field on every line, per-business + per-field debug logs, run-complete event, sync file sink |
+| 1.10 — CLI Polish & DX | ✅ DONE | _(this commit)_ | 39 | `banner.js`: startup banner + 1s confirm delay, `--yes`/`-y` to skip; `--help`/`--version`/`--dryRun`/`--limit`/exit codes all in place |
 | 1.11 — Documentation & Handoff | 🟡 PARTIAL | — | — | README has Quick start / CLI / per-phase docs ✓; missing Troubleshooting, CHANGELOG, git tag |
 
-**Critical path remaining:** 1.10 → 1.11 (then Phase 1 milestone complete).
+**Critical path remaining:** 1.11 (then Phase 1 milestone complete).
 
 ---
 
@@ -511,7 +511,7 @@ Full visibility into every run, present and past.
 
 ## Phase 1.10 — CLI Polish & Developer Experience
 
-> **Status: 🟡 PARTIAL (~70%)** — `--help`, `--version`, `--dryRun`, `--limit`, `--headless/--headed`, `--verbose`, exit codes 0/1/2/3/130 all implemented. Missing: startup banner with 1s delay, `--yes` flag to skip banner.
+> **Status: ✅ DONE (v0.10.0)** — `--help`, `--version`, `--dryRun`, `--limit`, `--headless/--headed`, `--verbose`, exit codes 0/1/2/3/130, and the startup banner with 1s confirm delay (skippable via `--yes`/`-y`) are all implemented. 39 unit tests in `tests/banner.test.js`.
 
 ### Goal
 Make the script pleasant to run, easy to debug, and self-documenting from the command line.
@@ -526,7 +526,7 @@ A tool you have to fight is a tool you stop using. Good CLI UX is the difference
 - [x] Implement `--limit N` (alias for `--maxResults`) for quick test runs.
 - [x] Implement `--headless` / `--headed` overrides (force a mode regardless of `.env`).
 - [x] Implement `--verbose` (alias for `--logLevel debug`).
-- [ ] Print a **startup banner** with the resolved config so the user confirms before the run begins (1-second delay, skippable with `--yes`).
+- [x] Print a **startup banner** with the resolved config so the user confirms before the run begins (1-second delay, skippable with `--yes`).
 - [x] Validate all CLI inputs and print friendly errors (not stack traces) for bad input.
 - [x] Exit codes: `0` success, `1` partial success (some failures), `2` config error, `3` runtime error.
 
