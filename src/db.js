@@ -123,11 +123,43 @@ const JSONB_COLUMNS = [
   'social_profiles',
 ];
 
+// Phase 3.1 — enrichment-derived columns. These are WRITTEN by INSERT + UPDATE
+// (so enriched data lands in the DB) but EXCLUDED from `data_hash` and from
+// change-tracking (TRACKED_FIELDS). Rationale: enrichment is DERIVED data, not
+// raw scrape data. A re-enrichment (algorithm update, re-run with a different
+// country hint) must NOT trigger a snapshot/field_change row or bump
+// `updated_at` — only a real scrape change (rating, reviews, phone, etc.)
+// counts as "the business's data changed". Enrichment columns are NULL until
+// the enrichment pipeline (src/enrichment/) populates them on the business
+// object before persistence; when enrichment is off (--enrich off, the
+// default), these stay NULL and Phase 2 behavior is preserved byte-for-byte.
+//
+// Add new enrichment columns here as each Phase 3 sub-phase lands (3.2 adds
+// the 5 address columns + lat/lng + geocode_confidence; 3.5 adds email/email_status;
+// etc.). The migrations/003-enrichment.sql file is the schema mirror of this list.
+const ENRICHMENT_COLUMNS = [
+  // Phase 3.1 — Phone normalization & validation
+  'phone_e164',
+  'phone_type',
+  'phone_country_code',
+];
+
 // Columns that are excluded from `data_hash` because they are managed by the
 // DB or are provenance metadata (not "business data" whose change we track).
 // `scraped_at` is excluded because it is the moment we saw the data, not the
 // data itself; `run_id` / `updated_at` / `data_hash` are bookkeeping.
-const HASH_EXCLUDED = new Set(['scraped_at', 'run_id', 'updated_at', 'data_hash']);
+// Enrichment columns (Phase 3.1+) are excluded because they are derived, not
+// raw scrape data — see the ENRICHMENT_COLUMNS comment above. (They're also
+// not in SCALAR_COLUMNS/JSONB_COLUMNS, so they wouldn't be hashed anyway, but
+// listing them here makes the exclusion explicit + future-proof if someone
+// later moves them into SCALAR_COLUMNS.)
+const HASH_EXCLUDED = new Set([
+  'scraped_at',
+  'run_id',
+  'updated_at',
+  'data_hash',
+  ...ENRICHMENT_COLUMNS,
+]);
 
 // All comparable business-data columns (used for hashing) — scalar + jsonb,
 // minus the excluded bookkeeping columns.
@@ -276,9 +308,13 @@ function columnValue(col, business) {
 
 // Full ordered column list for INSERT (excludes the SERIAL `id`, the
 // DEFAULT `updated_at`, and `run_id`/`data_hash` which are added explicitly).
+// Phase 3.1 — includes ENRICHMENT_COLUMNS so enriched fields (phone_e164, ...)
+// land in the DB when the enrichment pipeline populates them on the business
+// object. They're NULL when enrichment is off (preserving Phase 2 behavior).
 const INSERT_COLUMNS = [
   ...SCALAR_COLUMNS,
   ...JSONB_COLUMNS,
+  ...ENRICHMENT_COLUMNS,
   'data_hash',
   'run_id',
 ];
@@ -512,7 +548,17 @@ function buildBatchInsert(rows, runId) {
  *                          TTL freshness intact).
  */
 function buildUpdate(business, hash, runId, changeHash) {
-  const setCols = [...SCALAR_COLUMNS, ...JSONB_COLUMNS, 'data_hash', 'run_id'];
+  // Phase 3.1 — include ENRICHMENT_COLUMNS in the SET list so enriched fields
+  // are updated alongside scrape data. They're NULL when the business object
+  // wasn't enriched (enrichment off) — pg writes NULL, preserving the prior
+  // value if any (which is also NULL since enrichment is the only writer).
+  const setCols = [
+    ...SCALAR_COLUMNS,
+    ...JSONB_COLUMNS,
+    ...ENRICHMENT_COLUMNS,
+    'data_hash',
+    'run_id',
+  ];
   const setClauses = [];
   const params = [];
   let idx = 1;
@@ -1022,6 +1068,9 @@ module.exports = {
   JSONB_COLUMNS,
   HASH_COLUMNS,
   INSERT_COLUMNS,
+  // Phase 3.1 — enrichment-derived columns (written by INSERT+UPDATE, excluded
+  // from data_hash + change-tracking). Mirrors migrations/003-enrichment.sql.
+  ENRICHMENT_COLUMNS,
   // Phase 2.2 — change tracking constants + builders
   TRACKED_FIELDS,
   SNAPSHOT_COLUMNS,

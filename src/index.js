@@ -109,6 +109,12 @@ const {
 // Phase 2.1 — PostgreSQL persistence (lazy-loaded; only used when
 // cfg.output includes 'db').
 const { createPool, persistRunResults, closePool } = require('./db');
+// Phase 3.1 — phone normalization enrichment. Runs in the post-scrape pipeline
+// (before DB persistence) when --enrich on --enrichPhone on. Pure functions;
+// no network. Mutates each business in place with phone_e164/phone_type/
+// phone_country_code, which are then persisted by upsertBusinessesBatch (the
+// ENRICHMENT_COLUMNS list in src/db.js is the schema mirror).
+const { normalizePhonesBatch } = require('./enrichment/phone');
 // Phase 2.12 — incremental scraping & detail caching. Pure decision helpers
 // + a thin DB-aware cache wrapper. Only active when --incremental is on AND
 // --output db is configured (validated in config.js). The cache uses the same
@@ -2620,6 +2626,46 @@ async function main() {
     });
   }
 
+  // Phase 3.1 — Phone normalization enrichment. Runs when --enrich on AND
+  // --enrichPhone on (default on when --enrich is on). Mutates each business
+  // in place with phone_e164 / phone_type / phone_country_code, which the DB
+  // persistence layer (below) writes via the ENRICHMENT_COLUMNS list in
+  // src/db.js. Pure functions; no network; no API cost. Safe to run even when
+  // --output db is off (the enriched fields land on the business objects and
+  // are available to JSON export; CSV export ignores unknown fields).
+  //
+  // The enrichment is OUTSIDE the DB transaction deliberately — it's a pure
+  // transform on in-memory data, so a DB failure doesn't lose the enrichment
+  // work (the business objects are still enriched for the JSON/CSV outputs).
+  let phoneEnrichStats = null;
+  if (!cfg.dryRun && cfg.enrichment && cfg.enrichment.enabled && cfg.enrichment.features && cfg.enrichment.features.phone) {
+    try {
+      phoneEnrichStats = normalizePhonesBatch(result.businesses, {
+        defaultCountry: cfg.enrichment.defaultCountry || null,
+        logger,
+      });
+      logger.info('Enrichment: phone normalization complete', {
+        phase: 'enrichment',
+        feature: 'phone',
+        total: phoneEnrichStats.total,
+        valid: phoneEnrichStats.valid,
+        invalid: phoneEnrichStats.invalid,
+        skipped: phoneEnrichStats.skipped,
+        byType: phoneEnrichStats.byType,
+        defaultCountry: cfg.enrichment.defaultCountry || '(none — relying on + prefix only)',
+      });
+    } catch (err) {
+      // Enrichment failure is non-fatal — the scrape + DB persistence proceed
+      // with raw phones (Phase 2 behavior). Log + continue.
+      logger.error('Enrichment: phone normalization failed (non-fatal — continuing with raw phones)', {
+        phase: 'enrichment',
+        feature: 'phone',
+        message: err.message,
+        stack: err.stack,
+      });
+    }
+  }
+
   // Phase 2.1 — PostgreSQL persistence. Opens a pool, upserts every business
   // (keyed by place_id) in a single transaction, writes the run summary, and
   // closes the pool. A DB failure is logged + reflected in the exit code but
@@ -2629,6 +2675,11 @@ async function main() {
   // earlier (the incremental cache already uses it for preflight + lookups).
   // Pass `incremental: true` so unchanged businesses get a freshness-timestamp
   // refresh (advancing last_list_scraped without a full data update).
+  //
+  // Phase 3.1 — when phone enrichment ran (above), the business objects now
+  // carry phone_e164/phone_type/phone_country_code, which upsertBusinessesBatch
+  // writes via the ENRICHMENT_COLUMNS list. When enrichment is off, those
+  // fields are absent and the columns stay NULL (Phase 2 behavior preserved).
   let dbResult = null;
   if (!cfg.dryRun && wantsDb) {
     // Reuse the incremental pool when available; otherwise create a fresh one.

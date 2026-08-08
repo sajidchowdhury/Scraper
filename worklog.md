@@ -798,3 +798,65 @@ Stage Summary:
 - `npm run db:migrate` will now apply the full Phase 3.0 enrichment schema idempotently on both plain PostgreSQL and PostGIS-enabled PostgreSQL.
 - Committed and pushed to `main` (no feature branch, per the user's standing instruction).
 - Next: Phase 3.1 — Phone Number Normalization & Validation.
+
+---
+Task ID: 3.1
+Agent: main (Z.ai Code)
+Task: Phase 3.1 — Phone Number Normalization & Validation. Convert every scraped phone to E.164, detect type (mobile/landline/toll_free/voip/invalid/unknown), resolve ISO country code, flag invalid numbers. Persist to DB. Wire into the post-scrape pipeline.
+
+Work Log:
+- Read PHASE3_EXECUTION_PLAN.md §3.1 (task checklist + acceptance criteria: ≥40 tests, ≥98% E.164 accuracy, --enrichPhone off preserves Phase 2 behavior). Read the existing src/enrichment/phone.js stub (Phase 3.0 placeholder), src/enrichment/index.js barrel, src/enrichment/pipeline.js stub, src/db.js (buildBatchInsert/buildUpdate/columnValue/INSERT_COLUMNS/HASH_COLUMNS/HASH_EXCLUDED), src/config.js (cfg.enrichment structure + featureOn helper), src/index.js (persistRunResults call site at line ~2643), tests/db.test.js (mock client pattern + the buildBatchInsert param-count assertion at line 523).
+- Verified libphonenumber-js API surface: parsePhoneNumberFromString, parsed.number (E.164), parsed.country (ISO), parsed.getType() (PhoneNumberType enum), parsed.isValid(), parsed.nationalNumber, parsed.ext. Confirmed the default (min) build returns undefined for getType() in most regions — switched to libphonenumber-js/max for accurate mobile-vs-landline detection (the ~45 KB larger metadata is the only way to distinguish types). Tested US/DE/BD/UK/AU/IN parse paths + toll-free (800/888) + extensions (ext/x/,/;/#).
+- Implemented src/enrichment/phone.js (full module, ~430 lines, replaced the Phase 3.0 stub):
+  - DI seam: _loadLib() prefers libphonenumber-js/max, falls back to libphonenumber-js. _setLib(stub) test hook.
+  - Pre-processing: transliterateDigits (Arabic-Indic/Persian/Devanagari/Bengali → ASCII), stripNonPhoneChars (strips emoji/CJK/punctuation), splitExtension (extracts ext/ext./extension/ex/x/#/;/, postfixes — more reliable than libphonenumber-js's built-in ext detection for the x/, shorthand).
+  - Core: normalizePhone(raw, defaultRegion) → { e164, type, countryCode, isValid, nationalNumber, extension, raw }. Pipeline: transliterate → strip → splitExtension → re-attach ext as ;ext= → parse → extract. KEY DESIGN DECISION: e164 is suppressed (null) for INVALID numbers — libphonenumber-js returns a best-effort .number even for invalid parses, but clients filter on phone_e164 for auto-dialing, so an invalid e164 would be misleading/dangerous.
+  - detectPhoneType: maps libphonenumber-js PhoneNumberType → our 6-value taxonomy. FIXED_LINE_OR_MOBILE → 'landline' (conservative — we can't tell, and 'mobile' is the higher-value signal so we avoid false claims). invalid numbers → 'invalid' regardless of getType().
+  - resolveCountryCode: parsed.country first; falls back to defaultRegion even for null parsed (best-effort country for invalid local-format numbers).
+  - isPhoneValid, formatForDialing (INTERNATIONAL + NATIONAL forms).
+  - normalizePhonesBatch: mutates each business in place with phone_e164/phone_type/phone_country_code + a phone_normalized debug descriptor (NOT persisted). Returns { total, valid, invalid, byType, skipped }. Skips (not 'invalid') businesses with no phone field. Uses resolveDefaultRegion priority: opts.defaultCountry > business.phone_default_country > business.address_country > null.
+  - ENRICHMENT_COLUMNS = ['phone_e164', 'phone_type', 'phone_country_code'].
+- Extended src/db.js for enrichment persistence (the critical integration):
+  - Added ENRICHMENT_COLUMNS constant (3 phone cols, mirrors migrations/003-enrichment.sql).
+  - Added ENRICHMENT_COLUMNS to INSERT_COLUMNS (so buildBatchInsert writes them) + buildUpdate's setCols (so UPDATE writes them).
+  - Added ENRICHMENT_COLUMNS to HASH_EXCLUDED — enrichment is DERIVED data, not raw scrape data. A re-enrichment (algorithm update, different country hint) must NOT trigger snapshot/field_change rows or bump updated_at. Verified computeRowHash iterates HASH_COLUMNS (SCALAR + JSONB - excluded), so enrichment cols are excluded from the hash automatically.
+  - Did NOT add enrichment cols to TRACKED_FIELDS (no change-tracking for derived data — same rationale).
+  - columnValue's default case (toText) handles the 3 new TEXT cols; no new case needed.
+  - Exported ENRICHMENT_COLUMNS from module.exports.
+- Added --phoneDefaultCountry flag to src/config.js: CLI parser (--phoneDefaultCountry <ISO>), env var PHONE_DEFAULT_COUNTRY, cfg.enrichment.defaultCountry (coerced to uppercase ISO 2-letter; invalid values silently dropped to null). Updated HELP_TEXT with 2 Phase 3.1 examples (Berlin/Dhaka). Added a Phase 3.1 section to .env.example documenting the env var.
+- Wired enrichment into src/index.js post-scrape pipeline (line ~2629): when cfg.enrichment.enabled && cfg.enrichment.features.phone, runs normalizePhonesBatch on result.businesses BEFORE persistRunResults. Logs stats (total/valid/invalid/skipped/byType + defaultCountry). Non-fatal on error (logs + continues with raw phones — Phase 2 behavior). Deliberately OUTSIDE the DB transaction so a DB failure doesn't lose the enrichment work.
+- Wrote tests/enrichment-phone.test.js (104 tests across 12 describe blocks — 2.6× the ≥40 requirement):
+  1. transliterateDigits (7 tests: Arabic-Indic/Persian/Devanagari/Bengali + ASCII-passthrough + mixed + non-string)
+  2. stripNonPhoneChars (5 tests: emoji/CJK/currency stripping + allow-list preservation + non-string)
+  3. splitExtension (9 tests: ext/ext./x/,/;/# postfixes + null-extension + empty/non-string)
+  4. normalizePhone E.164 across countries (20 tests: US/DE/BD/UK/AU/IN × format variations — dots/dashes/parens/international/local/Bengali-digits)
+  5. detectPhoneType/type classification (8 tests: toll_free 800/888 + DE mobile/landline + BD mobile + UK mobile + null-parsed + undefined-type)
+  6. invalid number flagging (7 tests: too-few-digits/letters/invalid-area-code/empty/whitespace/punctuation/no-hint)
+  7. resolveCountryCode (9 tests: +49/+880/+44/+91/+61 inference + local-format hint + invalid-no-hint + invalid-with-hint + null-parsed fallback)
+  8. extension handling (4 tests: ext/x/, round-trip + null-when-absent)
+  9. edge cases (8 tests: null/undefined/number-coercion/emoji/Bengali-digits/Arabic-digits/raw-echo)
+  10. isPhoneValid + formatForDialing (7 tests: valid/null/no-isValid + international/national/null-forms)
+  11. resolveDefaultRegion priority (5 tests: opts > phone_default_country > address_country > null)
+  12. normalizePhonesBatch (8 tests: mixed-batch stats + mutation + null-phone + invalid-phone + empty-array + non-array + non-object-entries + address_country hint)
+  13. DB upsert integration with mock pg client (8 tests: INSERT-with-enrichment + INSERT-without-enrichment + UPDATE-with-enrichment + re-enrichment-doesn't-trigger-UPDATE + buildBatchInsert-param-count + buildUpdate-SET-clause + ENRICHMENT_COLUMNS export + end-to-end enrichment→persistence)
+- Fixed 2 real code issues surfaced by the tests:
+  (a) normalizePhone was returning e164 for invalid numbers (libphonenumber-js's best-effort .number). Changed to suppress e164 (null) when !isValid() — clients filter on phone_e164 for auto-dialing.
+  (b) resolveCountryCode returned null immediately for null parsed, ignoring defaultRegion. Fixed to fall back to defaultRegion even for null parsed (best-effort country for invalid local-format numbers).
+- Fixed 6 test-expectation issues (test bugs, not code bugs):
+  (a) stripNonPhoneChars CJK test expected the colon to survive — but : isn't in the phone-char allow-list.
+  (b) stripNonPhoneChars currency test expected / and : to survive — same issue.
+  (c) UK 07911 test expected countryCode='GB' — libphonenumber-js assigns 07911 to Guernsey (GG); relaxed to accept any +44 country (GB/GG/IM/JE).
+  (d) number-input test passed 12125550123 with no hint — can't parse without a region; added 'US' hint.
+  (e) Arabic-Indic test asserted r.raw contains '0123456789' — but r.raw echoes the ORIGINAL Arabic input; changed to assert nationalNumber (the transliterated form).
+  (f) end-to-end BD business used local-format '01712-345678' with a DE batch hint — parsed as German mobile (+491712345678); changed to '+8801712345678' (international form, no hint needed).
+- Updated tests/db.test.js: imported ENRICHMENT_COLUMNS; updated the buildBatchInsert param-count assertion from (SCALAR + JSONB + 5) to (SCALAR + JSONB + ENRICHMENT + 5). All 88 db tests pass.
+- Verification: npm run syntax passes for all 60+ files. enrichment-phone.test.js = 104/104 pass. db.test.js = 88/88. config.test.js = 103/103. Full suite = 1321 pass / 4 "(unnamed)" failures — the SAME 4 pre-existing sandbox flakes (incremental/captcha/fingerprint/proxy test files under bun concurrency) documented in the Phase 3.0 worklog. Verified by running the 4 files in isolation: 348/348 pass. Zero regressions.
+- Updated PHASE3_EXECUTION_PLAN.md: status table 3.1 → ✅ DONE (104 net-new tests). Phase 3.1 section header → ✅ DONE. All 7 task-checklist items marked [x] with implementation notes. All 6 acceptance-criteria items marked [x] with verification notes.
+- Committed and pushed to origin/main (no feature branch, per the user's standing instruction).
+
+Stage Summary:
+- Phase 3.1 shipped on `main`. The repo now has: a full phone-normalization module (src/enrichment/phone.js, ~430 lines, libphonenumber-js/max-backed), DB persistence for the 3 enrichment columns (ENRICHMENT_COLUMNS in src/db.js, excluded from data_hash + change-tracking), --phoneDefaultCountry CLI flag + PHONE_DEFAULT_COUNTRY env var, post-scrape pipeline integration in src/index.js, and 104 new tests (2.6× the requirement).
+- KEY DESIGN DECISION: enrichment columns are EXCLUDED from data_hash. A re-enrichment (algorithm update, different country hint) does NOT trigger snapshot/field_change rows or bump updated_at — only a real scrape change (rating/reviews/phone/website) counts as "the business's data changed". Verified by a dedicated test ('enrichment columns are NOT part of data_hash').
+- KEY SAFETY DECISION: e164 is suppressed (null) for invalid numbers. libphonenumber-js returns a best-effort .number even for invalid parses, but clients filter on phone_e164 for auto-dialing — an invalid e164 would be misleading/dangerous.
+- Zero regressions: all Phase 2 tests pass. Enrichment is OFF by default (--enrich off) — Phase 2 scraping behavior is 100% unchanged until --enrich on is passed. When enrichment is on but phone feature is off (--enrichPhone off), the 3 columns stay NULL (Phase 2 behavior preserved).
+- Next: Phase 3.2 — Address Parsing & Geocoding (src/enrichment/address.js — parseAddress + createGeocoder DI seam + nominatim/google/mock providers).

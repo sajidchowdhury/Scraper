@@ -228,6 +228,11 @@ function parseArgs(argv) {
     //   --enrichBudget <usd>     — USD cap on API-cost features (geocoding,
     //                              email SMTP probes, tech-stack). 0 = unlimited.
     //   --enrichConcurrency N    — parallel enrichment workers (default 4).
+    //   --phoneDefaultCountry <ISO> — Phase 3.1: default ISO 2-letter country
+    //                              hint for phone normalization (e.g. 'US',
+    //                              'DE', 'BD'). Used when a scraped phone lacks
+    //                              a '+' prefix. Default: none (infer from '+'
+    //                              only, which fails for local-format numbers).
     else if (a === '--enrich') out.enrich = argv[++i];
     else if (a === '--enrichPhone') out.enrichPhone = argv[++i];
     else if (a === '--enrichAddress') out.enrichAddress = argv[++i];
@@ -240,6 +245,7 @@ function parseArgs(argv) {
     else if (a === '--enrichConfidence') out.enrichConfidence = argv[++i];
     else if (a === '--enrichBudget') out.enrichBudget = argv[++i];
     else if (a === '--enrichConcurrency') out.enrichConcurrency = argv[++i];
+    else if (a === '--phoneDefaultCountry') out.phoneDefaultCountry = argv[++i];
   }
   return out;
 }
@@ -1144,6 +1150,17 @@ function loadConfig(argv = process.argv.slice(2)) {
       concurrency: toIntOrNull(cli.enrichConcurrency ?? process.env.ENRICH_CONCURRENCY) ?? 4,
       geocodingApiKey: process.env.GEOCODING_API_KEY || null,
       smtpVerifyEnabled: process.env.SMTP_VERIFY_ENABLED !== 'false', // default on
+      // Phase 3.1 — default country hint for phone normalization. Used when a
+      // scraped phone lacks a '+' prefix (local-format numbers). CLI flag
+      // --phoneDefaultCountry takes precedence; env var PHONE_DEFAULT_COUNTRY
+      // is the fallback. Coerced to uppercase ISO 2-letter; invalid values
+      // are silently dropped to null (libphonenumber-js would reject them).
+      defaultCountry: (() => {
+        const raw = cli.phoneDefaultCountry ?? process.env.PHONE_DEFAULT_COUNTRY;
+        if (!raw) return null;
+        const up = String(raw).trim().toUpperCase();
+        return /^[A-Z]{2}$/.test(up) ? up : null;
+      })(),
       // Resolved at runtime in the enrichment pipeline (Phase 3.12) into
       // { run, stats } (null when disabled).
       resolved: null,
@@ -1478,6 +1495,9 @@ Examples:
   npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --enrichEmail off   # skip SMTP probes
   npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --enrichBudget 5.00  # cap API spend at $5
   npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --enrichConcurrency 8
+  # Phase 3.1 — phone normalization. Default country hint for local-format numbers:
+  npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --phoneDefaultCountry DE
+  npm start -- --query "Cafe" --location "Dhaka"   --output db --enrich on --phoneDefaultCountry BD
   # Capture the Phase 2 enrichment-readiness baseline (5 metrics):
   node scripts/phase3-baseline.js data/<scrape-output>.json
 

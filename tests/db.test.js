@@ -42,6 +42,7 @@ const {
   closePool,
   SCALAR_COLUMNS,
   JSONB_COLUMNS,
+  ENRICHMENT_COLUMNS,
   HASH_COLUMNS,
   TRACKED_FIELDS,
   SNAPSHOT_COLUMNS,
@@ -519,8 +520,13 @@ describe('Phase 2.1 — buildBatchInsert', () => {
     expect(text).toContain('ON CONFLICT (place_id) DO NOTHING');
     // Two rows × N columns = params length. The +5 accounts for data_hash,
     // run_id (Phase 2.1) + change_hash, last_list_scraped, last_detail_scraped
-    // (Phase 2.12 — incremental freshness columns).
-    expect(params.length).toBe(rows.length * (SCALAR_COLUMNS.length + JSONB_COLUMNS.length + 5));
+    // (Phase 2.12 — incremental freshness columns). Phase 3.1 adds
+    // ENRICHMENT_COLUMNS (phone_e164, phone_type, phone_country_code) which
+    // are NULL when enrichment is off but still take a bind parameter slot.
+    expect(params.length).toBe(
+      rows.length *
+        (SCALAR_COLUMNS.length + JSONB_COLUMNS.length + ENRICHMENT_COLUMNS.length + 5),
+    );
   });
 
   test('SQL-injection safety: malicious place_id appears in params, NOT in SQL text', () => {
