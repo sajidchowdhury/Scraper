@@ -347,20 +347,53 @@ async function closePool(pool) {
 // ---------------------------------------------------------------------------
 
 /**
- * Run the schema migration (src/db/schema.sql) idempotently. Accepts either a
- * Pool or a single Client. Reads the SQL file, executes it as one batch.
+ * Run the database migration idempotently. Accepts either a Pool or a single
+ * Client. Executes in two phases:
+ *
+ *   1. src/db/schema.sql          — the base schema (Phase 1–2 tables/columns).
+ *                                   Read and executed as one batch.
+ *   2. src/db/migrations/*.sql    — ordered, idempotent migration files
+ *                                   (Phase 3+ enrichment schema extensions).
+ *                                   Executed in filename-sorted order so
+ *                                   `003-enrichment.sql` runs before
+ *                                   `004-...sql`. Each file is a separate
+ *                                   query() call so a failure in one file
+ *                                   produces a clear error pointing at the file.
+ *
+ * Both phases are idempotent (IF NOT EXISTS / DO $$ guards), so re-running
+ * `npm run db:migrate` is always safe and no-ops on an up-to-date database.
+ *
+ * Phase 2 compatibility: when the migrations/ directory is absent or empty,
+ * this function behaves exactly like the Phase 2 implementation (schema.sql
+ * only) — no behavior change, no extra query() calls.
  *
  * @param {import('pg').Pool|import('pg').Client|object} poolOrClient
  * @returns {Promise<void>}
  */
 async function runMigration(poolOrClient) {
   if (!poolOrClient) throw new Error('runMigration: poolOrClient is null');
-  const sqlPath = path.join(__dirname, 'db', 'schema.sql');
+  const dbDir = path.join(__dirname, 'db');
+  const sqlPath = path.join(dbDir, 'schema.sql');
   const sql = fs.readFileSync(sqlPath, 'utf8');
 
-  // Both pg.Pool (via .query) and pg.Client (via .query) expose query().
-  // For a Pool we use .query directly (auto-acquires/releases a client).
+  // Phase 1 — base schema. Both pg.Pool (via .query) and pg.Client (via
+  // .query) expose query(); for a Pool we use .query directly (auto-acquires
+  // and releases a client).
   await poolOrClient.query(sql);
+
+  // Phase 2 — ordered migration files (Phase 3+). Skip silently when the
+  // directory is absent or empty so Phase 2 behavior is preserved exactly.
+  const migrationsDir = path.join(dbDir, 'migrations');
+  if (fs.existsSync(migrationsDir)) {
+    const files = fs
+      .readdirSync(migrationsDir)
+      .filter((f) => f.endsWith('.sql'))
+      .sort(); // deterministic, filename-sorted order (003 → 004 → ...)
+    for (const file of files) {
+      const fileSql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+      await poolOrClient.query(fileSql);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

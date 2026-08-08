@@ -207,6 +207,39 @@ function parseArgs(argv) {
     else if (a === '--detailRefreshOnReviewDelta') out.detailRefreshOnReviewDelta = argv[++i];
     else if (a === '--noDetailCache') out.noDetailCache = true;
     else if (a === '--swrr') out.swrr = true;
+    // Phase 3.0 — enrichment pipeline. These flags gate the Phase 3 enrichment
+    // pipeline (phone normalization, address parsing, dedup, email discovery,
+    // tech-stack detection, sentiment, geo metrics, lead scoring, confidence).
+    // Enrichment is OFF by default — Phase 2 scraping behavior is unchanged
+    // until --enrich is passed. Per-feature sub-flags let the operator enable
+    // individual enrichment steps (all default to ON when --enrich is ON).
+    //   --enrich on|off          — master switch (default: off). When on, the
+    //                              pipeline runs after each scrape (or standalone
+    //                              via the enrichment queue job, Phase 3.13).
+    //   --enrichPhone on|off     — E.164 phone normalization + type detection.
+    //   --enrichAddress on|off   — structured address parsing + geocoding.
+    //   --enrichDedup on|off     — fuzzy dedup + business_duplicates tracking.
+    //   --enrichEmail on|off     — email discovery + SMTP verification.
+    //   --enrichTechStack on|off — website tech-stack detection + liveness.
+    //   --enrichSentiment on|off — review sentiment + theme analysis.
+    //   --enrichGeo on|off       — competitor density (1km/5km) + geo metrics.
+    //   --enrichLeadScore on|off — composite lead scoring (0–100).
+    //   --enrichConfidence on|off — per-field + record confidence scoring.
+    //   --enrichBudget <usd>     — USD cap on API-cost features (geocoding,
+    //                              email SMTP probes, tech-stack). 0 = unlimited.
+    //   --enrichConcurrency N    — parallel enrichment workers (default 4).
+    else if (a === '--enrich') out.enrich = argv[++i];
+    else if (a === '--enrichPhone') out.enrichPhone = argv[++i];
+    else if (a === '--enrichAddress') out.enrichAddress = argv[++i];
+    else if (a === '--enrichDedup') out.enrichDedup = argv[++i];
+    else if (a === '--enrichEmail') out.enrichEmail = argv[++i];
+    else if (a === '--enrichTechStack') out.enrichTechStack = argv[++i];
+    else if (a === '--enrichSentiment') out.enrichSentiment = argv[++i];
+    else if (a === '--enrichGeo') out.enrichGeo = argv[++i];
+    else if (a === '--enrichLeadScore') out.enrichLeadScore = argv[++i];
+    else if (a === '--enrichConfidence') out.enrichConfidence = argv[++i];
+    else if (a === '--enrichBudget') out.enrichBudget = argv[++i];
+    else if (a === '--enrichConcurrency') out.enrichConcurrency = argv[++i];
   }
   return out;
 }
@@ -219,6 +252,26 @@ function toIntOrNull(v) {
   if (v === undefined || v === null || v === '') return null;
   const n = Number.parseInt(String(v), 10);
   return Number.isFinite(n) ? n : null;
+}
+
+// Phase 3.0 — float coercion for the --enrichBudget USD cap. Mirrors
+// toIntOrNull but preserves decimals (e.g. 5.50 USD).
+function toFloatOrNull(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number.parseFloat(String(v));
+  return Number.isFinite(n) ? n : null;
+}
+
+// Phase 3.0 — per-feature enrichment toggle resolver. A feature is ON when its
+// explicit flag/env is 'on'/'true'/'1'/'yes'; OFF when 'off'/'false'/'0'/'no'.
+// When neither is set (undefined), the feature defaults to ON — this lets the
+// operator enable the whole pipeline with just `--enrich on` without having to
+// repeat every sub-flag. Callers pass the CLI value first (higher priority),
+// then the env value.
+function featureOn(cliVal, envVal) {
+  const v = cliVal !== undefined ? cliVal : envVal;
+  if (v === undefined || v === null || v === '') return true; // default ON
+  return /^(on|true|1|yes)$/i.test(String(v));
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,6 +1113,42 @@ function loadConfig(argv = process.argv.slice(2)) {
       resolved: null,
     },
 
+    // Phase 3.0 — enrichment pipeline. OFF by default (Phase 2 behavior
+    // preserved). When `enabled` is on, the enrichment pipeline (src/enrichment/)
+    // runs after each scrape to normalize phones, parse addresses, dedup,
+    // discover emails, detect tech stacks, analyze sentiment, compute geo
+    // metrics, score leads, and assign confidence. Per-feature sub-flags all
+    // default to ON when --enrich is on, but can be turned off individually
+    // (e.g. --enrichEmail off to skip SMTP probes that cost API budget).
+    //   --enrich on|off          — master switch.
+    //   --enrichBudget <usd>     — USD cap on API-cost features (0 = unlimited).
+    //   --enrichConcurrency N    — parallel enrichment workers (default 4).
+    // See .env.example §Phase 3 for the corresponding env vars.
+    enrichment: {
+      enabled:
+        /^(on|true|1|yes)$/i.test(cli.enrich || '') ||
+        process.env.ENRICH === 'on' ||
+        process.env.ENRICH === 'true',
+      features: {
+        phone: featureOn(cli.enrichPhone, process.env.ENRICH_PHONE),
+        address: featureOn(cli.enrichAddress, process.env.ENRICH_ADDRESS),
+        dedup: featureOn(cli.enrichDedup, process.env.ENRICH_DEDUP),
+        email: featureOn(cli.enrichEmail, process.env.ENRICH_EMAIL),
+        techStack: featureOn(cli.enrichTechStack, process.env.ENRICH_TECH_STACK),
+        sentiment: featureOn(cli.enrichSentiment, process.env.ENRICH_SENTIMENT),
+        geo: featureOn(cli.enrichGeo, process.env.ENRICH_GEO),
+        leadScore: featureOn(cli.enrichLeadScore, process.env.ENRICH_LEAD_SCORE),
+        confidence: featureOn(cli.enrichConfidence, process.env.ENRICH_CONFIDENCE),
+      },
+      budgetUsd: toFloatOrNull(cli.enrichBudget ?? process.env.ENRICH_BUDGET_USD) ?? 0,
+      concurrency: toIntOrNull(cli.enrichConcurrency ?? process.env.ENRICH_CONCURRENCY) ?? 4,
+      geocodingApiKey: process.env.GEOCODING_API_KEY || null,
+      smtpVerifyEnabled: process.env.SMTP_VERIFY_ENABLED !== 'false', // default on
+      // Resolved at runtime in the enrichment pipeline (Phase 3.12) into
+      // { run, stats } (null when disabled).
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -1379,6 +1468,18 @@ Examples:
   npm start -- --query "Cafe" --location "Berlin" --output db --incremental --detailCacheTtlDays 14
   npm start -- --query "Cafe" --location "Berlin" --output db --incremental --noDetailCache   # force deep-scrape
   npm start -- --query "Cafe" --location "Berlin" --output db --incremental --detailRefreshOnReviewDelta 5
+
+  # Phase 3 — data quality & enrichment (default: off — Phase 2 behavior unchanged)
+  #   Enrichment normalizes phones (E.164), parses addresses, dedups, discovers
+  #   emails, detects website tech stacks, analyzes review sentiment, computes
+  #   competitor density, scores leads (0–100), and assigns confidence scores.
+  #   All per-feature sub-flags default to ON when --enrich is on.
+  npm start -- --query "Cafe" --location "Berlin" --output db --enrich on            # full enrichment
+  npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --enrichEmail off   # skip SMTP probes
+  npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --enrichBudget 5.00  # cap API spend at $5
+  npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --enrichConcurrency 8
+  # Capture the Phase 2 enrichment-readiness baseline (5 metrics):
+  node scripts/phase3-baseline.js data/<scrape-output>.json
 
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun

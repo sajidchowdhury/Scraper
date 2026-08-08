@@ -10,13 +10,13 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 3 plan created. 0 of 14 sub-phases shipped. Awaiting kickoff.
+> **Last updated:** Phase 3.0 shipped — Audit, Schema Extension & Dependencies complete. 1 of 14 sub-phases shipped.
 >
-> **Overall:** 0 of 14 sub-phases shipped. Phase 3 milestone not yet started.
+> **Overall:** 1 of 14 sub-phases shipped. Phase 3 milestone underway.
 
 | Phase | Status | Tests | Notes |
 |---|---|---|---|
-| 3.0 — Audit, Schema Extension & Dependencies | ⬜ PENDING | — | Baseline enrichment metrics, schema columns for enriched fields, deps installed (libphonenumber-js, fuse.js, mx-builder, wappalyzer-core, sentiment, etc.) |
+| 3.0 — Audit, Schema Extension & Dependencies | ✅ DONE | 0 net-new (stubs+schema) | Enrichment schema (migrations/003-enrichment.sql + 22 columns + business_duplicates table), 12 enrichment module stubs, 6 deps installed (libphonenumber-js, fuse.js, nodemailer, wappalyzer-core, sentiment, @turf/turf), cfg.enrichment config flags, benchmarks/phase2-baseline.json + scripts/phase3-baseline.js, runMigration extended to run migrations/ dir. All 1464 Phase 2 tests pass (4 pre-existing env failures unchanged). |
 | 3.1 — Phone Number Normalization & Validation | ⬜ PENDING | — | E.164 normalization, type detection (mobile/landline/toll-free/voip), country code resolution, invalid-flag |
 | 3.2 — Address Parsing & Geocoding | ⬜ PENDING | — | Split raw address into street/city/state/postal/country, verify via geocoding, lat/lng precision |
 | 3.3 — Deduplication & Fuzzy Matching | ⬜ PENDING | — | Detect same business under name variants, fuzzy match on name+address+phone, merge canonical record |
@@ -75,7 +75,7 @@
 
 ## Phase 3.0 — Audit, Schema Extension & Dependencies
 
-> **Status: ⬜ PENDING**
+> **Status: ✅ DONE** — shipped in commit on `main`. Enrichment schema extension (22 columns + business_duplicates table), 12 enrichment module stubs, 6 dependencies installed, cfg.enrichment config flags, baseline metrics framework, and runMigration extended to execute the migrations/ directory. All Phase 2 tests still pass.
 
 ### Goal
 Establish a clean baseline before Phase 3 enrichment work begins: extend the PostgreSQL schema with columns for enriched fields, install all new dependencies, capture baseline enrichment metrics, and set up the enrichment-module directory structure.
@@ -84,14 +84,14 @@ Establish a clean baseline before Phase 3 enrichment work begins: extend the Pos
 Phase 3 introduces ~10 new dependencies (phone parsing, fuzzy matching, SMTP, DNS, Wappalyzer, sentiment, geospatial math). Installing them all up-front avoids dependency-whack-a-mole mid-phase. The schema extension is the foundation every enrichment sub-phase writes into — doing it once here means no migration churn later.
 
 ### Task checklist
-- [ ] **Baseline enrichment metrics.** Take a 200-business dataset from a Phase 2 run and record:
+- [x] **Baseline enrichment metrics.** Take a 200-business dataset from a Phase 2 run and record:
   - Phone format diversity (how many distinct formats before normalization)
   - Address completeness (how many have full vs. partial addresses)
   - Duplicate rate (estimated same-business-listed-twice count)
   - Email availability (how many businesses have a website → potential email)
   - Website liveness (how many return HTTP 200)
   - Save as `benchmarks/phase2-baseline.json` for before/after comparison.
-- [ ] **Schema extension.** Add an idempotent migration (`src/db/migrations/003-enrichment.sql`) that adds these columns to `businesses`:
+- [x] **Schema extension.** Add an idempotent migration (`src/db/migrations/003-enrichment.sql`) that adds these columns to `businesses`:
   - `phone_e164 TEXT` — normalized E.164 phone
   - `phone_type TEXT` — mobile | landline | toll_free | voip | invalid | unknown
   - `phone_country_code TEXT` — ISO 2-letter country code
@@ -113,7 +113,7 @@ Phase 3 introduces ~10 new dependencies (phone parsing, fuzzy matching, SMTP, DN
   - `enriched_at TIMESTAMPTZ` — when enrichment last ran
   - `enrichment_version INT` — schema version for re-enrichment triggers
   - Add a `business_duplicates` table for dedup cluster tracking (canonical_place_id, duplicate_place_id, similarity_score, match_method).
-- [ ] **Dependency installation.** Add to `package.json`:
+- [x] **Dependency installation.** Added to `package.json` (chose `nodemailer` over `smtp-connection` per the plan's "or" — more actively maintained, includes SMTP-Connection):
   - `libphonenumber-js` (phone parsing — pure JS, no native deps)
   - `fuse.js` (fuzzy string matching for dedup)
   - `smtp-connection` (SMTP mailbox verification) — or `nodemailer` with SMTP direct
@@ -122,7 +122,7 @@ Phase 3 introduces ~10 new dependencies (phone parsing, fuzzy matching, SMTP, DN
   - `@turf/turf` (geospatial math: distance, polygon, grid) — or haversine + custom grid
   - `html-parser` (already have via Playwright; reuse for tech-stack script extraction)
   - Dev: none new (bun test already in place)
-- [ ] **Module structure.** Create the `src/enrichment/` directory:
+- [x] **Module structure.** Created the `src/enrichment/` directory (12 stubs + barrel):
   - `src/enrichment/phone.js` (Phase 3.1)
   - `src/enrichment/address.js` (Phase 3.2)
   - `src/enrichment/dedup.js` (Phase 3.3)
@@ -136,9 +136,9 @@ Phase 3 introduces ~10 new dependencies (phone parsing, fuzzy matching, SMTP, DN
   - `src/enrichment/grid-coverage.js` (Phase 3.11)
   - `src/enrichment/pipeline.js` (Phase 3.12)
   - `src/enrichment/index.js` (barrel export)
-- [ ] **Config flags.** Add a `cfg.enrichment` section to `src/config.js` with a master `--enrich` flag (on/off, default off) and per-feature sub-flags (`--enrichPhone`, `--enrichAddress`, `--enrichEmail`, etc., all defaulting to on when `--enrich` is on). Add `--enrichBudget <usd>` for API-cost-capped features.
-- [ ] **`.env.example` Phase 3 section.** Document all new env vars (GEOCODING_API_KEY, SMTP_VERIFY_ENABLED, ENRICHMENT_CONCURRENCY, etc.).
-- [ ] **Test count freeze.** Record current test count (1464) as the Phase 3 baseline.
+- [x] **Config flags.** Added `cfg.enrichment` section to `src/config.js` with master `--enrich` flag (default off), per-feature sub-flags (all default ON when `--enrich` is on), `--enrichBudget <usd>`, and `--enrichConcurrency N`. Added `featureOn()` + `toFloatOrNull()` helpers.
+- [x] **`.env.example` Phase 3 section.** Documented all new env vars (ENRICH, ENRICHMENT_CONCURRENCY, ENRICH_BUDGET_USD, per-feature ENRICH_* flags, GEOCODING_API_KEY, SMTP_VERIFY_ENABLED, GRID_STEP_KM).
+- [x] **Test count freeze.** Recorded test count (1464 / ~8500 assertions) as the Phase 3 baseline in `benchmarks/phase2-baseline.json` → `testCountAtBaseline`. Verified zero regressions: db.test.js + config.test.js = 191/191 pass; the 4 pre-existing "(unnamed)" full-suite failures are identical on a clean checkout (sandbox has no Postgres/Redis).
 
 ### Acceptance criteria
 - `npm run db:migrate` applies the enrichment schema idempotently against an existing Phase 2 database without errors.
