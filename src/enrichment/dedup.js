@@ -60,6 +60,11 @@
 
 const __version = 1;
 
+// Dedup writes to the `business_duplicates` table (not the `businesses` table),
+// so it contributes no enrichment columns. Declared as [] so the enrichment
+// barrel (index.js) can aggregate it without a TypeError.
+const ENRICHMENT_COLUMNS = [];
+
 // ---------------------------------------------------------------------------
 // Configuration constants
 // ---------------------------------------------------------------------------
@@ -739,6 +744,7 @@ function findDuplicatePairs(businesses, opts) {
 
 module.exports = {
   __version,
+  ENRICHMENT_COLUMNS,
   // Constants
   DEFAULT_THRESHOLD,
   SIMILARITY_WEIGHTS,
