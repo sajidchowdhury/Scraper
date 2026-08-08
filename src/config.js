@@ -71,6 +71,14 @@ function parseArgs(argv) {
     } else if (a === '--deepScrapeSampleStep') {
       out.deepScrapeSampleStep = argv[++i];
     }
+    // Global run timeout — hard cap on wall-clock time for the whole run.
+    // Default 5min is too short for --deepScrape true (each detail panel adds
+    // ~3s); auto-scaled in loadConfig when deepScrape is on. 0 = unlimited.
+    else if (a === '--globalTimeoutMs' || a === '--globalTimeout') {
+      out.globalTimeoutMs = toIntOrNull(argv[++i]);
+    } else if (a === '--noGlobalTimeout') {
+      out.globalTimeoutMs = 0;
+    }
     // Phase 1.7 — crash recovery / resume
     else if (a === '--resume') out.resume = true;
     else if (a === '--fresh') out.fresh = true;
@@ -781,7 +789,26 @@ function loadConfig(argv = process.argv.slice(2)) {
     viewportHeight: toIntOrNull(process.env.VIEWPORT_HEIGHT) ?? 900,
 
     // Timeouts
-    globalTimeoutMs: toIntOrNull(process.env.GLOBAL_TIMEOUT_MS) ?? 5 * 60 * 1000,
+    // Global run timeout — hard wall-clock cap. Resolution priority:
+    //   1. --globalTimeoutMs <n> CLI flag (0 = unlimited)
+    //   2. GLOBAL_TIMEOUT_MS env var
+    //   3. Auto-scaled default when --deepScrape true (~3s/business + overhead):
+    //      max(5min, maxResults × 5s + 60s scroll/search buffer). 100 results
+    //      → 560s (~9.3min); 500 → 2560s (~43min); 1000 → 5060s (~84min).
+    //   4. 5 minutes (Phase 1 default — fast list-view-only runs).
+    globalTimeoutMs:
+      cli.globalTimeoutMs !== undefined
+        ? cli.globalTimeoutMs
+        : toIntOrNull(process.env.GLOBAL_TIMEOUT_MS) ??
+          ((cli.deepScrape !== undefined
+              ? cli.deepScrape
+              : process.env.DEEP_SCRAPE === 'true')
+            ? Math.max(
+                5 * 60 * 1000,
+                (toIntOrNull(cli.maxResults ?? process.env.DEFAULT_MAX_RESULTS) ?? 100) * 5 * 1000 +
+                  60 * 1000,
+              )
+            : 5 * 60 * 1000),
     navTimeoutMs: toIntOrNull(process.env.NAV_TIMEOUT_MS) ?? 60 * 1000,
 
     // Scroll (Phase 1.3)
@@ -1280,6 +1307,12 @@ Optional:
                              reservation/menu/social links (default: false)
   --deepScrapeSampleStep <n> Scrape every Nth business (1 = all, 5 = QA mode)
   --noDeepScrape             Force --deepScrape false (overrides .env)
+
+  --globalTimeoutMs <ms>     Hard wall-clock cap for the whole run (0 = unlimited).
+                             Default: 5min, or auto-scaled to maxResults×5s+60s
+                             when --deepScrape true (each detail panel adds ~3s).
+                             100 results → ~9min; 500 → ~43min; 1000 → ~84min.
+  --noGlobalTimeout          Disable the global timeout entirely (same as --globalTimeoutMs 0)
 
   --resume                   Phase 1.7 — resume from .checkpoint.json if it exists
   --fresh                    Phase 1.7 — ignore/delete checkpoint, start from scratch
