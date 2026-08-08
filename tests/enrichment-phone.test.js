@@ -822,13 +822,14 @@ describe('Phase 3.1 — DB upsert writes enrichment columns (mock pg client)', (
     expect(result.updated).toBe(0);
   });
 
-  test('buildBatchInsert param count includes the 3 enrichment columns', () => {
+  test('buildBatchInsert param count includes the enrichment columns', () => {
     const rows = [{ business: makeBusiness(), hash: 'h' }];
     const { params } = buildBatchInsert(rows, 1);
-    // SCALAR + JSONB + ENRICHMENT(3) + data_hash + run_id + change_hash +
-    // last_list_scraped + last_detail_scraped = SCALAR + JSONB + 7
+    // SCALAR + JSONB + ENRICHMENT(11: 3 phone + 8 address) + data_hash + run_id +
+    // change_hash + last_list_scraped + last_detail_scraped = SCALAR + JSONB + 16
+    const { ENRICHMENT_COLUMNS: DB_ENRICHMENT_COLS } = require('../src/db');
     expect(params.length).toBe(
-      SCALAR_COLUMNS.length + JSONB_COLUMNS.length + 3 + 5,
+      SCALAR_COLUMNS.length + JSONB_COLUMNS.length + DB_ENRICHMENT_COLS.length + 5,
     );
   });
 

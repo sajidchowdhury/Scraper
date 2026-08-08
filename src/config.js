@@ -246,6 +246,21 @@ function parseArgs(argv) {
     else if (a === '--enrichBudget') out.enrichBudget = argv[++i];
     else if (a === '--enrichConcurrency') out.enrichConcurrency = argv[++i];
     else if (a === '--phoneDefaultCountry') out.phoneDefaultCountry = argv[++i];
+    // Phase 3.2 — geocoding flags
+    //   --geocoder google|nominatim|mock — provider (default nominatim, free).
+    //   --geocodeApiKey <key>            — Google API key (env: GEOCODING_API_KEY).
+    //   --geocodeRateLimitMs <ms>        — override the provider's default gap.
+    //   --geocodeBudget <usd>            — USD cap on Google geocoding (0 = unlimited).
+    else if (a === '--geocoder') out.geocoder = argv[++i];
+    else if (a === '--geocodeApiKey') out.geocodeApiKey = argv[++i];
+    else if (a === '--geocodeRateLimitMs') out.geocodeRateLimitMs = argv[++i];
+    else if (a === '--geocodeBudget') out.geocodeBudget = argv[++i];
+    // Phase 3.3 — deduplication flags
+    //   --dedupThreshold <0.00–1.00>     — fuzzy-match cutoff (default 0.85).
+    //   --dedupMerge on|off              — merge duplicates into canonical (default on;
+    //                                     off = detect-only, no merge).
+    else if (a === '--dedupThreshold') out.dedupThreshold = argv[++i];
+    else if (a === '--dedupMerge') out.dedupMerge = argv[++i];
   }
   return out;
 }
@@ -1161,6 +1176,36 @@ function loadConfig(argv = process.argv.slice(2)) {
         const up = String(raw).trim().toUpperCase();
         return /^[A-Z]{2}$/.test(up) ? up : null;
       })(),
+      // Phase 3.2 — geocoding configuration. Provider selection drives cost:
+      //   - nominatim (default) — free OSM tier, 1 req/s rate limit.
+      //   - google              — $5 / 1k requests, requires geocodeApiKey.
+      //   - mock                — $0, returns canned coordinates (testing).
+      // geocodeBudgetUsd caps Google spend (0 = unlimited); when exhausted,
+      // geocodeBatch falls back to mock coordinates for the remaining rows.
+      geocoder: (() => {
+        const raw = cli.geocoder ?? process.env.GEOCODER;
+        const v = raw ? String(raw).toLowerCase() : 'nominatim';
+        return ['google', 'nominatim', 'mock'].includes(v) ? v : 'nominatim';
+      })(),
+      geocodeApiKey: cli.geocodeApiKey ?? process.env.GEOCODING_API_KEY ?? null,
+      geocodeRateLimitMs: toIntOrNull(cli.geocodeRateLimitMs ?? process.env.GEOCODE_RATE_LIMIT_MS) ?? null,
+      geocodeBudgetUsd: toFloatOrNull(cli.geocodeBudget ?? process.env.GEOCODE_BUDGET_USD) ?? 0,
+      // Phase 3.3 — deduplication configuration. dedupThreshold is the fuzzy-
+      // match cutoff (0.00–1.00) above which two businesses are considered
+      // duplicates. dedupMerge controls whether duplicates are merged into the
+      // canonical record (on, default) or just detected (off — useful for
+      // auditing before enabling merge in production).
+      dedupThreshold: (() => {
+        const raw = cli.dedupThreshold ?? process.env.DEDUP_THRESHOLD;
+        const n = raw != null ? Number.parseFloat(String(raw)) : NaN;
+        if (!Number.isFinite(n)) return 0.85; // sweet spot per acceptance criteria
+        return Math.max(0, Math.min(1, n));
+      })(),
+      dedupMerge: (() => {
+        const raw = cli.dedupMerge ?? process.env.DEDUP_MERGE;
+        if (raw === undefined || raw === null || raw === '') return true; // default on
+        return /^(on|true|1|yes)$/i.test(String(raw));
+      })(),
       // Resolved at runtime in the enrichment pipeline (Phase 3.12) into
       // { run, stats } (null when disabled).
       resolved: null,
@@ -1498,6 +1543,13 @@ Examples:
   # Phase 3.1 — phone normalization. Default country hint for local-format numbers:
   npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --phoneDefaultCountry DE
   npm start -- --query "Cafe" --location "Dhaka"   --output db --enrich on --phoneDefaultCountry BD
+  # Phase 3.2 — address parsing + geocoding (Google $5/1k, Nominatim free, Mock $0):
+  npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --geocoder google --geocodeApiKey $KEY --geocodeBudget 10.00
+  npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --geocoder nominatim   # free, 1 req/s
+  npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --geocoder mock        # $0, canned coords
+  # Phase 3.3 — deduplication (fuzzy match on name+phone+address):
+  npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --dedupThreshold 0.90 --dedupMerge on
+  npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --dedupMerge off   # detect-only, no merge
   # Capture the Phase 2 enrichment-readiness baseline (5 metrics):
   node scripts/phase3-baseline.js data/<scrape-output>.json
 

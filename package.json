@@ -1,6 +1,6 @@
 {
   "name": "gmaps-scraper",
-  "version": "3.0.0-phase3.0",
+  "version": "3.0.0-phase3.3",
   "description": "Google Maps business scraper — Phase 3.0 (Data Quality & Enrichment foundation: schema extension for enriched fields, enrichment module stubs, baseline metrics, config flags). Built on the Phase 2 milestone (PostgreSQL persistence, change tracking, proxy/stealth, CAPTCHA solving, worker pool, job queue, memory-stable long runs, self-healing selectors, incremental scraping). Phase 2 milestone tagged v2.0.0-phase2.",
   "engines": {
     "node": ">=20"

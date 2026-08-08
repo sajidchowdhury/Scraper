@@ -142,6 +142,18 @@ const ENRICHMENT_COLUMNS = [
   'phone_e164',
   'phone_type',
   'phone_country_code',
+  // Phase 3.2 — Address parsing & geocoding. The 5 structured address columns
+  // (street/city/state/postal/country) plus the geocoded lat/lng (distinct from
+  // the raw-scrape latitude/longitude columns above) and the 0.00–1.00
+  // geocode_confidence. See migrations/003-enrichment.sql §3.2.
+  'address_street',
+  'address_city',
+  'address_state',
+  'address_postal',
+  'address_country',
+  'lat',
+  'lng',
+  'geocode_confidence',
 ];
 
 // Columns that are excluded from `data_hash` because they are managed by the
@@ -284,6 +296,9 @@ function columnValue(col, business) {
     case 'rating':
     case 'latitude':
     case 'longitude':
+    case 'lat':
+    case 'lng':
+    case 'geocode_confidence':
       return toNum(v);
     case 'reviews_count':
       return toInt(v);
@@ -968,6 +983,74 @@ async function upsertBusiness(client, business, opts) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3.3 — business_duplicates persistence (idempotent)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a parameterized batched INSERT for business_duplicates rows. Idempotent
+ * via the UNIQUE (canonical_place_id, duplicate_place_id) constraint: ON
+ * CONFLICT updates the similarity_score + match_method + matched_at when the
+ * new score is HIGHER than the stored one (so a re-run with stronger evidence
+ * upgrades the match, but a weaker re-run doesn't downgrade it).
+ *
+ * Pure function — returns { text, params }, doesn't touch the DB. Exported for
+ * unit tests.
+ *
+ * @param {Array<{ canonicalPlaceId: string, duplicatePlaceId: string, similarityScore: number, matchMethod: string }>} rows
+ * @returns {{ text: string, params: any[] }|null} null when rows is empty.
+ */
+function buildDuplicateInsert(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const params = [];
+  const placeholders = [];
+  let idx = 1;
+  for (const r of rows) {
+    if (!r || !r.canonicalPlaceId || !r.duplicatePlaceId) continue;
+    const score = Number.isFinite(r.similarityScore) ? Math.max(0, Math.min(1, r.similarityScore)) : 0;
+    const method = r.matchMethod || 'compound';
+    placeholders.push(
+      '($' + idx + ', $' + (idx + 1) + ', $' + (idx + 2) + ', $' + (idx + 3) + ')',
+    );
+    params.push(r.canonicalPlaceId, r.duplicatePlaceId, score, method);
+    idx += 4;
+  }
+  if (placeholders.length === 0) return null;
+  const text =
+    'INSERT INTO business_duplicates ' +
+      '(canonical_place_id, duplicate_place_id, similarity_score, match_method) ' +
+      'VALUES ' + placeholders.join(', ') + ' ' +
+      'ON CONFLICT (canonical_place_id, duplicate_place_id) DO UPDATE ' +
+      'SET similarity_score = GREATEST(business_duplicates.similarity_score, EXCLUDED.similarity_score), ' +
+      'match_method = CASE WHEN EXCLUDED.similarity_score >= business_duplicates.similarity_score ' +
+      'THEN EXCLUDED.match_method ELSE business_duplicates.match_method END, ' +
+      'matched_at = CASE WHEN EXCLUDED.similarity_score > business_duplicates.similarity_score ' +
+      'THEN NOW() ELSE business_duplicates.matched_at END';
+  return { text, params };
+}
+
+/**
+ * Persist duplicate-cluster decisions to the business_duplicates table.
+ * Idempotent — re-running with the same pairs upserts (updates similarity_score
+ * only when the new value is higher; never inserts duplicate rows).
+ *
+ * @param {object} client — pg Client or mock.
+ * @param {Array<{ canonicalPlaceId: string, duplicatePlaceId: string, similarityScore: number, matchMethod: string }>} rows
+ * @returns {Promise<{ inserted: number, skipped: number }>} inserted = rows actually written (incl. upserts); skipped = invalid rows.
+ */
+async function persistDuplicates(client, rows) {
+  if (!client) throw new Error('persistDuplicates: client is null');
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length === 0) return { inserted: 0, skipped: 0 };
+  const valid = list.filter((r) => r && r.canonicalPlaceId && r.duplicatePlaceId);
+  const skipped = list.length - valid.length;
+  if (valid.length === 0) return { inserted: 0, skipped };
+  const ins = buildDuplicateInsert(valid);
+  if (!ins) return { inserted: 0, skipped };
+  await client.query(ins.text, ins.params);
+  return { inserted: valid.length, skipped };
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline integration hook — used by src/index.js after extraction.
 // ---------------------------------------------------------------------------
 
@@ -1093,6 +1176,9 @@ module.exports = {
   buildUnchangedRefresh,
   buildSnapshotInsert,
   buildFieldChangesInsert,
+  // Phase 3.3 — business_duplicates persistence (idempotent)
+  buildDuplicateInsert,
+  persistDuplicates,
   // pool / client lifecycle
   createPool,
   getClient,
