@@ -12,6 +12,166 @@ Google Maps business scraper — **Phase 1**: search → paginate → extract �
 - **[PHASE1_EXECUTION_PLAN.md](PHASE1_EXECUTION_PLAN.md)** — granular per-sub-phase spec, acceptance criteria, and status (Phase 1 complete).
 - **[PHASE2_EXECUTION_PLAN.md](PHASE2_EXECUTION_PLAN.md)** — granular per-sub-phase spec for Phase 2 (robustness & scale: proxies, stealth, concurrency, PostgreSQL, CAPTCHA solving). 13 sub-phases.
 - **[SCRAPER_FEATURES.md](SCRAPER_FEATURES.md)** — master roadmap (Phases 2–5: proxies, auto-CAPTCHA, concurrency, …).
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Phase 2 system architecture: high-level pipeline diagram, module map, request lifecycle, identity stack, concurrency model, persistence + change tracking, incremental cache, health & self-healing.
+- **[OPERATIONS.md](OPERATIONS.md)** — Phase 2 production operations runbook: 10k-listing overnight run, proxy + CAPTCHA budgeting, concurrency tuning, monitoring + alerting, recovery, post-run verification.
+
+## Phase 2 Features
+
+Phase 2 (sub-phases 2.0–2.12, version `2.0.0-phase2`) turns the Phase 1
+single-machine, file-only scraper into a robust, unattended pipeline that
+survives a 10,000+-listing overnight run. Every sub-system is opt-in via
+CLI flags or env vars — with all Phase 2 flags unset, the scraper behaves
+byte-for-byte like Phase 1. See **[`ARCHITECTURE.md`](ARCHITECTURE.md)**
+for the full pipeline diagram (CLI → preflight → health check → pool/queue
+→ worker identity stack → scrape pipeline → persistence + change tracking
++ incremental cache → export) and **[`OPERATIONS.md`](OPERATIONS.md)** for
+the production runbook (10k-run command, budgeting, monitoring, recovery).
+Detailed sub-phase specs + acceptance criteria live in
+**[`PHASE2_EXECUTION_PLAN.md`](PHASE2_EXECUTION_PLAN.md)**; selector
+internals live in **[`SELECTORS.md`](SELECTORS.md)**.
+
+### PostgreSQL Persistence
+
+Phase 2.1 — scraped businesses can be upserted into PostgreSQL alongside
+(or instead of) CSV/JSON via `--output db` (or `--output all` for all
+three). Each business is keyed by `place_id` and re-scrapes are no-op
+detected via a SHA-256 `data_hash` column, so identical re-runs produce
+zero writes. Create the schema once with `npm run db:migrate`
+(`DATABASE_URL` required). See the
+[PostgreSQL persistence (phase 2.1)](#postgresql-persistence-phase-21)
+section below for the schema, output targets, and idempotent upsert
+details.
+
+### Change Tracking & History
+
+Phase 2.2 — every re-scrape snapshots the old values into
+`business_snapshots` and logs one `field_changes` row per tracked field
+(`rating`, `reviews_count`, `business_status`, `phone`, `website`),
+turning the scraper into a trend-data tool. Identical re-scrapes produce
+zero snapshots and zero changes (no noise). Inspect any business's
+timeline with `npm run db:history -- --placeId ChIJxxx`. See the
+[Change tracking & history (phase 2.2)](#change-tracking--history-phase-22)
+section below for the tracked-fields table and CLI flags.
+
+### Proxy Management & Rotation
+
+Phase 2.3 — route browser traffic through a rotating proxy pool declared
+via `--proxyListFile` (one proxy per line: `protocol://[user:pass@]host:port`
+or `host:port:user:pass`). Three strategies (`--proxyStrategy
+round-robin|random|sticky`), automatic burn detection (3× 403/429, <50%
+success, 3× timeout → cooldown; HTTP 407 → permanent), and an optional
+`--proxyHealthCheck` HEAD probe before scraping. `--noProxy` forces a
+direct connection (Phase 1 behavior). See the
+[Proxy management & rotation (phase 2.3)](#proxy-management--rotation-phase-23)
+section below and `OPERATIONS.md` for the full burn rules + burn log.
+
+### Browser Fingerprint Randomization
+
+Phase 2.4 — each run gets a coherent fingerprint: user-agent + platform +
+viewport + timezone + locale + WebGL vendor/renderer + canvas noise +
+`hardwareConcurrency` + `deviceMemory` + geolocation, all generated so the
+combination never leaks a detectable mismatch (Windows UA → Win32
+platform, `de-DE` locale → `Europe/Berlin` timezone, etc.). Controlled
+via `--fingerprintProfile random|fixed|off` (default `random`),
+`--fixedFingerprint <json>` for pinned profiles, and `--noFingerprint`
+for Phase 1 behavior.
+
+### Stealth Hardening
+
+Phase 2.5 — patches the bot-detection surfaces fingerprint randomization
+doesn't cover (`navigator.webdriver`, `chrome.runtime`, `plugins.length`,
+`permissions.query`, `outerWidth/Height`, `Notification.permission`,
+`navigator.vendor`, `maxTouchPoints`) via `playwright-extra` +
+`puppeteer-extra-plugin-stealth` plus a custom init script. On by
+default (`--stealth on`); `--noStealth` disables it for A/B testing and
+`--stealthDebug` logs every patch applied + the resulting navigator
+properties. Complements (does not replace) the Phase 2.4 fingerprint.
+
+### CAPTCHA Auto-Solving
+
+Phase 2.6 — when Google shows a CAPTCHA, the orchestrator solves it via a
+third-party service and resumes unattended. Provider is selected via
+`--captchaProvider 2captcha|anticaptcha|capsolver|mock|none` (default
+`none` = Phase 1.8 pause-and-alert). `--captchaBudget <usd>` (default
+$5.00) is a hard spend cap — once hit, the orchestrator falls back to
+pause-and-alert rather than spending more. `--noCaptchaSolve` forces
+Phase 1.8 behavior. Use `--captchaProvider mock` for $0 smoke tests.
+
+### Session & Cookie Rotation
+
+Phase 2.7 — rotate the browser context (cookies + localStorage) every N
+Maps requests (`--sessionMaxRequests`, default 50) OR every M ms
+(`--sessionMaxAgeMs`, default 10 min), whichever fires first. Each new
+context starts with a fresh cookie jar and is optionally warmed up
+(`--warmup on`, default on) by visiting `google.com` + a random second
+site + a benign search so the session doesn't look like a zero-history
+bot. `--accountWarmup on` (off by default, account-burn risk) logs in
+with aged Google accounts from `--accountsFile` for richer data + fewer
+CAPTCHAs.
+
+### Worker Pool & Concurrency
+
+Phase 2.8 — parallel browser workers via `--workers <n>` (default 1 =
+Phase 1 sequential). Each worker gets its own proxy + fingerprint +
+session + rate limiter; with `--deepScrape true`, detail batches are
+split across the pool for ~N× speedup. Blocked workers cool down
+(`--workerCooldownMs`, default 5 min), rotate their identity, then
+revive; their task is re-queued to another worker. Workers that crash
+`--workerCrashLimit` times in 10 minutes are retired (pool shrinks).
+Load balancer: `--workerLoadBalancer round-robin|least-busy` (default
+`round-robin`).
+
+### Job Queue & Orchestration
+
+Phase 2.9 — `--queue on` decouples job submission from execution via a
+BullMQ-backed Redis queue (`--redisUrl`, default `redis://localhost:6379`).
+Submit a CSV of (query, location) pairs with `npm run batch -- --file
+queries.csv --queue on`; jobs persist in Redis so a process crash
+resumes on restart. Three job types (`search`, `detail-batch`,
+`enrich`), priority bands (1=high / 5=normal / 10=low via
+`--queuePriority`), exponential-backoff retries (`--queueAttempts`,
+default 3) → dead-letter queue. Monitor live with `npm run queue:status`
+(2s refresh; `--job`, `--deadLetter`, `--retry`, `--retryAll` modes).
+
+### Memory Management & Long-Run Stability
+
+Phase 2.10 — keeps the scraper running 8+ hours without OOM or orphaned
+Chromium processes. `--contextRestartEvery <n>` (default 50)
+force-restarts each browser context every N tasks to clear Chrome memory
+leaks; `--maxHeapMb` (default 1024) + `--maxRssMb` (default 4096) trigger
+graceful degradation (pause queue → restart contexts → run `global.gc()`
+if `--expose-gc` → reduce pool). A zombie reaper scans for orphaned
+Chromium at startup + shutdown + hourly in endless mode. `--endless`
+keeps the process alive pulling jobs from the queue forever (Phase 5
+continuous scraping); `--healthPort` binds a GET `/health` JSON endpoint
+(auto-on when `--endless`, returns 200 ok/degraded or 503 unhealthy).
+
+### Self-Healing Selectors & Health Checks
+
+Phase 2.11 — a five-layer defense against Google Maps DOM changes:
+selector versioning + staleness warning (`--maxSelectorAge`, default 30
+days), startup health check (loads a fixture, aborts with **exit code 3**
+if core fields <50%), first-batch abort (after 10 businesses, exit 3 if
+core <50%), heuristic auto-discovery (`--autoDiscover`, default on —
+falls back to phone/website/rating/reviews_count pattern matching when
+selectors miss), and debug dumps (`--selectorDebugDump`, default on —
+writes 500-char card snippets to `data/selector-debug/{field}_{ts}.html`
+when a field's rate drops below 80%). `--skipHealthCheck` bypasses the
+startup check for emergency runs. See **[`SELECTORS.md`](SELECTORS.md)**
+for the full self-healing workflow + how to add new selectors.
+
+### Incremental Scraping & Detail Caching
+
+Phase 2.12 — a two-tier cache that cuts repeat-run runtime by ~80%.
+`--incremental` (requires `--output db`) enables a run-level preflight
+that skips the browser entirely when the most-recent scrape of this
+(query, location) is within `--listFreshnessDays` (default 1) — ~0
+requests, <30s runtime. Per-business, cached detail data (hours,
+reviews, photos) is reused within `--detailCacheTtlDays` (default 7)
+when the list-view `change_hash` matches; `--detailRefreshOnReviewDelta`
+(default 10%) forces a refresh on review surges even within the TTL.
+`--noDetailCache` forces a full deep-scrape; `--listFreshnessDays 0`
+forces a full re-scrape.
 
 ## Quick start
 
@@ -37,6 +197,33 @@ Output is written to `data/{query}_{location}_{timestamp}.*`:
 - `.csv` — UTF-8-with-BOM, Excel-safe, 25-column stable schema
 - `.json` — full nested data (arrays/objects preserved)
 - `.summary.json` — run metadata (query, location, totals, extraction rates, timing, output paths)
+
+### Phase 2 — 10,000-listing overnight run
+
+The canonical Phase 2 acceptance test. Bring up the infrastructure,
+submit a multi-query batch to the Redis queue, then run a 5-worker pool
+with the full Phase 2 stack (proxies, fingerprint, stealth, session
+rotation, incremental cache, CAPTCHA solving, deep-scrape) overnight.
+See **[`OPERATIONS.md`](OPERATIONS.md)** for the full runbook and
+**[`scripts/run-10k.sh`](scripts/run-10k.sh)** for a wrapper that handles
+prerequisite checks + logging.
+
+```bash
+# 1. Start infrastructure (one-time)
+docker compose up -d
+npm run db:migrate
+
+# 2. Populate .env: DATABASE_URL, REDIS_URL, CAPTCHA_API_KEY, PROXY_LIST_FILE
+
+# 3. Submit the 52-query batch + run the 5-worker pool overnight
+npm run batch -- --file queries-10k.csv --queue on
+npm start -- --workers 5 --queue on --incremental --deepScrape true \
+  --captchaProvider 2captcha --proxyStrategy random --sessionLength 50 --endless
+
+# Monitor + review
+npm run queue:status              # live dashboard
+./scripts/run-10k.sh              # or run the whole flow with this helper
+```
 
 ## CLI
 
@@ -659,6 +846,139 @@ npm start -- --query "Restaurant" --location "Toronto" --fresh
 | `2` | Config error — bad CLI input (e.g. `--maxResults abc`) |
 | `3` | Runtime error — crash or CAPTCHA abort (checkpoint preserved for `--resume`) |
 | `130` | `Ctrl-C` / `SIGINT` (checkpoint preserved) |
+
+### Run aborted with exit code 3 (Phase 2.11 selector failure)
+
+The Phase 2.11 self-healing selector subsystem aborted the run — either
+the startup health check or the first-batch abort (after 10 businesses)
+found core fields (`name`, `rating`, `reviews_count`, `address`) below
+50%. This means Google changed the Maps DOM. To recover:
+
+1. Inspect `data/selector-debug/` — `<field>_<timestamp>.html` files
+   contain 500-char card snippets from the failed run.
+2. Re-capture fixtures with `npm run capture-fixtures` (dev-only; needs
+   a live browser session) against a known query.
+3. Update the selectors in `src/extract.js` (add/update fallbacks per
+   `SELECTORS.md`).
+4. Bump the version + `lastVerifiedDate` in `src/selectors/version.js`.
+
+Temporary workaround for emergency runs: `--skipHealthCheck` bypasses
+both the startup check and the first-batch abort (the run continues, but
+extraction rates will be poor until selectors are fixed).
+
+### All proxies burned
+
+Either the proxy provider has an outage, the pool is too small for the
+request rate, or the scraper is being too aggressive. Fix:
+
+- Lower `--maxRPM` (e.g. 15 instead of 30).
+- Increase the proxy pool — add more lines to the file passed to
+  `--proxyListFile`.
+- Check `--proxyCooldownMs` (default 10 min); if the run is shorter than
+  the cooldown, burned proxies never recover. Lower it for short runs.
+- Inspect `data/proxy_burn_log.jsonl` for per-proxy burn reasons
+  (403/429 / timeout / 407). HTTP 407 (auth) means the credentials are
+  wrong; those proxies are removed permanently — fix the credentials in
+  the list file.
+
+### CAPTCHA budget exceeded early
+
+The run is hitting more CAPTCHAs than expected — either the IP/proxy is
+flagged or the budget is too low for the workload.
+
+- Raise `--captchaBudget` (default $5.00; ~$0.003/solve for 2captcha,
+  ~$0.002 for anticaptcha, ~$0.0008 for capsolver).
+- Reduce `--workers` — fewer parallel sessions means fewer simultaneous
+  CAPTCHA triggers.
+- Check whether the IP/proxy is flagged: a single-worker `--maxResults 20`
+  smoke test should produce 0–1 CAPTCHAs; if it produces 5+, the IP is
+  burned. Rotate proxies.
+- Use `--captchaProvider mock` for $0 smoke tests — returns a fake token,
+  no API call. Useful for verifying the orchestrator wiring without
+  spending money.
+
+### Workers retiring (pool shrinking)
+
+The site is blocking workers faster than they can cool down + revive.
+Each retired worker (after `--workerCrashLimit` crashes in 10 min,
+default 3) drops the pool size, so throughput collapses. Fix:
+
+- Increase `--workerCooldownMs` (default 5 min) so blocked workers stay
+  out longer before revival.
+- Lower `--maxRPM` so each worker is less aggressive.
+- Rotate proxies (`--proxyStrategy random`) and ensure the pool has
+  enough healthy proxies.
+- Reduce `--workers` so the remaining workers each get more proxy
+  headroom.
+
+### Heap / RSS growing
+
+Chrome memory leaks accumulate over long runs. Fix:
+
+- Set `--contextRestartEvery 25` (default 50) to force-restart each
+  browser context more frequently, clearing leaks.
+- Lower `--workers` (each Chromium ~150–300MB).
+- Check for orphaned Chromium processes — the zombie reaper cleans these
+  at startup + shutdown + hourly in `--endless` mode, but a hard kill
+  (`SIGKILL`) bypasses it. Run `pgrep -af chromium` and `kill` stragglers.
+- Monitor via `--healthPort <port>` then
+  `curl http://127.0.0.1:<port>/health` — the JSON response includes
+  `heap`, `rss`, `workers`, `queueDepth`, `endless`. Status `degraded`
+  (HTTP 200) means pressure; `unhealthy` (HTTP 503) means the
+  degradation sequence is actively running.
+
+### Queue stalled / not draining
+
+The worker isn't pulling jobs off BullMQ. Fix:
+
+- Check Redis is up: `docker compose ps redis` (or `redis-cli ping`).
+- Check `--redisUrl` (or `REDIS_URL` in `.env`) points to the right
+  instance.
+- `npm run queue:status` shows active + failed counts; failed jobs have
+  exhausted `--queueAttempts` (default 3) and are in the dead-letter
+  queue. Retry with `npm run queue:status -- --retryAll` or
+  `--retry <jobId>`.
+- If the worker process crashed mid-job, BullMQ auto-re-queues the job
+  when the connection drops — restart the worker and it will resume.
+
+### Incremental not caching (second run isn't fast)
+
+The second run of the same (query, location) should be ~80% faster, but
+isn't. Fix:
+
+- Ensure `--output db` + `--incremental` are both set. Incremental mode
+  requires the database (freshness is tracked in PostgreSQL via the
+  `last_list_scraped` column).
+- Run `npm run db:migrate` after upgrading — the Phase 2.12 columns
+  (`last_list_scraped`, `last_detail_scraped`, `change_hash`) are added
+  idempotently by the migration. Rows scraped before the migration will
+  not be fresh until re-scraped once.
+- Check the `last_list_scraped` column freshness:
+  ```sql
+  SELECT place_id, last_list_scraped, last_detail_scraped
+  FROM businesses WHERE query='Cafe' AND location='Berlin'
+  ORDER BY last_list_scraped DESC LIMIT 5;
+  ```
+- `--listFreshnessDays 0` forces a full re-scrape (treats every business
+  as stale) — useful for debugging or one-off refreshes.
+- `--noDetailCache` ignores the detail cache TTL and forces deep-scrape;
+  the list-view incremental still applies.
+
+### 0% detail-scrape success
+
+The detail-panel selectors are broken (or the detail panel never opens).
+Deep-scrape attempts return `detail_scraped: false` for every business.
+Fix:
+
+- Run a small debug scrape: `npm start -- --query "Cafe" --location
+  "Berlin" --deepScrape true --maxResults 5 --verbose`. The per-business
+  `triedSelectors` + `beforeUrl`/`afterUrl` diagnostics reveal what's
+  failing.
+- Check `data/selector-debug/` for detail-panel HTML snippets (Phase
+  2.11 debug dumps fire when detail-field rates drop below 80%).
+- If the detail panel never opens (vs. opens but selectors miss), the
+  issue is in `src/detail.js` — see `SELECTORS.md` for the open/extract
+  flow + fallback strategy.
 
 ## Known limitations (Phase 1 scope)
 

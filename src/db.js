@@ -50,6 +50,16 @@ const {
   summarizeChanges,
 } = deltas;
 
+// Phase 2.12 — incremental scraping helpers. `computeChangeHash` is a SHA-256
+// of the LIST-VIEW fields only (distinct from `computeRowHash` below, which
+// hashes the full row including detail JSONB). Kept in a separate module so
+// the incremental subsystem is unit-testable in isolation. db.js →
+// incremental.js is a one-way require (incremental.js does NOT require db.js),
+// so there's no circular dependency.
+const {
+  computeChangeHash,
+} = require('./incremental');
+
 // `pg` is an optional runtime dependency: the scraper still works without it
 // (Phase 1 file-only behavior) as long as `--output db` is never requested.
 // We lazy-require it inside createPool() so `require('./db')` never throws
@@ -398,18 +408,26 @@ async function insertRunSummary(client, summary) {
  * Uses ON CONFLICT (place_id) DO NOTHING as a safety net against concurrent
  * inserts (the pre-flight hash SELECT is the primary insert detector).
  *
- * @param {object[]} rows — array of { business, hash }.
+ * Phase 2.12 — also populates the freshness columns:
+ *   - change_hash        : the list-view hash (passed in, pre-computed).
+ *   - last_list_scraped  : NOW() (we just verified the list fields).
+ *   - last_detail_scraped: NOW() when business.detail_scraped is true, else
+ *                          NULL (never detail-scraped — the TTL check treats
+ *                          NULL as "no cache", forcing a future deep-scrape).
+ *
+ * @param {object[]} rows — array of { business, hash, changeHash }.
  * @param {number|null} runId
  * @returns {{ text: string, params: any[] }}
  */
 function buildBatchInsert(rows, runId) {
-  const cols = INSERT_COLUMNS; // e.g. 25 columns
+  const cols = [...INSERT_COLUMNS, 'change_hash', 'last_list_scraped', 'last_detail_scraped'];
   const placeholders = [];
   const params = [];
   let idx = 1;
-  for (const { business, hash } of rows) {
+  const nowIso = new Date().toISOString();
+  for (const { business, hash, changeHash } of rows) {
     const rowPh = [];
-    for (const col of cols) {
+    for (const col of INSERT_COLUMNS) {
       if (col === 'data_hash') {
         rowPh.push('$' + idx);
         params.push(hash);
@@ -422,6 +440,19 @@ function buildBatchInsert(rows, runId) {
       }
       idx++;
     }
+    // change_hash (list-view-only hash, Phase 2.12). Default to null when the
+    // caller didn't pre-compute it (backward-compatible with pre-2.12 callers).
+    rowPh.push('$' + idx);
+    params.push(changeHash !== undefined ? changeHash : null);
+    idx++;
+    // last_list_scraped — always NOW() (list fields just verified)
+    rowPh.push('$' + idx);
+    params.push(nowIso);
+    idx++;
+    // last_detail_scraped — NOW() when detail_scraped, else NULL
+    rowPh.push('$' + idx);
+    params.push(business && business.detail_scraped === true ? nowIso : null);
+    idx++;
     placeholders.push('(' + rowPh.join(', ') + ')');
   }
   const text =
@@ -436,8 +467,18 @@ function buildBatchInsert(rows, runId) {
 /**
  * Build a parameterized UPDATE for a single business (whose data_hash differs
  * from the stored value). Returns { text, params }.
+ *
+ * Phase 2.12 — also refreshes the freshness columns:
+ *   - change_hash        : updated to the new list-view hash.
+ *   - last_list_scraped  : NOW() (list fields just re-verified).
+ *   - last_detail_scraped: CASE WHEN detail_scraped THEN NOW() ELSE
+ *                          last_detail_scraped END — refreshed only when a
+ *                          detail scrape happened this run; otherwise the
+ *                          existing cached timestamp is preserved (so a re-
+ *                          scrape that skipped the detail-panel keeps its
+ *                          TTL freshness intact).
  */
-function buildUpdate(business, hash, runId) {
+function buildUpdate(business, hash, runId, changeHash) {
   const setCols = [...SCALAR_COLUMNS, ...JSONB_COLUMNS, 'data_hash', 'run_id'];
   const setClauses = [];
   const params = [];
@@ -455,6 +496,26 @@ function buildUpdate(business, hash, runId) {
     }
     idx++;
   }
+  // change_hash (Phase 2.12). Default to null when not provided (backward-
+  // compatible with pre-2.12 callers that don't pre-compute the list hash).
+  setClauses.push('change_hash = $' + idx);
+  params.push(changeHash !== undefined ? changeHash : null);
+  idx++;
+  // last_list_scraped — always NOW()
+  setClauses.push('last_list_scraped = $' + idx);
+  params.push(new Date().toISOString());
+  idx++;
+  // last_detail_scraped — CASE: refresh when detail_scraped, else preserve.
+  const detailFlagIdx = idx;
+  params.push(business && business.detail_scraped === true);
+  idx++;
+  const nowIdx = idx;
+  params.push(new Date().toISOString());
+  idx++;
+  setClauses.push(
+    'last_detail_scraped = CASE WHEN $' + detailFlagIdx + ' THEN $' + nowIdx +
+      ' ELSE last_detail_scraped END',
+  );
   // place_id is the WHERE key (last param).
   setClauses.push('updated_at = NOW()');
   params.push(business.place_id);
@@ -462,6 +523,40 @@ function buildUpdate(business, hash, runId) {
     'UPDATE businesses SET ' +
     setClauses.join(', ') +
     ' WHERE place_id = $' + idx;
+  return { text, params };
+}
+
+/**
+ * Phase 2.12 — Build a batched UPDATE that refreshes `last_list_scraped` and
+ * `change_hash` for unchanged businesses (data_hash matched). Advances the
+ * freshness timestamp so frequently-re-scraped businesses stay "fresh" without
+ * a full re-scrape. Does NOT touch `updated_at` (preserves the Phase 2.1
+ * "unchanged = no updated_at bump" contract) and does NOT write snapshots /
+ * field_changes (nothing changed).
+ *
+ * Uses a VALUES-table join so the whole batch is one round-trip:
+ *   UPDATE businesses SET last_list_scraped = NOW(), change_hash = c.change_hash
+ *   FROM (VALUES ($1, $2), ($3, $4), ...) AS c(place_id, change_hash)
+ *   WHERE businesses.place_id = c.place_id
+ *
+ * @param {Array<{placeId: string, changeHash: string}>} rows
+ * @returns {{text: string, params: any[]}|null} null when rows is empty.
+ */
+function buildUnchangedRefresh(rows) {
+  if (!rows || rows.length === 0) return null;
+  const params = [];
+  const values = [];
+  let idx = 1;
+  for (const { placeId, changeHash } of rows) {
+    values.push('($' + idx + ', $' + (idx + 1) + ')');
+    params.push(placeId);
+    params.push(changeHash);
+    idx += 2;
+  }
+  const text =
+    'UPDATE businesses SET last_list_scraped = NOW(), change_hash = c.change_hash ' +
+      'FROM (VALUES ' + values.join(', ') + ') AS c(place_id, change_hash) ' +
+      'WHERE businesses.place_id = c.place_id';
   return { text, params };
 }
 
@@ -608,7 +703,7 @@ function buildFieldChangesInsert(rows) {
  *
  * @param {object} client — pg Client or mock with .query(text, params).
  * @param {object[]} businesses
- * @param {object} [opts] — { runId, batchSize }
+ * @param {object} [opts] — { runId, batchSize, incremental }
  * @returns {Promise<{ inserted: number, updated: number, unchanged: number, changesByField: object, changesTotal: number, snapshotsWritten: number, details: object[] }>}
  */
 async function upsertBusinessesBatch(client, businesses, opts) {
@@ -616,6 +711,11 @@ async function upsertBusinessesBatch(client, businesses, opts) {
   const o = opts || {};
   const runId = o.runId !== undefined ? o.runId : null;
   const batchSize = o.batchSize || 50;
+  // Phase 2.12 — when true, unchanged businesses get a lightweight refresh of
+  // last_list_scraped + change_hash (we just re-verified the list fields, so
+  // the freshness timestamp should advance even though no data changed).
+  // When false (default), unchanged = pure no-op (Phase 2.1 behavior).
+  const incremental = !!o.incremental;
 
   const list = Array.isArray(businesses) ? businesses : [];
   const totals = {
@@ -648,17 +748,23 @@ async function upsertBusinessesBatch(client, businesses, opts) {
     // 2. Classify.
     const toInsert = [];
     const toUpdate = [];
+    const unchangedRefresh = []; // Phase 2.12 — { placeId, changeHash } for freshness refresh
     for (const business of chunk) {
       if (!business || !business.place_id) continue;
       const hash = computeRowHash(business);
+      const changeHash = computeChangeHash(business); // Phase 2.12 — list-view-only hash
       const action = decideAction(existing.get(business.place_id) || null, business);
       if (action === 'inserted') {
-        toInsert.push({ business, hash });
+        toInsert.push({ business, hash, changeHash });
       } else if (action === 'updated') {
-        toUpdate.push({ business, hash });
+        toUpdate.push({ business, hash, changeHash });
       } else {
         totals.unchanged++;
         totals.details.push({ place_id: business.place_id, action: 'unchanged', changes: [] });
+        // Phase 2.12 — collect for the freshness refresh (issued below).
+        if (incremental) {
+          unchangedRefresh.push({ placeId: business.place_id, changeHash });
+        }
       }
     }
 
@@ -723,8 +829,8 @@ async function upsertBusinessesBatch(client, businesses, opts) {
       }
 
       // 4e. Per-row UPDATE for changed businesses + roll up change counts.
-      for (const { business, hash } of toUpdate) {
-        const upd = buildUpdate(business, hash, runId);
+      for (const { business, hash, changeHash } of toUpdate) {
+        const upd = buildUpdate(business, hash, runId, changeHash);
         await client.query(upd.text, upd.params);
         totals.updated++;
         const changes = perBusinessChanges.get(business.place_id) || [];
@@ -739,6 +845,27 @@ async function upsertBusinessesBatch(client, businesses, opts) {
           action: 'updated',
           changes: changes.map((c) => c.field),
         });
+      }
+    }
+
+    // 5. Phase 2.12 — freshness refresh for unchanged businesses (incremental
+    //    mode only). One batched UPDATE advances last_list_scraped to NOW()
+    //    and re-stamps change_hash, WITHOUT touching updated_at (preserving
+    //    Phase 2.1's "don't bump updated_at on unchanged" contract) and
+    //    WITHOUT writing snapshots/field_changes (nothing changed). This keeps
+    //    frequently-re-scraped businesses "fresh" so they don't fall through
+    //    to a full re-scrape just because the original timestamp aged out.
+    if (unchangedRefresh.length > 0) {
+      const refresh = buildUnchangedRefresh(unchangedRefresh);
+      if (refresh) {
+        try {
+          await client.query(refresh.text, refresh.params);
+        } catch (err) {
+          // Non-fatal — the upsert already succeeded; only the freshness
+          // timestamp failed to advance. The business will be re-classified
+          // as stale on the next run, which is correct (conservative).
+          // Swallow so a transient DB error doesn't roll back the transaction.
+        }
       }
     }
   }
@@ -774,12 +901,13 @@ async function upsertBusiness(client, business, opts) {
  *   5. Commit (or rollback on any error).
  *
  * @param {import('pg').Pool} pool
- * @param {object} args — { businesses, summary, logger }
+ * @param {object} args — { businesses, summary, logger, incremental }
  * @returns {Promise<{ runId, inserted, updated, unchanged }>}
  */
 async function persistRunResults(pool, args) {
   if (!pool) throw new Error('persistRunResults: pool is null');
   const { businesses, summary, logger } = args || {};
+  const incremental = !!(args && args.incremental);
   const list = Array.isArray(businesses) ? businesses : [];
 
   return withClient(pool, async (client) => {
@@ -797,7 +925,14 @@ async function persistRunResults(pool, args) {
         logPath: summary && summary.logPath,
       });
 
-      const upsertRes = await upsertBusinessesBatch(client, list, { runId, batchSize: 50 });
+      // Phase 2.12 — pass `incremental` so unchanged businesses get a
+      // freshness-timestamp refresh (advancing last_list_scraped without a
+      // full data update).
+      const upsertRes = await upsertBusinessesBatch(client, list, {
+        runId,
+        batchSize: 50,
+        incremental,
+      });
 
       // Stamp the DB counts + change-detection totals back onto the run row.
       // (Phase 2.2 — `changes_detected` is the total field_changes rows written
@@ -873,6 +1008,7 @@ module.exports = {
   // SQL builders (exported for tests)
   buildBatchInsert,
   buildUpdate,
+  buildUnchangedRefresh,
   buildSnapshotInsert,
   buildFieldChangesInsert,
   // pool / client lifecycle
@@ -893,6 +1029,9 @@ module.exports = {
   // `const { computeChanges } = require('./db')` without a second import).
   computeChanges,
   summarizeChanges,
+  // Phase 2.12 — re-export the list-view-only change hash (so callers can
+  // `const { computeChangeHash } = require('./db')` without a second import).
+  computeChangeHash,
   // internal: loadPg (for monkey-patching in tests)
   _loadPg: loadPg,
   _deltas: deltas,

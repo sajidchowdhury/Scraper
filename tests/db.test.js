@@ -517,8 +517,10 @@ describe('Phase 2.1 — buildBatchInsert', () => {
     expect(text).toContain('INSERT INTO businesses');
     expect(text).toContain('VALUES');
     expect(text).toContain('ON CONFLICT (place_id) DO NOTHING');
-    // Two rows × N columns = params length
-    expect(params.length).toBe(rows.length * (SCALAR_COLUMNS.length + JSONB_COLUMNS.length + 2));
+    // Two rows × N columns = params length. The +5 accounts for data_hash,
+    // run_id (Phase 2.1) + change_hash, last_list_scraped, last_detail_scraped
+    // (Phase 2.12 — incremental freshness columns).
+    expect(params.length).toBe(rows.length * (SCALAR_COLUMNS.length + JSONB_COLUMNS.length + 5));
   });
 
   test('SQL-injection safety: malicious place_id appears in params, NOT in SQL text', () => {
@@ -960,6 +962,76 @@ describe('Phase 2.1 — pool + migration lifecycle', () => {
 //   (b) one field_changes row per tracked field that actually changed.
 // And that re-scraping with IDENTICAL data writes neither (no noise).
 // ---------------------------------------------------------------------------
+
+describe('Phase 2.12 — incremental freshness refresh (DI mock client)', () => {
+  test('upsert with incremental=true refreshes last_list_scraped for unchanged businesses', async () => {
+    // Seed a business, then re-upsert identical data with incremental=true.
+    // The unchanged business should trigger a batched UPDATE refreshing
+    // last_list_scraped (the buildUnchangedRefresh query).
+    const client = makeMockClient();
+    const b = makeBusiness({ place_id: 'INCR_UNCHANGED', reviews_count: 100 });
+    await upsertBusiness(client, b, { runId: 1 });
+
+    // Clear the query log, then re-upsert identical data with incremental=true.
+    client.queryCalls.length = 0;
+    const res = await upsertBusiness(client, b, { runId: 2, incremental: true });
+    expect(res.action).toBe('unchanged');
+
+    // An UPDATE refreshing last_list_scraped should have been issued.
+    const refreshUpdate = client.queryCalls.find(
+      (c) => c.text.startsWith('UPDATE businesses SET last_list_scraped = NOW()'),
+    );
+    expect(refreshUpdate).toBeDefined();
+    // The refresh UPDATE should NOT touch updated_at (preserves Phase 2.1 contract).
+    expect(refreshUpdate.text).not.toContain('updated_at');
+    // The place_id should be a parameter (SQL-injection safe).
+    expect(refreshUpdate.params).toContain('INCR_UNCHANGED');
+  });
+
+  test('upsert WITHOUT incremental flag does NOT issue the refresh UPDATE (Phase 2.1 behavior)', async () => {
+    const client = makeMockClient();
+    const b = makeBusiness({ place_id: 'INCR_OFF', reviews_count: 100 });
+    await upsertBusiness(client, b, { runId: 1 });
+
+    client.queryCalls.length = 0;
+    const res = await upsertBusiness(client, b, { runId: 2 }); // no incremental flag
+    expect(res.action).toBe('unchanged');
+
+    // No refresh UPDATE should be issued (Phase 2.1 no-op on unchanged).
+    const refreshUpdate = client.queryCalls.find(
+      (c) => c.text.startsWith('UPDATE businesses SET last_list_scraped = NOW()'),
+    );
+    expect(refreshUpdate).toBeUndefined();
+  });
+
+  test('upsert with incremental=true populates change_hash + last_list_scraped on INSERT', async () => {
+    const client = makeMockClient();
+    const b = makeBusiness({ place_id: 'INCR_INSERT', detail_scraped: true });
+    const res = await upsertBusiness(client, b, { runId: 1, incremental: true });
+    expect(res.action).toBe('inserted');
+
+    const row = client._businesses.get('INCR_INSERT');
+    expect(row).toBeDefined();
+    // change_hash should be populated (list-view hash).
+    expect(row.change_hash).toBeTruthy();
+    expect(typeof row.change_hash).toBe('string');
+    expect(row.change_hash).toHaveLength(64); // SHA-256 hex
+    // last_list_scraped should be set (ISO string).
+    expect(row.last_list_scraped).toBeTruthy();
+    // last_detail_scraped should be set (detail_scraped=true on this business).
+    expect(row.last_detail_scraped).toBeTruthy();
+  });
+
+  test('upsert with incremental=true sets last_detail_scraped=NULL on INSERT when detail_scraped=false', async () => {
+    const client = makeMockClient();
+    const b = makeBusiness({ place_id: 'INCR_NOSCRAP', detail_scraped: false });
+    await upsertBusiness(client, b, { runId: 1, incremental: true });
+
+    const row = client._businesses.get('INCR_NOSCRAP');
+    expect(row.last_detail_scraped).toBeNull(); // never detail-scraped
+    expect(row.last_list_scraped).toBeTruthy(); // list was scraped
+  });
+});
 
 describe('Phase 2.2 — change tracking on update (DI mock client)', () => {
   test('first insert → no snapshots, no field_changes', async () => {

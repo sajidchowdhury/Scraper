@@ -184,6 +184,29 @@ function parseArgs(argv) {
     else if (a === '--selectorDebugDump') out.selectorDebugDump = argv[++i];
     else if (a === '--maxSelectorAge') out.maxSelectorAge = argv[++i];
     else if (a === '--selectorDebugDir') out.selectorDebugDir = argv[++i];
+    // Phase 2.12 — incremental scraping & detail caching. These flags control
+    //   whether repeat runs skip fresh/unchanged businesses + reuse cached
+    //   detail data, cutting repeat-run runtime by ~80%.
+    //   --incremental            — enable incremental mode (default: off).
+    //                              Requires --output db (freshness is tracked
+    //                              in PostgreSQL; without a DB there's nothing
+    //                              to cache).
+    //   --listFreshnessDays N    — a business is "fresh" if last_list_scraped
+    //                              is within N days (default: 1). Fresh +
+    //                              unchanged → skip detail-scrape.
+    //   --detailCacheTtlDays N   — detail data is reused if last_detail_scraped
+    //                              is within N days (default: 7).
+    //   --detailRefreshOnReviewDelta N — force a detail re-scrape when
+    //                              reviews_count changed by > N percent
+    //                              (default: 10).
+    //   --noDetailCache          — always deep-scrape (ignore the TTL).
+    //   --swrr                   — stale-while-revalidate (stub for Phase 5).
+    else if (a === '--incremental') out.incremental = true;
+    else if (a === '--listFreshnessDays') out.listFreshnessDays = argv[++i];
+    else if (a === '--detailCacheTtlDays') out.detailCacheTtlDays = argv[++i];
+    else if (a === '--detailRefreshOnReviewDelta') out.detailRefreshOnReviewDelta = argv[++i];
+    else if (a === '--noDetailCache') out.noDetailCache = true;
+    else if (a === '--swrr') out.swrr = true;
   }
   return out;
 }
@@ -593,6 +616,38 @@ function validate(cfg) {
         'Warn when selector sets are older than this (default 30).',
     );
   }
+  // Phase 2.12 — incremental scraping validation.
+  // --incremental requires --output db (freshness is tracked in PostgreSQL;
+  // without a DB there's nothing to cache). We fail fast here so the operator
+  // sees the error before any browser launches.
+  if (cfg.incremental.enabled && !cfg.output.includes('db')) {
+    errors.push(
+      '--incremental requires --output db (or --output all). Freshness is ' +
+        'tracked in PostgreSQL via last_list_scraped / last_detail_scraped / ' +
+        'change_hash; without a DB there is nothing to cache. See .env.example → Phase 2.12.',
+    );
+  }
+  if (cfg.incremental.listFreshnessDays < 0 || cfg.incremental.listFreshnessDays > 365) {
+    errors.push(
+      `listFreshnessDays must be between 0 and 365 (got ${cfg.incremental.listFreshnessDays}). ` +
+        '0 = always stale (re-scrape everything); 365 = fresh for a year.',
+    );
+  }
+  if (cfg.incremental.detailCacheTtlDays < 0 || cfg.incremental.detailCacheTtlDays > 365) {
+    errors.push(
+      `detailCacheTtlDays must be between 0 and 365 (got ${cfg.incremental.detailCacheTtlDays}). ` +
+        '0 = always miss (deep-scrape everything); 365 = cache detail data for a year.',
+    );
+  }
+  if (
+    cfg.incremental.detailRefreshOnReviewDelta < 0 ||
+    cfg.incremental.detailRefreshOnReviewDelta > 1000
+  ) {
+    errors.push(
+      `detailRefreshOnReviewDelta must be between 0 and 1000 percent (got ${cfg.incremental.detailRefreshOnReviewDelta}). ` +
+        '0 = always force-refresh on any review change; 1000 = effectively never.',
+    );
+  }
   return errors;
 }
 
@@ -967,6 +1022,44 @@ function loadConfig(argv = process.argv.slice(2)) {
       resolved: null,
     },
 
+    // Phase 2.12 — incremental scraping & detail caching.
+    //   --incremental                — enable incremental mode (default: off).
+    //                                   Requires --output db. On repeat runs,
+    //                                   skips fresh/unchanged businesses and
+    //                                   reuses cached detail data, cutting
+    //                                   runtime by ~80%.
+    //   --listFreshnessDays N        — a business is "fresh" if its
+    //                                   last_list_scraped is within N days
+    //                                   (default: 1). Fresh + change_hash
+    //                                   match → skip detail-scrape.
+    //   --detailCacheTtlDays N       — detail data (hours, reviews, photos) is
+    //                                   reused if last_detail_scraped is within
+    //                                   N days (default: 7).
+    //   --detailRefreshOnReviewDelta N — force a detail re-scrape when
+    //                                   reviews_count changed by > N percent
+    //                                   (default: 10). Catches a spike in
+    //                                   reviews even when the TTL is fresh.
+    //   --noDetailCache              — always deep-scrape (ignore the TTL).
+    //                                   Forces reason='no_cache' for every
+    //                                   business.
+    //   --swrr                       — stale-while-revalidate (stub for Phase 5;
+    //                                   accepted + logged, behaves like normal
+    //                                   incremental mode).
+    incremental: {
+      enabled: !!cli.incremental || process.env.INCREMENTAL === 'true' ||
+        process.env.INCREMENTAL === 'on',
+      listFreshnessDays:
+        toIntOrNull(cli.listFreshnessDays ?? process.env.LIST_FRESHNESS_DAYS) ?? 1,
+      detailCacheTtlDays:
+        toIntOrNull(cli.detailCacheTtlDays ?? process.env.DETAIL_CACHE_TTL_DAYS) ?? 7,
+      detailRefreshOnReviewDelta:
+        toIntOrNull(cli.detailRefreshOnReviewDelta ?? process.env.DETAIL_REFRESH_ON_REVIEW_DELTA) ?? 10,
+      noDetailCache: !!cli.noDetailCache || process.env.NO_DETAIL_CACHE === 'true',
+      swrr: !!cli.swrr || process.env.SWRR === 'true',
+      // Resolved at runtime in index.js into { cache, stats } (null when disabled).
+      resolved: null,
+    },
+
     // Logging
     logLevel: cli.logLevel || process.env.LOG_LEVEL || 'info',
 
@@ -1161,8 +1254,58 @@ Optional:
   --selectorDebugDir <path>  Phase 2.11 — override the debug-dump directory
                              (default: ./data/selector-debug).
 
+  --incremental              Phase 2.12 — incremental scraping & detail caching.
+                             Skip businesses whose list data is fresh + unchanged;
+                             reuse cached detail data within its TTL. Cuts repeat-
+                             run runtime by ~80%. Requires --output db (freshness
+                             is tracked in PostgreSQL).
+  --listFreshnessDays <n>    Phase 2.12 — a business is "fresh" if its
+                             last_list_scraped is within N days (default: 1).
+                             Fresh + change_hash match → skip detail-scrape.
+  --detailCacheTtlDays <n>   Phase 2.12 — detail data (hours, reviews, photos)
+                             is reused if last_detail_scraped is within N days
+                             (default: 7). 0 = always deep-scrape.
+  --detailRefreshOnReviewDelta <pct>  Phase 2.12 — force a detail re-scrape when
+                             reviews_count changed by > this percent (default 10).
+                             Catches a review spike even when the TTL is fresh.
+  --noDetailCache            Phase 2.12 — always deep-scrape (ignore the TTL).
+                             Forces reason='no_cache' for every business.
+  --swrr                     Phase 2.12 — stale-while-revalidate (stub for Phase
+                             5; accepted + logged, behaves like normal incremental).
+
   --version                  Print version and exit
   --help, -h                 Show this help
+
+Phase 2 flags by category (quick reference):
+  Proxy:        --proxyStrategy --sessionLength --proxyCooldownMs --proxyListFile
+                --proxyHealthCheck --noProxy --workerProxyStrategy
+  Stealth:      --fingerprintProfile --fixedFingerprint --noFingerprint
+                --stealth --noStealth --stealthDebug
+  Concurrency:  --workers --workerCrashLimit --workerCooldownMs
+                --workerLoadBalancer --workerDetailBatchSize --workerTaskRetries
+  Queue:        --queue --redisUrl --queuePriority --queueAttempts --queueConcurrency
+  DB:           --output db | csv,json,db | all
+  Cache:        --incremental --listFreshnessDays --detailCacheTtlDays
+                --detailRefreshOnReviewDelta --noDetailCache --swrr
+  CAPTCHA:      --captchaProvider --captchaApiKey --captchaBudget
+                --captchaFallbackProvider --noCaptchaSolve
+  Health:       --contextRestartEvery --maxHeapMb --maxRssMb --endless
+                --healthCheckIntervalMs --healthPort --healthHost --noHealthServer
+                --skipHealthCheck --autoDiscover --selectorDebugDump --maxSelectorAge
+  Session:      --sessionMaxRequests --sessionMaxAgeMs --warmup --noWarmup
+                --warmupDurationMs --accountWarmup --accountsFile
+
+Phase 2 Quick Start — the definitive 10,000-listing overnight run:
+  # 1. Start infrastructure (one-time): docker compose up -d + npm run db:migrate
+  # 2. Populate .env: DATABASE_URL, REDIS_URL, CAPTCHA_API_KEY, PROXY_LIST_FILE
+  # 3. Submit the 52-query batch to the queue:
+  npm run batch -- --file queries-10k.csv --queue on
+  # 4. Run the 5-worker pool overnight (the canonical Phase 2 command):
+  npm start -- --workers 5 --queue on --incremental --deepScrape true \\
+    --captchaProvider 2captcha --proxyStrategy random --sessionLength 50 --endless
+  # 5. Monitor: npm run queue:status   (live, refreshes 2s)
+  # 6. Review: benchmarks/phase2-10k-run.json   (populated by scripts/run-10k.sh)
+  # Or run the whole flow with: ./scripts/run-10k.sh
 
 Examples:
   # Real runs — write CSV + JSON + summary to ./data/
@@ -1224,6 +1367,18 @@ Examples:
   npm start -- --query "Cafe" --location "Berlin" --queue on --queueAttempts 5   # more retries
   npm run batch -- --file queries.csv --workers 5 --queue on   # batch submit + process
   npm run queue:status                                         # live status (top-style, 2s refresh)
+
+  # Phase 2.12 — incremental scraping & detail caching (default: off)
+  #   Requires --output db (freshness tracked in PostgreSQL). First run scrapes
+  #   everything; the SECOND run immediately after is a 100% cache hit (~0
+  #   requests, <30s). --listFreshnessDays controls when a full re-scrape is
+  #   forced; --detailCacheTtlDays controls when the detail deep-scrape repeats.
+  npm start -- --query "Cafe" --location "Berlin" --output db --incremental            # 2nd run = cache hit
+  npm start -- --query "Cafe" --location "Berlin" --output db --incremental --deepScrape true
+  npm start -- --query "Cafe" --location "Berlin" --output db --incremental --listFreshnessDays 3
+  npm start -- --query "Cafe" --location "Berlin" --output db --incremental --detailCacheTtlDays 14
+  npm start -- --query "Cafe" --location "Berlin" --output db --incremental --noDetailCache   # force deep-scrape
+  npm start -- --query "Cafe" --location "Berlin" --output db --incremental --detailRefreshOnReviewDelta 5
 
   # Smoke test — runs the pipeline but writes NO files (no CSV, no JSON)
   npm start -- --query "Cafe" --location "Berlin" --maxResults 10 --yes --dryRun

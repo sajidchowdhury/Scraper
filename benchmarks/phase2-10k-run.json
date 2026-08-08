@@ -1,0 +1,64 @@
+{
+  "metadata": {
+    "recordedAt": null,
+    "phase": "phase2-10k",
+    "purpose": "Phase 2.13 — definitive 10,000-listing overnight acceptance run. Populated by scripts/run-10k.sh after an actual run.",
+    "command": "npm start -- --workers 5 --queue on --incremental --deepScrape true --captchaProvider 2captcha --proxyStrategy random --sessionLength 50 --endless",
+    "scraperVersion": "2.0.0-phase2",
+    "queriesFile": "queries-10k.csv",
+    "expectedBusinesses": 10000,
+    "logFile": null,
+    "wallClockSeconds": null,
+    "wallClockHours": null,
+    "status": "PENDING — no actual overnight run has been executed in this environment. An operator with real proxies + CAPTCHA budget + 8 hours of capacity must run scripts/run-10k.sh to populate results.* and criteria.*. The schema below documents what the run captures."
+  },
+  "config": {
+    "workers": 5,
+    "queue": "on",
+    "incremental": true,
+    "deepScrape": true,
+    "captchaProvider": "2captcha",
+    "proxyStrategy": "random",
+    "sessionLength": 50,
+    "endless": true,
+    "queries": "50 (query, location) pairs, ~200 results each"
+  },
+  "results": {
+    "totalBusinesses": null,
+    "runsInWindow": null,
+    "extracted": null,
+    "dbInserted": null,
+    "dbUpdated": null,
+    "dbUnchanged": null,
+    "changesDetected": null,
+    "detailScraped": null,
+    "detailTotal": null
+  },
+  "criteria": {
+    "extractedPctOfTarget": null,
+    "detailSuccessPct": null,
+    "under8Hours": null,
+    "captchaSpendUsd": null,
+    "proxyBurnPct": null,
+    "zeroCrashes": null
+  },
+  "successThresholds": {
+    "extractedPctOfTarget": ">= 95",
+    "detailSuccessPct": ">= 90",
+    "under8Hours": true,
+    "captchaSpendUsd": "< 5.00",
+    "proxyBurnPct": "< 20",
+    "zeroCrashes": true
+  },
+  "howToPopulate": {
+    "step1": "Ensure docker compose up -d (postgres + redis) + npm run db:migrate.",
+    "step2": "Populate .env: DATABASE_URL, REDIS_URL, CAPTCHA_API_KEY, PROXY_LIST_FILE (>= 25 proxies).",
+    "step3": "Run: ./scripts/run-10k.sh (or --captchaProvider mock for a $0 smoke test).",
+    "step4": "The script writes results.* + under8Hours + detailSuccessPct + extractedPctOfTarget automatically from the DB.",
+    "step5": "Read captchaSpendUsd from logs/captcha-cost.jsonl (sum of costUsd) + proxyBurnPct from the run log (burn events / pool size) + zeroCrashes from the run log (no 'pool exhausted' / OOM). Populate criteria.* by hand.",
+    "step6": "Verify every criteria.* meets successThresholds. If all pass, Phase 2 is accepted (tag v2.0.0-phase2)."
+  },
+  "integrationTestProxy": {
+    "note": "In lieu of the live overnight run (which requires real proxies + CAPTCHA budget + 8h and cannot be executed in a CI/sandbox environment), the cross-subsystem composition is verified by tests/integration-phase2.test.js (24 tests). That test wires every REAL Phase 2 subsystem module together through DI seams (mock BullMQ + mock pg + DI runTask) and asserts: 10 jobs through a 2-worker pool complete, proxies/fingerprints/sessions rotate, change-tracking writes snapshots + field_changes on update, the incremental cache produces per-business detail cache hits on a re-run, a block signal re-queues + rotates identity, the selector health check aborts on low extraction rates, heap stays stable across 10 jobs, and graceful shutdown leaves no orphaned jobs. The live 10k run is the final operator-run acceptance gate."
+  }
+}
