@@ -351,6 +351,17 @@ CREATE INDEX IF NOT EXISTS idx_businesses_website_liveness
 -- extension or index already exists. Requires PostGIS for ST_DWithin; if
 -- PostGIS is not installed this block is skipped (competitor density falls
 -- back to a haversine JS computation — see src/enrichment/geo-metrics.js).
+--
+-- Implementation note: the CREATE INDEX is wrapped in EXECUTE '...' (dynamic
+-- SQL) rather than written as a plain statement. PL/pgSQL compiles the ENTIRE
+-- DO block upfront — both the IF and ELSE branches — *before* the runtime
+-- check for PostGIS. A bare `CREATE INDEX ... (ST_Point(lng, lat)::geography)`
+-- would be parsed at compile time, and the `::geography` cast inside the GiST
+-- index expression triggers `syntax error at or near "::"` on databases
+-- without PostGIS (the cast target type is unknown until the extension is
+-- loaded, so the parser rejects it). Wrapping it in EXECUTE defers parsing to
+-- runtime, so the statement is only compiled when the PostGIS branch actually
+-- executes — no parse error on plain PG, correct index on PostGIS-enabled PG.
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -364,8 +375,7 @@ BEGIN
       SELECT 1 FROM pg_indexes
       WHERE indexname = 'idx_businesses_geo_point'
     ) THEN
-      CREATE INDEX idx_businesses_geo_point
-        ON businesses USING GIST (ST_Point(lng, lat)::geography);
+      EXECUTE 'CREATE INDEX idx_businesses_geo_point ON businesses USING GIST (ST_Point(lng, lat)::geography)';
     END IF;
   END IF;
 END $$;
