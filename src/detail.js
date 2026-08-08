@@ -43,6 +43,10 @@
 
 const { withRetry } = require('./retry');
 const { randomInt } = require('./antiblock');
+// Reuse the list-view cleaners so detail-scraped phone/website are normalized
+// identically to list-view phone/website (no behavioral split between sources).
+// extract.js does not require detail.js, so this is a one-way dependency.
+const { cleanPhone, cleanWebsite } = require('./extract');
 
 // ---------------------------------------------------------------------------
 // Detail field schema (exported for CSV column order in Phase 1.6)
@@ -69,6 +73,8 @@ const EMPTY_DETAIL = {
   reservation_url: null,
   menu_url: null,
   social_profiles: [],
+  phone: null,
+  website: null,
   detail_scraped: false,
 };
 
@@ -142,6 +148,26 @@ const DETAIL_SELECTORS = {
     'a[href*="twitter.com"], a[href*="x.com"]',
     'a[href*="linkedin.com"]',
     'a[href*="youtube.com"]',
+  ],
+  // Phone — the detail-panel "Call" action button. Google renders the phone
+  // number as a button/link whose data-item-id contains "phone:tel:+…".
+  // The list-view card frequently does NOT render this (layout/region
+  // dependent), so the detail panel is the reliable source.
+  phone: [
+    'button[data-item-id*="phone:tel"]',
+    'a[data-item-id*="phone:tel"]',
+    'a[href^="tel:"]',
+    'button[aria-label*="Phone"]',
+    'span[data-item-id*="phone"]',
+  ],
+  // Website — the detail-panel "Website" action button. Google marks it with
+  // data-item-id containing "authority". Also captured in socialLinks above
+  // (as platform "other"), but extracted here as a first-class field so the
+  // canonical `website` column is populated even when the list card omits it.
+  website: [
+    'a[data-item-id*="authority"]',
+    'a[aria-label*="Website"]',
+    'button[aria-label*="Website"]',
   ],
 };
 
@@ -487,6 +513,37 @@ async function extractDetailFromPage(page, opts = {}) {
         }
       }
 
+      // --- Phone (first-class) ------------------------------------------
+      // The detail panel reliably shows the phone as a "Call" action button
+      // whose data-item-id is "phone:tel:+<number>" (or an <a href="tel:…">).
+      // The list-view card often omits phone entirely, so this is the
+      // authoritative source. We extract the raw value here; normalization
+      // (E.164, type detection) happens in the Phase 3 enrichment pipeline.
+      const phoneEl = pickScope(panel, SEL.phone);
+      let phoneRaw = null;
+      if (phoneEl) {
+        // Prefer data-item-id ("phone:tel:+8801712345678") → strip the prefix.
+        // Then href ("tel:+8801712345678") → strip "tel:". Finally innerText.
+        const itemId = phoneEl.getAttribute('data-item-id') || '';
+        const href = phoneEl.getAttribute('href') || '';
+        if (itemId.includes('phone:tel:')) {
+          phoneRaw = itemId.slice(itemId.indexOf('phone:tel:') + 'phone:tel:'.length);
+        } else if (href.startsWith('tel:')) {
+          phoneRaw = href.slice(4);
+        } else {
+          phoneRaw = (phoneEl.innerText || phoneEl.textContent || '').trim();
+        }
+      }
+
+      // --- Website (first-class) ----------------------------------------
+      // The detail panel "Website" action button carries data-item-id
+      // containing "authority" and its href is the business URL. This is the
+      // same element captured in socialHrefs above (classified as platform
+      // "other"), but we surface it here as the canonical `website` field so
+      // downstream consumers don't have to mine social_profiles for it.
+      const webEl = pickScope(panel, SEL.website);
+      const websiteRaw = webEl ? webEl.getAttribute('href') : null;
+
       return {
         hoursRows,
         popularDayEntries,
@@ -495,6 +552,8 @@ async function extractDetailFromPage(page, opts = {}) {
         reservation_url,
         menu_url,
         socialHrefs,
+        phoneRaw,
+        websiteRaw,
       };
     },
     { selectorsJson: JSON.stringify(DETAIL_SELECTORS), maxReviews, maxPhotos },
@@ -521,6 +580,12 @@ function normalizeDetail(raw, opts = {}) {
     reservation_url: raw.reservation_url || null,
     menu_url: raw.menu_url || null,
     social_profiles: parseSocialProfiles(raw.socialHrefs, opts),
+    // Phone/website — cleaned with the SAME helpers the list-view extractor
+    // uses (cleanPhone strips "tel:" prefixes + data-item-id noise; cleanWebsite
+    // strips utm/gclid/fbclid tracking params). null if the detail panel didn't
+    // render them. Full E.164 normalization + type detection is Phase 3.1.
+    phone: cleanPhone(raw.phoneRaw),
+    website: cleanWebsite(raw.websiteRaw),
     detail_scraped: true,
   };
 }
@@ -528,6 +593,13 @@ function normalizeDetail(raw, opts = {}) {
 /**
  * Merge detail fields into a list-view business record.
  * Returns a NEW object (does not mutate input).
+ *
+ * Phone & website backfill: the list-view card frequently does NOT render
+ * phone/website (they live in the detail panel). When deepScrape is on, the
+ * detail panel is the authoritative source. We PREFER the list-view value
+ * (it was extracted from the canonical card and is never worse), and only
+ * fall back to the detail-scraped value when the list view missed it.
+ * `??` does exactly this: business.phone ?? detail.phone ?? null.
  */
 function mergeDetailFields(business, detail) {
   const safeDetail = detail || EMPTY_DETAIL;
@@ -540,6 +612,9 @@ function mergeDetailFields(business, detail) {
     reservation_url: safeDetail.reservation_url ?? null,
     menu_url: safeDetail.menu_url ?? null,
     social_profiles: safeDetail.social_profiles ?? [],
+    // Backfill: prefer list-view value, fall back to detail-scraped value.
+    phone: business.phone ?? safeDetail.phone ?? null,
+    website: business.website ?? safeDetail.website ?? null,
     detail_scraped: !!safeDetail.detail_scraped,
   };
 }
