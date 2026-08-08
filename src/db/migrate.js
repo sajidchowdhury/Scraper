@@ -8,7 +8,7 @@
  * so re-running this script is always safe.
  *
  * Usage:
- *   npm run db:migrate                    # uses process.env.DATABASE_URL
+ *   npm run db:migrate                    # uses process.env.DATABASE_URL (from .env)
  *   node src/db/migrate.js                # same
  *   node src/db/migrate.js "postgresql://..."  # explicit connection string
  *
@@ -18,11 +18,41 @@
  *   3 — runtime error (cannot connect / SQL failed)
  */
 
+const fs = require('fs');
+const path = require('path');
 const {
   createPool,
   runMigration,
   closePool,
 } = require('../db');
+
+// ---------------------------------------------------------------------------
+// Tiny .env loader (mirrors src/config.js loadDotEnv — no external dep).
+// Loads .env from the project root so `npm run db:migrate` picks up
+// DATABASE_URL without requiring the operator to pass it on the CLI.
+// ---------------------------------------------------------------------------
+function loadDotEnv(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  const raw = fs.readFileSync(filePath, 'utf8');
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let val = trimmed.slice(eq + 1).trim();
+    if (
+      (val.startsWith('"') && val.endsWith('"')) ||
+      (val.startsWith("'") && val.endsWith("'"))
+    ) {
+      val = val.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = val;
+  }
+}
+
+// Load .env from the project root (cwd when invoked via npm run db:migrate).
+loadDotEnv(path.join(process.cwd(), '.env'));
 
 async function main() {
   // Allow an explicit connection string as the first positional arg (handy
