@@ -8,8 +8,15 @@
 #   docker compose down -v      # also delete data volumes (destructive)
 #
 # Connection strings (matches .env.example):
-#   DATABASE_URL=postgresql://gmaps:gmaps@localhost:5432/gmaps_scraper
-#   REDIS_URL=redis://localhost:6379
+#   DATABASE_URL=postgresql://gmaps:gmaps@localhost:5434/gmaps_scraper
+#   REDIS_URL=redis://localhost:6380
+#
+# NOTE on ports: PostgreSQL is mapped to host port 5434 (not the default 5432)
+# and Redis to host port 6380 (not the default 6379) to avoid conflicts with
+# native Windows/Mac installations of PostgreSQL/Redis that commonly occupy
+# the default ports. If you don't have a native install, you can safely change
+# these back to 5432:5432 and 6379:6379 — just update DATABASE_URL / REDIS_URL
+# in your .env to match.
 #
 # Data is persisted in named volumes (gmaps_pg, gmaps_redis) so it survives
 # container restarts. Use `docker compose down -v` to wipe completely.
@@ -24,7 +31,7 @@ services:
       POSTGRES_PASSWORD: gmaps
       POSTGRES_DB: gmaps_scraper
     ports:
-      - "5432:5432"
+      - "5434:5432"
     volumes:
       - gmaps_pg:/var/lib/postgresql/data
     healthcheck:
@@ -38,7 +45,7 @@ services:
     container_name: gmaps-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
       - gmaps_redis:/data
     healthcheck:
