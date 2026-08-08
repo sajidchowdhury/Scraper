@@ -128,7 +128,7 @@ For each business, extract:
 
 ---
 
-## 4. Phase 3 — Data Quality & Enrichment
+## 4. Phase 3 — Data Quality & Enrichment  ✅ SHIPPED (v3.0.0-phase3)
 
 *This is where you stop selling "scraped data" and start selling **enriched, verified leads** — at 5× the price.*
 

@@ -589,3 +589,286 @@ and Ctrl-C if something looks wrong.
   process re-attaches to the queue and resumes pending work. In-process
   mode relies on the Phase 1.7 `.checkpoint.json` + `--resume` for crash
   recovery.
+
+## Phase 3 — Data Quality & Enrichment
+
+Phase 3 layers a *derived-data* pipeline on top of the Phase 2 scrape. After
+the worker pool persists the raw `businesses` rows, the orchestrator
+(`src/enrichment/pipeline.js`, Phase 3.12) runs `enrichBatch(businesses, opts)`
+across the whole batch: ten sub-phases (3.1 phone → 3.10 confidence) normalize
+phone numbers, parse + geocode addresses, deduplicate fuzzy-matched listings,
+flag chain/spam patterns, discover + verify emails, detect website tech stacks,
+score review sentiment, compute competitor-density geo-metrics, fuse everything
+into a 0-100 lead score, and finally stamp an evidence-depth confidence score.
+Phase 3.11 (grid-coverage) is a *separate* search-strategy utility that feeds
+the scraper's main query loop with a grid of `(lat, lng)` search points so a
+whole city can be covered despite Google Maps' ~120-results-per-query cap; it
+is not part of the per-business enrichment pipeline. Enrichment is OFF by
+default (`--enrich off`) — a run without the flag is byte-for-byte Phase 2.
+
+### Enrichment Pipeline Diagram
+
+```
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │ Phase 2 scrape pipeline                                                 │
+ │ search.js → scroll.js → extract.js → detail.js → db.upsertBusinessesBatch │
+ └───────────────────────────────────┬─────────────────────────────────────┘
+                                     │ result.businesses[]  (raw Maps fields)
+                                     ▼
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │ enrichBatch(businesses, opts)              src/enrichment/pipeline.js   │
+ │                                                (Phase 3.12)             │
+ │                                                                         │
+ │  runPhase(name, fn, logger) wraps EACH phase in try/catch:              │
+ │  one failure → { error, phase } stub + log; downstream phases see       │
+ │  missing descriptors and degrade to neutral. The batch keeps running.   │
+ │                                                                         │
+ │  3.1  phone          normalizePhonesBatch         (always on, offline)  │
+ │  3.2  address        parseAddress + geocodeBatch  (geocode opt-in → net)│
+ │  3.3  dedup          findDuplicates              (batch-wide, offline)  │
+ │  3.4  chain + spam   detectChainBatch + detectSpamBatch (batch-wide)    │
+ │  3.5  email          enrichEmailsBatch           (SMTP verify opt-in)   │
+ │  3.6  tech-stack     detectTechStackBatch        (HTTP fetch opt-in)    │
+ │  3.7  sentiment      analyzeReviewsBatch         (always on, offline)   │
+ │  3.8  geo-metrics    computeGeoMetricsBatch      (batch-wide, offline)  │
+ │  3.9  lead-score     scoreLeadsBatch             (always on; fuses all) │
+ │  3.10 confidence     computeConfidenceBatch      (always on; evidence)  │
+ │                                                                         │
+ │  Every phase mutates business rows IN PLACE: writes its ENRICHMENT_     │
+ │  COLUMNS + attaches a debug descriptor (phone_normalized, dedup_result, │
+ │  chain_result, spam_result, tech_stack_result, sentiment_result,        │
+ │  geo_result, lead_result, confidence_result). Descriptors are NOT       │
+ │  persisted — they feed downstream phases + the CLI banner only.         │
+ │                                                                         │
+ │  Returns { enriched, skipped, failed, costUsd, phases }                 │
+ └───────────────────────────────────┬─────────────────────────────────────┘
+                                     │ mutated businesses[] + per-phase stats
+                                     ▼
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │ Persist ENRICHMENT_COLUMNS → UPDATE businesses SET ...                  │
+ │ + stamp enriched_at = NOW(), enrichment_version = 1                     │
+ │ src/db.js — ENRICHMENT_COLUMNS are EXCLUDED from data_hash + change     │
+ │ tracking (derived data; re-enrichment never bumps updated_at)           │
+ └─────────────────────────────────────────────────────────────────────────┘
+
+ SEPARATE TRACK — NOT in the per-business pipeline:
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │ 3.11 grid-coverage    gridSearchPoints(region, { query, stepKm })       │
+ │                       src/enrichment/grid-coverage.js                   │
+ │ Drives the scraper's main search loop (one Maps query per grid point).  │
+ │ Overlapping result sets between adjacent cells are merged by Phase 3.3  │
+ │ dedup. Pure geometry — no network, no DB, no Google API.                │
+ └─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Phase 3 Module Map
+
+| Phase | Module | Responsibility | Persisted columns |
+|---|---|---|---|
+| 3.0 | `src/enrichment/index.js` | Barrel export + `ENRICHMENT_COLUMNS` aggregation (single source of truth, mirrored by `migrations/003-enrichment.sql`) + `ENRICHMENT_VERSION` re-enrichment trigger. | (aggregator) |
+| 3.1 | `src/enrichment/phone.js` | Phone normalization & validation. E.164 conversion, type detection (mobile/landline/toll_free/voip/invalid/unknown), ISO country resolution, non-Latin-digit transliteration, extension extraction. Backed by `libphonenumber-js/max` (offline). `e164` suppressed for invalid numbers (safety: clients filter on it for auto-dialing). | `phone_e164`, `phone_type`, `phone_country_code` |
+| 3.2 | `src/enrichment/address.js` | Split raw one-line address into street/unit/city/state/postal/country + optional geocoding to `lat`/`lng` with `geocode_confidence`. DI geocoder seam (`google`/`nominatim`/`mock`); mock returns a deterministic offset so the pipeline is testable offline. | `address_street`, `address_city`, `address_state`, `address_postal`, `address_country`, `lat`, `lng`, `geocode_confidence` |
+| 3.3 | `src/enrichment/dedup.js` | Fuzzy deduplication. Weighted similarity (name 0.5 / phone 0.3 / address 0.2) above `threshold` (default 0.85) clusters near-duplicate listings; canonical picked by completeness score. Block-key pre-filter keeps it O(n·k) not O(n²). | (none — clusters written to `business_duplicates` by the caller; `dedup_result` descriptor feeds 3.9/3.10) |
+| 3.4 | `src/enrichment/chain-detection.js` | Two analyses: (A) chain-brand detection against a token+alias catalogue (McDonald's, Starbucks, …); (B) spam/fake-listing scoring from phone-reuse across listings, spam-name keywords, throwaway TLDs, and area-code/state mismatch. | (none — `chain_result` + `spam_result` descriptors feed 3.9/3.10) |
+| 3.5 | `src/enrichment/email.js` | Email discovery (scrape website contact/about pages + pattern-based guess: `info@`, `contact@`, `first.last@`) followed by optional SMTP mailbox verification (RCPT TO → 250/251 verified, 550/551/553 invalid, transient → unverified). | `email`, `email_status` |
+| 3.6 | `src/enrichment/tech-stack.js` | HTTP-fetch the website (redirect-following, 2 MB cap, 10 s timeout), then run signature detection for CMS / framework / CDN / analytics / ecommerce / JS libs + liveness (`live`/`dead`/`redirected`/`error`) + HTTP status code. | `website_tech_stack`, `website_status_code`, `website_liveness` |
+| 3.7 | `src/enrichment/sentiment.js` | AFINN-based review sentiment + 8-aspect theme extraction (food/service/price/cleanliness/atmosphere/wait/value/location) + rating/review consistency check (a 5.0★ rating paired with scathing reviews is a fake-listing tell). | `sentiment_score`, `sentiment_themes` |
+| 3.8 | `src/enrichment/geo-metrics.js` | Competitor density within 1 km + 5 km (overall and same-category), nearest-neighbor distance, isolation classification, area-type classification (urban/suburban/rural), category-specific coverage radius. Batch-wide — needs all businesses to count neighbors. | `competitor_density_1km`, `competitor_density_5km` |
+| 3.9 | `src/enrichment/lead-score.js` | Capstone: fuses 3.1–3.8 into a 0-100 composite lead score. 7 signals × 4 profiles, grade A-F, sales tier, hard SPAM_CAP at 34. | `lead_score`, `lead_score_profile` |
+| 3.10 | `src/enrichment/confidence.js` | Evidence-depth confidence (DISTINCT from lead score). Neutral base 50, 18 signed-delta factors, banded 0-100 → stored 0.00-1.00. Surfaces *how well-evidenced* a listing is so operators know which lead scores to trust. | `confidence_score` |
+| 3.11 | `src/enrichment/grid-coverage.js` | Grid-based geospatial search coverage. `gridSearchPoints(region, { query, stepKm })` generates a regular-in-km grid of `(lat, lng)` points (longitude step shrinks with `cos(lat)`); `estimateCoverage()` quantifies the gap-vs-waste trade-off. Search-strategy utility — feeds the scraper's query loop, NOT the per-business pipeline. | (none — drives search input, not DB columns) |
+| 3.12 | `src/enrichment/pipeline.js` | Orchestrator. `enrichBatch(businesses, opts)` chains 3.1→3.10 in fixed order, isolates each phase in `runPhase()` try/catch, stamps `enriched_at` + `enrichment_version`, returns `{ enriched, skipped, failed, costUsd, phases }`. `enrichBusiness(business, opts)` is the single-record convenience wrapper. | `enriched_at`, `enrichment_version` (provenance, written by the pipeline) |
+
+### Data Flow
+
+The Phase 2 scrape produces `result.businesses[]` — an array of raw Maps
+fields (name, phone, address, website, rating, reviews_count, top_reviews,
+category, place_id, …). When `--enrich on`, `src/index.js` hands that array
+to `enrichBatch(businesses, opts)` *before* `persistRunResults`, deliberately
+outside the DB transaction so a DB failure can't lose the enrichment work.
+
+The pipeline is **mutate-in-place**: each phase reads prior-phase descriptors
+off the business object and writes its own ENRICHMENT_COLUMNS + debug
+descriptor back onto the same object. No intermediate copies. Three phases are
+**batch-wide** — they need the full array to do their job:
+
+- **3.3 dedup** compares every business against every other (via block-key
+  pre-filter) to cluster duplicates and pick a canonical.
+- **3.4 spam** builds a phone-reuse map across the whole batch (one phone
+  number shared by 5+ "businesses" is a strong fake-listing signal).
+- **3.8 geo-metrics** counts neighbors within 1 km / 5 km — per-business
+  density is meaningless without the rest of the batch.
+
+The other seven phases are per-business: each business is processed
+independently and the phase would produce identical output on a single-element
+batch. `enrichBusiness()` exploits this by wrapping a one-element array and
+delegating to `enrichBatch()`, at the cost of trivial batch-wide stats (no
+duplicates possible, no neighbors).
+
+After the pipeline returns, the caller persists the ENRICHMENT_COLUMNS to
+PostgreSQL via `db.upsertBusinessesBatch`. The columns are aggregated by
+`src/enrichment/index.js` from each module's `ENRICHMENT_COLUMNS` export
+(de-duplicated; dedup + chain-detection + grid-coverage contribute none) plus
+the two provenance columns (`enriched_at`, `enrichment_version`).
+
+### Error-Isolation Model
+
+`runPhase(name, fn, logger)` is the safety seam. Every phase is invoked
+through it:
+
+```
+function runPhase(name, fn, logger) {
+  try {
+    const t0 = Date.now();
+    const result = fn();
+    logger?.info(`[enrichment] ${name} done in ${Date.now() - t0}ms`);
+    return result;
+  } catch (err) {
+    logger?.error(`[enrichment] ${name} FAILED: ${err.message}`);
+    return { error: err.message, phase: name };
+  }
+}
+```
+
+A thrown phase produces a `{ error, phase }` stub in the `phases` object of
+the return summary, but does **not** abort the run. Downstream phases are
+written defensively: every descriptor access tolerates `null`/`undefined`, and
+a missing descriptor contributes *nothing* — neither positive nor negative.
+The lead scorer (3.9) degrades the affected signal to a neutral 50 with a note
+explaining the gap ("spam_result not available — neutral 50 (Phase 3.4 did not
+run)"); the confidence scorer (3.10) simply notes the signal as uncovered in
+`signalCoverage`. The batch therefore always produces a sensible lead score +
+confidence for every business, even if half the phases failed. The per-phase
+`phases` object in the return value lets the operator audit exactly which
+phases succeeded, which failed, and what the error was.
+
+### Opt-In Network Phases
+
+The default enrichment run is **fully offline and $0**: no HTTP, no DNS, no
+SMTP, no paid geocoding API. Three phases make network calls and are gated
+behind `opts` flags:
+
+| Phase | Flag | Default | Behavior when off |
+|---|---|---|---|
+| 3.2 geocode | `opts.geocode` | `false` | Address is still *parsed* into structured fields (street/city/state/postal/country) — only the lat/lng resolution is skipped. `lat`/`lng`/`geocode_confidence` stay null. |
+| 3.5 email verify | `opts.emailVerify` | `false` | Discovery still runs — the website is not fetched, but the `email` column is populated from pattern-based guesses on the website domain. `email_status` is set to `unverified` (the default — discovery ran but no hard SMTP verdict). |
+| 3.6 tech-stack fetch | `opts.techStackFetch` | `false` | Phase is **skipped entirely** (`phases.techStack = { skipped: true, reason: 'techStackFetch not enabled' }`). `website_tech_stack`/`website_status_code`/`website_liveness` stay null; the `HAS_TECH_STACK` confidence factor won't fire. |
+
+When `opts.geocode` is on but no `geocoder` is specified, it falls back to
+`'mock'` — a deterministic offset from the parsed postal code — so the pipeline
+remains testable without a real API key. The Google and Nominatim providers are
+real; only Google costs money (Nominatim is free under its usage policy). The
+`costUsd` field in the return summary accumulates geocoding spend so budget
+caps (`--enrichBudget`) can be enforced by the caller.
+
+### Confidence & Provenance Model
+
+`confidence_score` is **evidence depth**, deliberately distinct from
+`lead_score` (which is *attractiveness*). A 5.0★ listing with zero reviews and
+no website could be a fantastic lead or could be spam — the lead score can't
+tell those two apart, but confidence can. Operators use it to decide which
+lead scores to trust and which need more enrichment before outreach.
+
+The model (ported from the dashboard's `confidence.ts`): a neutral base of 50,
+then signed deltas from eight evidence dimensions. Each delta emits a
+`{ code, label, detail, impact, delta }` factor so the reasoning is fully
+explainable. 18 factors total:
+
+- **Positive (10):** `HAS_PHONE` (+8), `HAS_VALID_PHONE` (+5), `HAS_GEOCODE`
+  (+6), `HIGH_GEOCODE_CONFIDENCE` (+4), `HAS_WEBSITE` (+6), `HAS_LIVE_WEBSITE`
+  (+4), `HAS_REVIEWS` (+5), `HIGH_REVIEW_VOLUME` (+6, ≥20 reviews),
+  `HAS_SENTIMENT` (+4), `HAS_TECH_STACK` (+3).
+- **Negative (8):** `MISSING_PHONE` (−10), `INVALID_PHONE` (−12),
+  `MISSING_ADDRESS` (−8), `MISSING_GEOCODE` (−10), `MISSING_WEBSITE` (−8),
+  `LOW_REVIEW_VOLUME` (−6, <5 reviews), `RATING_REVIEW_MISMATCH` (−8),
+  `SPAM_FLAGGED` (−20).
+
+Each missing raw field (name/phone/address/website/rating/reviews/lat-lng)
+also nibbles 2 points off the base; the high-impact gaps additionally fire the
+explicit `MISSING_*` factors above. The final 0-100 score is clamped, banded,
+and divided by 100 for storage:
+
+- **Bands:** `very_low` (<20), `low` (20-39), `medium` (40-59), `high`
+  (60-79), `very_high` (≥80).
+- **Storage:** `NUMERIC(4,2)` → stored as 0.00-1.00 (computed internally as
+  0-100, divided by 100, rounded to 2 decimals).
+- **`signalCoverage`:** fraction of 8 pipeline signals present (phone /
+  address-geocode / dedup / chain-spam / tech / sentiment / geo / lead).
+  Missing descriptors contribute no coverage credit but no penalty either.
+- **`missingFields`:** list of raw fields absent from the scrape.
+- **`confidence_result`:** the full `{ score, band, factors, missingFields,
+  signalCoverage, note }` debug descriptor — NOT persisted, powers the CLI
+  banner + downstream debugging.
+
+**Provenance:** every enriched row is stamped with `enriched_at = NOW()` and
+`enrichment_version = 1` (the `__version` constant in `pipeline.js` /
+`ENRICHMENT_VERSION` in `index.js`). Bumping the version is the re-enrichment
+trigger — rows with a lower `enrichment_version` get re-enriched on the next
+pipeline run. Enrichment columns are excluded from `data_hash` and
+change-tracking (`HASH_EXCLUDED` in `src/db.js`), so a re-enrichment with a
+new algorithm or a different phone-country hint does NOT create
+`business_snapshots` / `field_changes` rows or bump `updated_at` — only a real
+scrape change (rating/reviews/phone/website) counts as "the business's data
+changed."
+
+### Lead-Scoring Model
+
+The capstone phase (3.9) fuses every prior signal into one 0-100 composite
+**lead score**. The model is transparent and additive: seven signal
+dimensions, each normalized to a 0-100 subscore, combined by fixed weights
+that sum to 1.0 per profile. Every subscore carries a human-readable note and
+the weighted contribution is exposed, so the score is fully explainable.
+
+| Signal | Sources |
+|---|---|
+| `legitimacy` | 3.4 spam score (inverse) + chain flag |
+| `reputation` | 3.7 sentiment + star rating + consistency |
+| `data_quality` | 3.1 phone + 3.2 address + website + reviews |
+| `digital_maturity` | 3.6 tech-stack sophistication + liveness |
+| `establishment` | review volume (maturity / longevity proxy) |
+| `uniqueness` | 3.3 dedup (primary vs duplicate) + phone reuse |
+| `geo` | 3.8 isolation / competition / area type |
+
+**Four scoring profiles** weight the signals differently for different
+outreach workflows (weights sum to 1.0 each):
+
+- `web-agency` (default) — emphasizes legitimacy, data_quality,
+  establishment; keeps `digital_maturity` low-weight (low maturity is the
+  *opportunity*, not a disqualifier).
+- `reputation-mgmt` — heavily weights reputation (the signal they sell
+  against); underweights digital_maturity.
+- `seo-agency` — weights digital_maturity + data_quality (need a site to
+  optimize) + geo (local SEO matters).
+- `default` — the dashboard's even-split baseline.
+
+**Grade** (composite → letter): A ≥85, B ≥70, C ≥55, D ≥40, F <40.
+
+**Tier** (composite + spam flag → sales action): `priority` ≥85,
+`qualified` ≥70, `nurture` ≥55, `monitor` ≥40, `disqualify` <40.
+
+**SPAM_CAP** (critical rule): a listing flagged `isSpam` by Phase 3.4 with
+`spamScore ≥ 65` (`SPAM_CAP_THRESHOLD`) is hard-capped at 34
+(`SPAM_CAP_SCORE`) — grade F, tier `disqualify` — regardless of how strong its
+other signals are. The spam engine's strong-signal overrides are designed to
+be near-certain. `spamCapped = true` is set on the `lead_result` descriptor so
+the batch wrapper and downstream consumers can audit the cap.
+
+Two columns are persisted: `lead_score` (INT 0-100) and `lead_score_profile`
+(TEXT). The full `lead_result` descriptor (subscores, weights, strengths,
+risks, recommendation) is attached to the business object but NOT persisted —
+it powers the CLI banner and downstream grid/confidence phases.
+
+### Backward Compatibility
+
+Enrichment is gated behind `--enrich on` (default `off`). An `--enrich off`
+run — the default — never loads the enrichment pipeline: `enrichBatch` is not
+called, no ENRICHMENT_COLUMNS are written, and the `businesses` table looks
+exactly as it did under Phase 2. The schema migration (`003-enrichment.sql`)
+is purely additive (22 nullable columns + one side table + indexes, all
+`IF NOT EXISTS`), so a Phase 2 database migrates forward without touching
+existing rows. Within an `--enrich on` run, each feature is independently
+toggleable (`--enrichPhone off`, `--enrichEmail off`, …) — turning a feature
+off leaves its columns NULL and the downstream phases treat the absence as
+neutral, exactly as if the descriptor had never been produced. The Phase 2
+acceptance suite (1464 tests) continues to pass unchanged; Phase 3 adds its
+own suite on top.

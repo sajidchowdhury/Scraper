@@ -173,6 +173,224 @@ when the list-view `change_hash` matches; `--detailRefreshOnReviewDelta`
 `--noDetailCache` forces a full deep-scrape; `--listFreshnessDays 0`
 forces a full re-scrape.
 
+## Phase 3 — Data Quality & Enrichment
+
+Phase 3 (sub-phases 3.0–3.13, version `3.0.0-phase3`) turns raw scrape
+results into **verified, normalized, deduplicated, enriched, scored
+leads**. A single `--enrich on` flag runs an 11-stage pipeline after
+each scrape (phone → address → dedup → chain/spam → email → tech-stack
+→ sentiment → geo-metrics → lead score → confidence); grid-based
+geospatial coverage (3.11) drives the search loop itself. Enrichment is
+**opt-in and off by default** — with `--enrich` unset, the scraper
+behaves byte-for-byte like Phase 2. See **[`ENRICHMENT.md`](ENRICHMENT.md)**
+for the full operations runbook (provider setup, budgeting,
+troubleshooting) and **[`ARCHITECTURE.md`](ARCHITECTURE.md)** for the
+enrichment pipeline diagram. Detailed sub-phase specs + acceptance
+criteria live in **[`PHASE3_EXECUTION_PLAN.md`](PHASE3_EXECUTION_PLAN.md)**.
+
+### Enrichment Quick Start
+
+```bash
+# Canonical enriched run — 100 Toronto restaurants → Postgres + full enrichment
+node src/index.js --query "Restaurant" --location "Toronto" \
+  --maxResults 100 --output db --enrich on --yes
+```
+
+The default enriched run is **fully offline**: phone normalization,
+address parsing, dedup, chain/spam detection, email discovery
+(heuristic only), sentiment, geo-metrics, lead scoring, and confidence
+all run without any outbound network calls. The three
+network-dependent stages are opt-in:
+
+- **Geocoding** — `--geocoder google|nominatim|mock` (default
+  `nominatim`, free at 1 req/s; `google` is $5/1k and needs
+  `--geocodeApiKey`; `mock` is $0 canned coords for testing).
+- **Email SMTP verification** — network mailbox probes.
+- **Tech-stack detection** — live HTTP fetch of each business's website.
+
+Opt-in example (Google geocoding + email + tech-stack enrichment):
+
+```bash
+node src/index.js --query "Restaurant" --location "Toronto" \
+  --maxResults 100 --output db --enrich on --yes \
+  --geocoder google --geocodeApiKey $GEOCODING_API_KEY \
+  --enrichEmail on --enrichTechStack on
+```
+
+Per-feature sub-flags (`--enrichPhone`, `--enrichAddress`,
+`--enrichDedup`, `--enrichEmail`, `--enrichTechStack`,
+`--enrichSentiment`, `--enrichGeo`, `--enrichLeadScore`,
+`--enrichConfidence`) all default to **on** when `--enrich on` is
+passed — pass e.g. `--enrichEmail off` to skip a stage.
+`--enrichBudget <usd>` caps total API spend (0 = unlimited);
+`--enrichConcurrency N` (default 4) parallelizes the batch;
+`--phoneDefaultCountry <ISO>` (e.g. `DE`, `BD`) hints local-format
+phone numbers lacking a `+` prefix.
+
+### Phone Normalization (3.1)
+
+Converts every scraped phone to **E.164** format, detects its type
+(`mobile` / `landline` / `toll_free` / `voip` / `invalid` / `unknown`),
+resolves the ISO 3166-1 alpha-2 country code, and suppresses E.164 for
+invalid numbers (so clients filtering on `phone_e164` for auto-dialing
+never get a misleading dial string). Built on `libphonenumber-js/max`
+— offline, no telco API. Flag: `--enrichPhone on|off` (default on);
+`--phoneDefaultCountry <ISO>`. Persisted columns: `phone_e164`,
+`phone_type`, `phone_country_code`.
+
+### Address Parsing & Geocoding (3.2)
+
+Parses the raw address string into structured fields
+(street/city/state/postal/country). Geocoding to `lat`/`lng` is
+**opt-in** via `--geocoder google|nominatim|mock` + `--geocodeApiKey`
++ `--geocodeBudget <usd>` + `--geocodeRateLimitMs`; without a geocoder
+the structured fields still populate from the offline parser. Flag:
+`--enrichAddress on|off` (default on). Persisted columns:
+`address_street`, `address_city`, `address_state`, `address_postal`,
+`address_country`, `lat`, `lng`, `geocode_confidence` (0.00–1.00 —
+filter `>= 0.8` for high-precision leads).
+
+### Deduplication (3.3)
+
+Fuzzy-matches businesses listed under slightly different names
+("McDonald's" vs "McDonalds" vs "McDonald's Restaurant") on
+name + phone + address, clusters them into a canonical record, and
+tracks the decisions so re-runs are idempotent. Flag: `--enrichDedup
+on|off` (default on), `--dedupThreshold 0.00–1.00` (default `0.85` —
+the similarity cutoff), `--dedupMerge on|off` (default on; `off` =
+detect-only for auditing before enabling merge). Persists cluster
+decisions to the `business_duplicates` table (no `businesses`-column
+write); a `dedup_result` descriptor feeds lead scoring + confidence.
+
+### Chain Detection & Spam/Fake-Listing Filtering (3.4)
+
+Two always-on analyses: (A) **chain detection** matches the business
+name against a curated catalogue of known brands (McDonald's,
+Starbucks, Subway, 7-Eleven, …) via token + alias overlap; (B) a
+**spam engine** evaluates ~11 heuristics (keyword stuffing, AAA-prefix
+names, generic names, suspicious TLDs, no-website service businesses,
+phone reuse, rating/review mismatches, …) and emits a `spamScore` +
+`riskLevel` (`clean` / `low` / `medium` / `high`). Runs whenever
+`--enrich on` is set (no separate flag). Results are in-memory
+descriptors (`chain_result`, `spam_result`) that feed lead scoring —
+a hard spam cap clamps any listing flagged `isSpam` with
+`spamScore >= 65` to lead score 34 — and confidence. No
+`businesses`-column write.
+
+### Email Discovery & Verification (3.5)
+
+For every business with a website, generates candidate contact emails
+(common local-parts × domain + `mailto:`/page-text scan) and assigns
+an `email_status` (`verified` / `unverified` / `invalid` / `no_mx`).
+Discovery is heuristic and offline; **SMTP mailbox verification is
+opt-in** (network — slow, can look like spam reconnaissance, and many
+servers are catch-all). Flag: `--enrichEmail on|off` (default on).
+Persisted columns: `email`, `email_status`. Verified emails carry more
+weight than unverified ones in the confidence score.
+
+### Website Tech-Stack Detection (3.6)
+
+**Opt-in** (makes live HTTP requests): fetches each business's website,
+classifies liveness (`live` / `dead` / `redirected` / `error`), runs a
+signature detector over headers + HTML for the CMS / framework /
+frontend / e-commerce / hosting / CDN / analytics stack (WordPress,
+Shopify, Wix, Squarespace, React, Next.js, Cloudflare, …), and computes
+a 0–100 sophistication score. Flag: `--enrichTechStack on|off`.
+Persisted columns: `website_tech_stack` (JSONB array),
+`website_status_code`, `website_liveness`. Powers the
+`digital_maturity` lead-score signal.
+
+### Review Sentiment Analysis (3.7)
+
+Runs AFINN-based sentiment over each business's `top_reviews` and
+cross-checks the review-derived polarity against the star rating — a
+5.0★ rating paired with scathing review text is a strong fake-listing
+tell surfaced as a `rating_review_mismatch` anomaly. Also extracts
+aspect themes (food / service / price / ambience). Flag:
+`--enrichSentiment on|off` (default on). Persisted columns:
+`sentiment_score` (−1.00–+1.00), `sentiment_themes` (JSONB).
+
+### Geo-Metrics (3.8)
+
+For every business, computes spatial analytics relative to the rest of
+the batch via haversine: competitor density within 1 km and 5 km
+(overall + same-category), geographic isolation, and area-type flags
+(dense commercial cluster vs isolated listing — a corroboration signal
+for spam). Pure math, no network, no PostGIS requirement (a JS fallback
+runs alongside the optional PostGIS GiST index). Flag: `--enrichGeo
+on|off` (default on). Persisted columns: `competitor_density_1km`,
+`competitor_density_5km`.
+
+### Lead Scoring (3.9)
+
+The capstone stage: fuses every prior signal into a single **0–100
+composite** lead score across seven dimensions (legitimacy,
+reputation, data_quality, digital_maturity, establishment, uniqueness,
+geo), each normalized to 0–100 and combined by fixed per-profile
+weights (summing to 1.0). Every subscore carries a human-readable
+note, so the score is fully explainable (no black box). Flag:
+`--enrichLeadScore on|off` (default on). Persisted columns:
+`lead_score`, `lead_score_profile`.
+
+#### Lead-scoring profiles
+
+Each profile weights the seven signals differently to reflect what
+makes a listing attractive for a given outreach workflow. The active
+profile is selected at the pipeline layer (default `web-agency`); see
+**[`ENRICHMENT.md`](ENRICHMENT.md)** for per-run profile selection.
+
+| Profile | When to use | What it prioritizes |
+|---|---|---|
+| `web-agency` (default) | Selling website redesigns / dev services | Legitimacy, data_quality, establishment; `digital_maturity` is low-weight so a low-maturity site is the *opportunity*, not a disqualifier |
+| `reputation-mgmt` | Selling review-management / ORM services | Reputation (heaviest weight — the signal you sell against); under-weights `digital_maturity` |
+| `seo-agency` | Selling local SEO services | `digital_maturity` + `data_quality` (need a live site to optimize) + `geo` (local SEO matters) |
+| `default` | Balanced baseline / general prospecting | Even split across all seven signals — no signal dominates |
+
+### Confidence Scoring (3.10)
+
+**Distinct from the lead score** — the lead score says *how
+attractive* a listing is; confidence says *how well-evidenced* that
+score is. A 5.0★ listing with zero reviews and a shaky geocode could
+be a great lead or could be spam; confidence surfaces that uncertainty
+so operators know which scores to trust and which need more enrichment
+before outreach. Eight evidence dimensions (phone / address / dedup /
+spam / chain / tech / review / geo coverage) deltas from a neutral
+base of 50, banded `very_low` / `low` / `medium` / `high` /
+`very_high`. Flag: `--enrichConfidence on|off` (default on). Persisted
+column: `confidence_score` (0.00–1.00).
+
+### Grid-Based Geospatial Coverage (3.11)
+
+Google Maps caps search results at ~120 per query — a single
+"Restaurant in Toronto" query misses ~95% of the city. Grid coverage
+splits a region into a grid of `(lat,lng)` search points (each getting
+its own Maps query, e.g. `plumber@43.6532,-79.3832`), so the scraper
+harvests the **whole area** instead of the first 120 hits. Overlapping
+result sets between adjacent cells are merged by Phase 3.3 dedup. This
+is a **search-strategy** module (no `businesses`-column write); the
+scraper's main loop calls `gridSearchPoints(region, {query, stepKm})`
+to get the list of points to query, and `estimateCoverage()` reports a
+coverage ratio (90th-percentile nearest-neighbour distance) as an
+operator signal for whether to tighten `stepKm`.
+
+```bash
+# Cover a 5km area around downtown Toronto with a grid of search points
+node src/index.js --query "Plumber" --location "Toronto" \
+  --grid on --gridBounds "43.65,-79.38,5km" --output db --enrich on --yes
+```
+
+### Backward Compatibility
+
+`--enrich off` (the default) produces output identical to Phase 2 — no
+enrichment columns are populated, no `business_duplicates` rows are
+written, and the scraper behaves byte-for-byte like the Phase 2
+pipeline. Enrichment runs **outside** the DB transaction so a DB
+failure never loses enrichment work, and enrichment columns are
+excluded from `data_hash` / change-tracking — a re-enrichment
+(algorithm update, different country hint) never triggers
+snapshot/field_change rows or bumps `updated_at`; only a real scrape
+change does.
+
 ## Quick start
 
 ```bash

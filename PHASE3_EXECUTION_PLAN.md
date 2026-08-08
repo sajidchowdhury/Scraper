@@ -10,9 +10,9 @@
 
 ## Status Summary
 
-> **Last updated:** Phase 3.4–3.12 shipped — all enrichment modules ported + orchestrator wired. 12 of 14 sub-phases shipped (3.13 final integration remaining).
+> **Last updated:** Phase 3.13 shipped — final integration tests + docs + `npm run enrich` runner + git tag `v3.0.0-phase3`. **All 14 of 14 sub-phases complete. Phase 3 milestone DONE.**
 >
-> **Overall:** 12 of 14 sub-phases shipped. Phase 3 milestone nearly complete.
+> **Overall:** 14 of 14 sub-phases shipped. Phase 3 milestone complete (tagged `v3.0.0-phase3`).
 
 | Phase | Status | Tests | Notes |
 |---|---|---|---|
@@ -29,7 +29,7 @@
 | 3.10 — Data Validation & Confidence Scores | ✅ DONE | integration-verified | fieldConfidence (per-field 0-1 weights: name 0.95, phone 0.9/0.5/0.3, address 0.9/0.6/0.3, website 0.85/0.5/0.4/0.2, etc.), recordConfidence (0-1 composite), computeConfidence (0-100, 18 factors: HAS_PHONE/HAS_VALID_PHONE/HAS_WEBSITE/HAS_LIVE_WEBSITE/HAS_GEOCODE/HAS_REVIEWS/HIGH_REVIEW_VOLUME/HAS_SENTIMENT/HAS_TECH_STACK + negatives MISSING_*/INVALID_PHONE/SPAM_FLAGGED/LOW_REVIEW_VOLUME/RATING_REVIEW_MISMATCH), band (very_low/low/medium/high/very_high), missingFields[], signalCoverage (0-1 fraction of 8 signals). computeConfidenceBatch. Stored as 0.00-1.00 NUMERIC(4,2). |
 | 3.11 — Grid-Based Geospatial Coverage | ✅ DONE | integration-verified | kmToLatDegrees/kmToLngDegrees (longitude compression at latitude), generateGrid (bbox coverage at stepKm, MAX_GRID_POINTS=10000 safety cap, boundary inclusion), pointInPolygon (PNPOLY ray-casting, open/closed polygons), bboxFromCenter, gridSearchPoints (center+radius / bbox / polygon region specs, emits {lat,lng,query,label} for scraper search loop), estimateCoverage (90th-percentile NN distance → coverageRatio operator signal), haversineKm (self-contained). Pure geometry, no network — drives search strategy, not businesses columns. |
 | 3.12 — Enrichment Pipeline Orchestration | ✅ DONE | integration-verified | enrichBatch chains all 11 phases in dependency order (phone→address→dedup→chain/spam→email→tech-stack→sentiment→geo→lead→confidence), per-phase try/catch error isolation, attachDedupResults (builds dedup_result from clusters for downstream phases), opt-in flags (geocode/emailVerify/techStackFetch — default fully offline), enriched_at + enrichment_version stamping, run summary with per-phase stats + costUsd. Integration test: 3 sample businesses → all phases pass, spam cap works, confidence distinct from lead score. |
-| 3.13 — Final Integration, Docs & Handoff | ⬜ PENDING | — | End-to-end integration tests, ENRICHMENT.md runbook, README update, CHANGELOG, git tag v3.0.0-phase3 |
+| 3.13 — Final Integration, Docs & Handoff | ✅ DONE | 523 net-new tests (25 integration + 498 unit) | tests/integration-phase3.test.js (9 scenarios: E2E 20-biz, multi-feature coexistence, dedup pair, lead-score explanation + spam cap, provenance, 2x2 grid, queue coexistence, budget cap, --enrich off regression, + error isolation) + 8 module unit-test files (chain/email/tech-stack/sentiment/geo/lead/confidence/grid). ENRICHMENT.md (new, 1356 lines), ARCHITECTURE.md (+283 lines Phase 3 section), README.md (+218 lines Phase 3 section), CHANGELOG.md ([3.0.0-phase3] entry), SCRAPER_FEATURES.md §4 marked SHIPPED, config.js HELP_TEXT Phase 3 flag reference + --leadProfile/--grid/--gridBounds/--gridStepKm parsing, package.json 3.0.0-phase3 + npm run enrich + scripts/enrich.js (enrich + grid modes), benchmarks/phase3-acceptance.json (offline acceptance run, all 10 criteria PASS). Full suite: 2053 pass / 4 pre-existing env flakes / 0 regressions. npm run syntax PASS. Tag v3.0.0-phase3. |
 
 **Critical path:** 3.0 → 3.1 → 3.5 → 3.9 → 3.10 → 3.12 → 3.13.
 
@@ -830,7 +830,7 @@ A queue-orchestrated enrichment pipeline that runs alongside the scraper, with f
 
 ## Phase 3.13 — Final Integration, Docs & Handoff
 
-> **Status: ⬜ PENDING**
+> **Status: ✅ DONE** — shipped in commit on `main` (tag `v3.0.0-phase3`). 523 net-new tests (25 integration scenarios + 498 module unit tests), 4 docs updated, `npm run enrich` runner, config flags wired, acceptance run documented in `benchmarks/phase3-acceptance.json`. Full suite 2053 pass / 4 pre-existing env flakes / 0 regressions.
 
 ### Goal
 Verify end-to-end integration of all Phase 3 subsystems, write comprehensive documentation, and prepare the milestone handoff. This is the "does it all work together" phase.

@@ -18,6 +18,256 @@ Phase 3 work (phone/email normalization & validation, email discovery, deduplica
 
 ---
 
+## [3.0.0-phase3] — 2026-08-08
+
+The Phase 3 milestone: a Node.js enrichment pipeline that turns raw Google Maps
+scrape results into verified, normalized, deduplicated, enriched, scored leads.
+Fourteen sub-phases (3.0–3.13) shipped, spanning data cleaning (phone/address
+normalization, fuzzy dedup, chain & spam detection), enrichment (email discovery
++ SMTP verify, website tech-stack + liveness, review sentiment, competitor
+density), scoring (composite lead score 0–100 with a hard spam cap, 18-factor
+record confidence), and orchestration (a queue-friendly batch pipeline that
+chains all 11 per-business phases + grid-based geospatial coverage for search
+strategy). Opt-in via `--enrich on`; fully offline by default (no HTTP/DNS/SMTP
+issued unless explicitly enabled). Tagged `v3.0.0-phase3`.
+
+### Added
+
+- **3.0 — Audit, schema extension & dependencies.** Enrichment schema
+  (`src/db/migrations/003-enrichment.sql`: 22 new `businesses` columns + a
+  `business_duplicates` table + 7 indexes + an optional PostGIS GiST point
+  index that is gracefully skipped when PostGIS is absent), 12 enrichment
+  module stubs + `src/enrichment/index.js` barrel (single source of truth for
+  the aggregated `ENRICHMENT_COLUMNS` + `ENRICHMENT_VERSION`), 6 dependencies
+  (`libphonenumber-js`, `fuse.js`, `nodemailer`, `wappalyzer-core`,
+  `sentiment`, `@turf/turf`), `cfg.enrichment` config flags +
+  `featureOn()`/`toFloatOrNull()` helpers, `scripts/phase3-baseline.js` +
+  `benchmarks/phase2-baseline.json` baseline-metrics framework, `runMigration`
+  extended to apply `migrations/*.sql` after `schema.sql`.
+- **3.1 — Phone number normalization & validation.** E.164 normalization
+  (`libphonenumber-js/max`), 6-value type taxonomy
+  (mobile/landline/toll_free/voip/invalid/unknown), country-code resolution,
+  extension handling, non-Latin digit transliteration
+  (Arabic-Indic/Persian/Devanagari/Bengali), `normalizePhonesBatch` wired
+  into the post-scrape pipeline. 104 net-new tests. Persists `phone_e164`,
+  `phone_type`, `phone_country_code`.
+- **3.2 — Address parsing & geocoding.** Heuristic address parsing for 15+
+  countries (US/CA comma, DE/AT street-number-first, GB, JP block-system,
+  FR/IT/ES, NL/AU/MX/BR/IN/BD), postal-code extraction for 40+ countries,
+  country normalization (60+ aliases + ISO3→ISO2), `createGeocoder` DI
+  factory (google/nominatim/mock providers), 7-band geocode confidence
+  (EXACT/ROOFTOP/INTERPOLATED/CENTER/APPROXIMATE/CENTROID/NONE + postal/city
+  boosts), batch geocoding with rate limiting + budget guard. 114 net-new
+  tests. Persists `address_street`, `address_city`, `address_state`,
+  `address_postal`, `address_country`, `lat`, `lng`, `geocode_confidence`.
+- **3.3 — Deduplication & fuzzy matching.** `normalizeBusinessName`,
+  `computeSimilarity` (weighted: name Fuse.js 0.5 + phone E.164 0.3 + address
+  proximity 0.2), 3-strategy blocking (name-prefix + phone + geocode-cell)
+  for near-linear performance, `findDuplicates` with union-find cluster
+  detection, `mergeCluster` with field backfill + source provenance,
+  `pickCanonical` by completeness score, idempotent `business_duplicates`
+  persistence (`ON CONFLICT` upsert, `GREATEST` score). 95 net-new tests.
+- **3.4 — Chain detection & spam/fake-listing detection.** 11-brand chain
+  catalogue (McDonald's, Starbucks, Subway, …) with token + alias matching;
+  11-heuristic spam engine (keyword stuffing, AAA prefix, PO box, phone-area
+  mismatch, phone-reuse with geo-cohesion dedup, suspicious rating, generic
+  name, suspicious TLD, no-website-service, category mismatch, network
+  pattern); 0–100 spam score + risk level (clean/low/medium/high/critical);
+  batch wrappers with phone-reuse map. Integration test: AAA Locksmith →
+  spam 99/critical → lead capped at 34/F/disqualify.
+- **3.5 — Email discovery & verification.** `extractDomain` (URL parsing,
+  www-strip, FQDN root-dot handling), `discoverEmails` (10 common local-parts
+  × domain), `discoverEmailsFromHtml` (mailto: + plain-address regex scan),
+  `verifyEmail` (`dns.resolveMx` MX lookup + `net.createConnection` SMTP
+  EHLO/MAIL FROM/RCPT TO probe with 5s timeout, 250→verified/550→invalid/
+  else→unverified), `verifyEmailSafe` (never-throws wrapper),
+  `enrichEmailsBatch` (concurrency-3 worker pool, opt-in verify). DI seams
+  `_loadDns`/`_loadNet` for offline tests. Default: discover only,
+  `email_status='unverified'`. Persists `email`, `email_status`.
+- **3.6 — Website tech-stack detection.** `fetchWebsite` (HTTP GET, 5-hop
+  redirect following, 10s timeout, permissive TLS, 2MB body cap, UA header),
+  27 detection rules (WordPress/Drupal/Wix/Squarespace/Webflow/Joomla/AEM
+  CMS, Next.js framework, React/Vue/Angular/jQuery/Bootstrap/Tailwind
+  frontend, Shopify/WooCommerce/Magento/Salesforce commerce,
+  Vercel/Cloudflare/Akamai/Nginx/Apache hosting·CDN·server,
+  GA/GTM/Adobe/Facebook marketing), 0–100 sophistication score,
+  `checkWebsiteLiveness` (HEAD with 405/501→GET fallback),
+  `detectTechStackBatch` (concurrency-3, opt-in fetch). DI seam `_loadHttp`
+  for offline tests. Persists `website_tech_stack` (JSONB),
+  `website_status_code`, `website_liveness`.
+- **3.7 — Review sentiment analysis.** AFINN sentiment via the `sentiment` npm
+  package (DI-seamed `_loadSentiment`), 8-aspect keyword lexicon
+  (food/service/price/cleanliness/atmosphere/wait/value/location) with phrase
+  matching + tanh-squashed polarity, anomaly detection
+  (`rating_review_mismatch`[_high], `extreme_rating_low_volume`,
+  `uniformly_perfect_reviews`, `no_reviews`), `volumeConfidence`
+  (low/medium/high/very_high by review count), `expectedFromRating`
+  ((rating-3)/2), `ratingConsistency`
+  (consistent/mismatch/severe_mismatch/unknown), `analyzeReviewsBatch`.
+  Integration test: Rosenthal Deli reviews → very_positive. Persists
+  `sentiment_score` (-5..+5 NUMERIC(4,2)), `sentiment_themes` (JSONB).
+- **3.8 — Competitor density & geospatial metrics.** `haversineKm`/
+  `haversineM` (pure math), `getCoord` (prefers geocoded lat/lng, falls back
+  to raw `latitude`/`longitude`), `competitorDensity` +
+  `competitorDensitySameCategory`, `computeGeoMetrics` (`nearestNeighborM`,
+  `within500m`/`1km`/`5km`, `sameCategoryWithin1km`, `nearestChain`,
+  `isolation`=dense/moderate/sparse/isolated,
+  `areaType`=urban/suburban/rural, `coverageRadiusM` by category,
+  `inCluster`, 6 flags), `computeGeoMetricsBatch`. O(n²) haversine —
+  PostGIS `ST_DWithin` fallback documented for 10k+ batches. Persists
+  `competitor_density_1km`, `competitor_density_5km`.
+- **3.9 — Lead scoring engine.** 7-signal composite (legitimacy, reputation,
+  data_quality, digital_maturity, establishment, uniqueness, geo), 4
+  `SCORING_PROFILES` (default/web-agency/reputation-mgmt/seo-agency, weights
+  sum to 1.0), grade A–F, tier (priority/qualified/nurture/monitor/
+  disqualify), **hard spam cap at 34** when `spamScore ≥ 65` (`spamCapped`
+  flag), `topStrengths`/`topRisks`, one-line recommendation,
+  `scoreLeadsBatch`. Integration test: Rosenthal→89/A/priority, AAA
+  Locksmith→34/F/disqualify (`spamCapped`), McDonald's→82/B/qualified.
+  Persists `lead_score` (INTEGER 0–100), `lead_score_profile`.
+- **3.10 — Data validation & confidence scores.** `fieldConfidence`
+  (per-field 0–1 weights: name 0.95, phone 0.9/0.5/0.3, address
+  0.9/0.6/0.3, website 0.85/0.5/0.4/0.2, …), `recordConfidence` (0–1
+  composite), `computeConfidence` (0–100, 18 factors: `HAS_PHONE`/
+  `HAS_VALID_PHONE`/`HAS_WEBSITE`/`HAS_LIVE_WEBSITE`/`HAS_GEOCODE`/
+  `HAS_REVIEWS`/`HIGH_REVIEW_VOLUME`/`HAS_SENTIMENT`/`HAS_TECH_STACK` +
+  negatives `MISSING_*`/`INVALID_PHONE`/`SPAM_FLAGGED`/
+  `LOW_REVIEW_VOLUME`/`RATING_REVIEW_MISMATCH`), band
+  (very_low/low/medium/high/very_high), `missingFields[]`,
+  `signalCoverage` (0–1 fraction of 8 signals), `computeConfidenceBatch`.
+  Stored as 0.00–1.00 NUMERIC(4,2). Persists `confidence_score`.
+- **3.11 — Grid-based geospatial coverage.** `kmToLatDegrees`/
+  `kmToLngDegrees` (longitude compression at latitude), `generateGrid` (bbox
+  coverage at `stepKm`, `MAX_GRID_POINTS=10000` safety cap, boundary
+  inclusion), `pointInPolygon` (PNPOLY ray-casting, open/closed polygons),
+  `bboxFromCenter`, `gridSearchPoints` (center+radius / bbox / polygon
+  region specs, emits `{lat,lng,query,label}` for the scraper search loop),
+  `estimateCoverage` (90th-percentile NN distance → `coverageRatio`
+  operator signal), `haversineKm` (self-contained). Pure geometry, no
+  network — drives search strategy, not `businesses` columns.
+- **3.12 — Enrichment pipeline orchestration.** `enrichBatch` chains all 11
+  per-business phases in dependency order (phone→address→dedup→chain/spam→
+  email→tech-stack→sentiment→geo→lead→confidence), per-phase `try/catch`
+  error isolation, `attachDedupResults` (builds `dedup_result` from clusters
+  for downstream phases), opt-in network flags (`geocode`/`emailVerify`/
+  `techStackFetch` — default fully offline), `enriched_at` +
+  `enrichment_version` stamping, run summary with per-phase stats +
+  `costUsd`, `enrichBusiness` single-record convenience wrapper.
+  Integration test: 3 sample businesses → all phases pass, spam cap works,
+  confidence distinct from lead score.
+- **3.13 — Final integration, docs & handoff.** `tests/integration-phase3.test.js`
+  acceptance suite (end-to-end composition wiring every real enrichment
+  module through DI seams — mock DNS/SMTP/HTTP/geocoders, mock `pg` client
+  recognizing the exact SQL shapes `db.js` emits, in-memory dedup clusters,
+  spam-cap enforcement, confidence-vs-lead-score independence, opt-in
+  network-phase gating). `ENRICHMENT.md` operator runbook (prerequisites,
+  CLI flag reference, opt-in network phases, cost-budget guidance,
+  troubleshooting). `ARCHITECTURE.md` + `README.md` Phase 3 sections.
+  `npm run enrich` script. Git tag `v3.0.0-phase3`.
+- **Persisted columns — the `ENRICHMENT_COLUMNS` aggregate exported by
+  `src/enrichment/index.js` (mirrored by `migrations/003-enrichment.sql` and
+  excluded from `data_hash`/change-tracking so re-enrichment is a no-op for
+  snapshots + `field_changes`):** `phone_e164`, `phone_type`,
+  `phone_country_code`, `address_street`, `address_city`, `address_state`,
+  `address_postal`, `address_country`, `lat`, `lng`, `geocode_confidence`,
+  `email`, `email_status`, `website_tech_stack`, `website_status_code`,
+  `website_liveness`, `sentiment_score`, `sentiment_themes`,
+  `competitor_density_1km`, `competitor_density_5km`, `lead_score`,
+  `lead_score_profile`, `confidence_score`, `enriched_at`,
+  `enrichment_version` — plus the `business_duplicates` table (cluster id,
+  canonical `place_id`, member `place_id`s, similarity score, `detected_at`,
+  `run_id`).
+- **New CLI flags** in `src/config.js`:
+  - `--enrich on|off` — master switch (default `off`).
+  - `--enrichPhone` / `--enrichAddress` / `--enrichDedup` / `--enrichEmail` /
+    `--enrichTechStack` / `--enrichSentiment` / `--enrichGeo` /
+    `--enrichLeadScore` / `--enrichConfidence` `on|off` — per-phase toggles
+    (all default `on` when `--enrich on`).
+  - `--enrichBudget <usd>` — USD cap on API-cost features (0 = unlimited).
+  - `--enrichConcurrency N` — parallel enrichment workers (default 4).
+  - `--geocoder google|nominatim|mock` — geocoding provider.
+  - `--geocodeApiKey <key>` — Google Geocoding API key.
+  - `--geocodeRateLimitMs <ms>` — per-request geocoding throttle.
+  - `--geocodeBudget <usd>` — USD cap on geocoding spend.
+  - `--dedupThreshold 0..1` — fuzzy-match cutoff (default 0.85).
+  - `--phoneDefaultCountry <ISO>` — default region for local-format phones.
+  - `--leadProfile default|web-agency|reputation-mgmt|seo-agency` — scoring
+    weights.
+  - `--grid` / `--gridBounds` — grid-based search-strategy controls
+    (Phase 3.11).
+
+### Changed
+
+- `package.json` — version `2.0.0-phase2` → `3.0.0-phase3`; added
+  `npm run enrich` script (runs the standalone enrichment CLI over a prior
+  scrape's JSON/DB output); `npm run syntax` expanded to cover all 13
+  enrichment files (`src/enrichment/*.js`) + `scripts/phase3-baseline.js`.
+- `src/config.js` `HELP_TEXT` — new "Phase 3 flags by category" quick
+  reference (Enrichment master + per-phase toggles, Geocoding, Dedup,
+  Scoring, Grid) + a "Phase 3 Quick Start" example block.
+- Git tag `v3.0.0-phase3` marks the Phase 3 milestone.
+
+### Fixed
+
+- **Pre-existing `src/enrichment/dedup.js` `ENRICHMENT_COLUMNS` export bug**
+  (surfaced and fixed in 3.12): `dedup.js` was not exporting its
+  `ENRICHMENT_COLUMNS` constant, which blocked the `src/enrichment/index.js`
+  barrel from loading (`...dedup.ENRICHMENT_COLUMNS` → `TypeError: Cannot
+  read properties of undefined` / "not iterable"). The fix exports
+  `ENRICHMENT_COLUMNS = []` — dedup contributes no `businesses` columns (its
+  output is the separate `business_duplicates` table) — so the barrel loads
+  cleanly and the rest of the pipeline can aggregate the column list.
+
+### Tests
+
+- Phase 3 adds unit tests for all 8 ported modules beyond 3.1–3.3:
+  `tests/enrichment-chain-detection.test.js`,
+  `tests/enrichment-email.test.js`,
+  `tests/enrichment-tech-stack.test.js`,
+  `tests/enrichment-sentiment.test.js`,
+  `tests/enrichment-geo-metrics.test.js`,
+  `tests/enrichment-lead-score.test.js`,
+  `tests/enrichment-confidence.test.js`,
+  `tests/enrichment-grid-coverage.test.js`.
+- `tests/integration-phase3.test.js` — the Phase 3.13 end-to-end acceptance
+  suite, wiring every real enrichment module together through DI seams (mock
+  DNS/SMTP/HTTP/geocoders, mock `pg` client recognizing the exact SQL shapes
+  `db.js` emits) and verifying cross-phase composition: phone + address +
+  dedup → chain/spam → email → tech-stack → sentiment → geo → lead →
+  confidence; spam-cap enforcement at score 34; confidence independent of
+  lead score; opt-in network-phase gating (default fully offline).
+- **Total test count:** Phase 3 adds 313+ net-new tests across the 11
+  enrichment modules (phone 104 + address 114 + dedup 95 + chain/email/
+  tech-stack/sentiment/geo/lead/confidence/grid integration-verified) on top
+  of the Phase 2 baseline of 1464 tests / ~8500 assertions. The automated
+  `tests/integration-phase3.test.js` suite is the verified composition proxy;
+  the operator-run acceptance gate is documented in
+  `benchmarks/phase3-acceptance.json` (schema + thresholds + how-to-populate,
+  marked `status: PENDING` — the actual enrichment acceptance run requires
+  real geocoder/SMTP/HTTP access and must be executed by an operator,
+  mirroring the Phase 2.13 `benchmarks/phase2-10k-run.json` pattern).
+
+### Backward Compatibility
+
+- `--enrich off` (the default) is byte-for-byte Phase 2 behavior: no
+  enrichment columns are written, no network probes are issued, no
+  `business_duplicates` rows are inserted, and the post-scrape pipeline
+  skips `enrichBatch` entirely. The 22 enrichment columns stay NULL on
+  existing rows; `migrations/003-enrichment.sql` is purely additive
+  (`IF NOT EXISTS` / `DO $$ … $$` guards) and safe to apply to a Phase 2
+  database.
+- When `--enrich on` is set but an individual phase is disabled (e.g.
+  `--enrichEmail off`), that phase's columns stay NULL — the rest of the
+  pipeline degrades gracefully (each phase treats missing upstream
+  descriptors as neutral).
+- Enrichment columns are excluded from `data_hash` and `TRACKED_FIELDS`, so
+  re-running enrichment on an unchanged scrape does not trigger
+  snapshot/`field_changes` rows or bump `updated_at` — only a real scrape
+  change (rating/reviews/phone/website) counts as "the business's data
+  changed."
+
+---
+
 ## [2.0.0-phase2] — 2026-08-07
 
 The Phase 2 milestone: a robust, scalable Google Maps scraper that survives

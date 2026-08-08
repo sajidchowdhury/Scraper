@@ -261,6 +261,19 @@ function parseArgs(argv) {
     //                                     off = detect-only, no merge).
     else if (a === '--dedupThreshold') out.dedupThreshold = argv[++i];
     else if (a === '--dedupMerge') out.dedupMerge = argv[++i];
+    // Phase 3.9 — lead-scoring profile selection.
+    //   --leadProfile <name> — default | web-agency | reputation-mgmt | seo-agency.
+    else if (a === '--leadProfile') out.leadProfile = argv[++i];
+    // Phase 3.11 — grid-coverage search-strategy flags. Generate the grid of
+    // search points the scraper queries to cover a whole area (defeats
+    // Google's ~120-result-per-query cap). Consumed by `npm run enrich --grid on`
+    // and (pending scrape-loop integration) by the main search loop.
+    //   --grid on|off                      — enable grid generation.
+    //   --gridBounds "<lat,lng,radiusKm>"  — center + radius to cover.
+    //   --gridStepKm <km>                  — grid spacing (default: derived).
+    else if (a === '--grid') out.grid = argv[++i];
+    else if (a === '--gridBounds') out.gridBounds = argv[++i];
+    else if (a === '--gridStepKm') out.gridStepKm = argv[++i];
   }
   return out;
 }
@@ -1206,6 +1219,25 @@ function loadConfig(argv = process.argv.slice(2)) {
         if (raw === undefined || raw === null || raw === '') return true; // default on
         return /^(on|true|1|yes)$/i.test(String(raw));
       })(),
+      // Phase 3.9 — lead-scoring profile. Picks the 7-signal weight set used
+      // by scoreLeadsBatch. 'web-agency' (default) prioritizes businesses
+      // with outdated websites; 'reputation-mgmt' prioritizes review volume;
+      // 'seo-agency' prioritizes digital maturity; 'default' is balanced.
+      leadProfile: (() => {
+        const raw = cli.leadProfile ?? process.env.LEAD_PROFILE;
+        const v = raw ? String(raw).toLowerCase() : 'web-agency';
+        return ['default', 'web-agency', 'reputation-mgmt', 'seo-agency'].includes(v) ? v : 'web-agency';
+      })(),
+      // Phase 3.11 — grid-coverage search-strategy config. When --grid on,
+      // a grid of search points covering --gridBounds is generated (via
+      // gridCoverage.gridSearchPoints) and each point becomes a scraper
+      // search query, merging results to defeat Google's ~120-result cap.
+      // NOTE: full scrape-loop integration is the remaining 3.11 follow-up;
+      // the flags + gridSearchPoints API are shipped and exercised by
+      // `npm run enrich -- --grid on`.
+      gridEnabled: /^(on|true|1|yes)$/i.test(String(cli.grid ?? process.env.GRID_ENABLED ?? '')),
+      gridBounds: cli.gridBounds ?? process.env.GRID_BOUNDS ?? null,
+      gridStepKm: toFloatOrNull(cli.gridStepKm ?? process.env.GRID_STEP_KM),
       // Resolved at runtime in the enrichment pipeline (Phase 3.12) into
       // { run, stats } (null when disabled).
       resolved: null,
@@ -1223,7 +1255,7 @@ function loadConfig(argv = process.argv.slice(2)) {
   return cfg;
 }
 
-const HELP_TEXT = `gmaps-scraper — Google Maps business scraper (Phase 2)
+const HELP_TEXT = `gmaps-scraper — Google Maps business scraper (Phase 3)
 
 Usage:
   npm start -- --query <q> --location <loc> [options]
@@ -1550,6 +1582,33 @@ Examples:
   # Phase 3.3 — deduplication (fuzzy match on name+phone+address):
   npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --dedupThreshold 0.90 --dedupMerge on
   npm start -- --query "Cafe" --location "Berlin" --output db --enrich on --dedupMerge off   # detect-only, no merge
+
+  # ── Phase 3 flags by category (Phase 3.13 reference) ─────────────────────────
+  # Master switch + budget:
+  #   --enrich on|off              master switch (default off = Phase 2 behavior)
+  #   --enrichBudget <usd>         USD cap on API-cost features (0 = unlimited)
+  #   --enrichConcurrency <n>      parallel enrichment workers (default 4)
+  # Per-feature toggles (default ON when --enrich is on):
+  #   --enrichPhone|Address|Dedup|Email|TechStack|Sentiment|Geo|LeadScore|Confidence on|off
+  # Phone:
+  #   --phoneDefaultCountry <CC>   ISO 2-letter region hint (CA, US, BD, GB, ...)
+  # Geocoding (opt-in network):
+  #   --geocoder google|nominatim|mock   provider (default nominatim, free)
+  #   --geocodeApiKey <key>              Google API key (env: GEOCODING_API_KEY)
+  #   --geocodeRateLimitMs <ms>          provider rate-limit override
+  #   --geocodeBudget <usd>              USD cap on Google geocoding
+  # Dedup:
+  #   --dedupThreshold <0.00–1.00>       fuzzy-match cutoff (default 0.85)
+  #   --dedupMerge on|off                merge into canonical (default on)
+  # Lead scoring:
+  #   --leadProfile default|web-agency|reputation-mgmt|seo-agency
+  # Grid coverage (search strategy; also 'npm run enrich -- --grid on'):
+  #   --grid on|off                      enable grid generation
+  #   --gridBounds "<lat,lng,radiusKm>"  center + radius to cover
+  #   --gridStepKm <km>                  grid spacing (default: derived)
+  # Standalone enrichment (no live scrape):
+  #   npm run enrich -- --input raw.json --output enriched.json --profile web-agency
+  #   npm run enrich -- --grid on --gridBounds "43.65,-79.38,5km" --query Restaurant
   # Capture the Phase 2 enrichment-readiness baseline (5 metrics):
   node scripts/phase3-baseline.js data/<scrape-output>.json
 
